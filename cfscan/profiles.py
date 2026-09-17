@@ -103,6 +103,9 @@ def default_profile(cfst_path=None):
         "scheme": "https",
         "url_path": "/",
         "http_status": DEFAULT_HTTP_STATUS,
+        # Cloudflare datacentres to keep, as IATA codes ("FRA,AMS"). Empty means
+        # the whole edge, which is what a first scan should measure.
+        "colo": "",
         "ip_version": 4,
         "ip_file": DEFAULT_IPV4_FILE,
         "ipv6_file": DEFAULT_IPV6_FILE,
@@ -111,9 +114,19 @@ def default_profile(cfst_path=None):
         "max_latency_ms": 1000,
         "max_loss": 0.25,
         "results_limit": 20,
+        # How many of the best addresses cfscan shows and verifies. This is the
+        # number the user actually sees; "results_limit" only reaches the
+        # scanner's own console output, which cfscan hides.
+        "top_ips": 10,
         "download_test": False,
         "recommended_ip": DEFAULT_RECOMMENDED_IP,
         "verify_attempts": 20,
+        # Addresses this profile has proven, newest first (see menu 3).
+        "favourites": [],
+        # One summary per scan of which datacentres answered and how fast, used
+        # to rank the edge locations from measurement rather than from a map
+        # (see menu 12).
+        "edge_history": [],
     }
 
 
@@ -208,6 +221,12 @@ def _merge_profile(stored):
         merged["mode"] = "httping"
     if merged.get("scheme") not in ("http", "https"):
         merged["scheme"] = "https"
+    if not isinstance(merged.get("colo"), str):
+        merged["colo"] = ""
+    if not isinstance(merged.get("favourites"), list):
+        merged["favourites"] = []
+    if not isinstance(merged.get("edge_history"), list):
+        merged["edge_history"] = []
     return merged
 
 

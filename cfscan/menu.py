@@ -17,8 +17,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from . import __version__, running_from_dev_link
+from . import edges as edges_module
+from . import favourites as favourites_module
 from . import multisip as multisip_module
 from . import pool as pool_module
+from . import ranges as ranges_module
 from . import results as results_module
 from . import vantages as vantages_module
 from .parser import CsvError, rank_results, parse_results_csv, recommend
@@ -38,6 +42,7 @@ from .profiles import (
 from .results import ResultStore, latest_result_path, timestamp_label
 from .runner import (
     CLOUDFLARE_HTTPS_PORTS,
+    colo_problem,
     PROBE_ADDRESSES,
     CfstNotFoundError,
     ScanError,
@@ -58,6 +63,7 @@ from .runner import (
 from .ui import Aborted
 from .validate import (
     ValidationError,
+    validate_colo,
     validate_domain,
     validate_http_status,
     validate_ip,
@@ -89,8 +95,11 @@ __all__ = [
     "show_client_guide",
     "show_top_ips",
     "verify_top_candidates",
+    "prunable_results",
+    "edge_locations",
     "show_last_results",
     "show_profiles",
+    "update_ranges_flow",
     "switch_ip_version",
     "verify_flow",
 ]
@@ -112,8 +121,40 @@ MENU_ITEMS = (
     ("8", "Open Results Folder"),
     ("9", "Help"),
     ("10", "Multi-carrier scan"),
+    ("11", "Update IP ranges"),
+    ("12", "Edge locations"),
     ("0", "Exit"),
 )
+
+#: How the entries above are grouped on screen. Eleven items in one flat list
+#: read as eleven equally likely choices; grouped, the screen says what kind of
+#: thing each one is before the user reads a single label.
+MENU_GROUPS = (
+    ("Scan", ("1", "2", "10")),
+    ("Check one address", ("3",)),
+    ("Results", ("4", "8")),
+    ("Setup", ("5", "6", "7", "11", "12")),
+    ("", ("9", "0")),
+)
+
+#: The dim half-line after each entry. It answers "what does this actually do?"
+#: for someone who has not read the help screen, which is most people most of
+#: the time.
+MENU_HINTS = {
+    "1": "scan the range with the active profile",
+    "2": "ask for every setting, then scan",
+    "3": "re-check a saved address, or any address you type",
+    "4": "the newest saved result file",
+    "5": "what is stored and which one is active",
+    "6": "add, edit, activate or delete a profile",
+    "7": "switch the active profile's address family",
+    "8": "reveal the CSV and log files in Finder",
+    "9": "what every setting means",
+    "10": "compare carriers on one fixed candidate list",
+    "11": "download Cloudflare's current range lists",
+    "12": "rank the datacentres from what you measured",
+    "0": "",
+}
 
 
 @dataclass
@@ -149,6 +190,13 @@ class Session:
     #: Whether the "your shell exports a proxy" notice was already shown, so it
     #: appears once per session instead of before every single scan.
     proxy_notice_shown: bool = False
+    #: The same, for the "your default route is a tunnel" notice.
+    tunnel_notice_shown: bool = False
+    #: A region filter for this run only (``cfscan --colo``). It is kept here
+    #: rather than written into the profile because the flows save the profile
+    #: for their own reasons - a verified address, a scan's observations - and
+    #: a one-run experiment must not ride along into the stored configuration.
+    colo_override: object = None
 
 
 # --------------------------------------------------------------------------
@@ -175,6 +223,19 @@ def _cfst_path(config):
     return config.get("cfst_path") or find_cfst()
 
 
+def _scan_profile(session, profile):
+    """The profile as a scan should see it, with any one-run override applied.
+
+    Returns a copy when an override is set, so everything written back - the
+    verified address, the datacentre observations - still lands on the real
+    profile and the override never does.
+    """
+    override = getattr(session, "colo_override", None)
+    if override is None:
+        return profile
+    return dict(profile, colo=override)
+
+
 def _render_profile(console, name, profile):
     console.key_value("Profile", name)
     console.key_value("Domain", profile.get("domain"))
@@ -188,21 +249,26 @@ def _render_profile(console, name, profile):
         console.key_value("Protocol", "TCPing (plain TCP connect)")
     console.key_value("Expected status", profile.get("http_status")
                       if mode == "httping" else "-")
+    console.key_value("Region filter", str(profile.get("colo") or "")
+                      or "any datacentre")
     console.key_value("IP version", f"IPv{profile.get('ip_version', 4)}")
     console.key_value("IP range file", ip_file_for(profile))
     console.key_value("Attempts", profile.get("attempts"))
     console.key_value("Concurrency", profile.get("concurrency"))
     console.key_value("Max latency", f"{profile.get('max_latency_ms')} ms")
     console.key_value("Max packet loss", f"{float(profile.get('max_loss', 0)) * 100:g}%")
-    console.key_value("Results to display", profile.get("results_limit"))
+    console.key_value("Addresses offered", profile.get("top_ips") or 10)
     console.key_value("Download test",
                       "enabled" if profile.get("download_test") else "disabled")
     if profile.get("recommended_ip"):
         console.key_value("Recommended IP", profile.get("recommended_ip"))
-    problem = scheme_port_problem(profile)
-    if problem:
-        console.blank()
-        console.warn(problem)
+    saved = favourites_module.entries_for(profile)
+    if saved:
+        console.key_value("Saved good IPs", f"{len(saved)} (menu 3)")
+    for problem in (scheme_port_problem(profile), colo_problem(profile)):
+        if problem:
+            console.blank()
+            console.warn(problem)
 
 
 def _url_for(profile):
@@ -212,7 +278,14 @@ def _url_for(profile):
 
 
 def _top_ips(session, profile):
-    """How many of the best addresses a test should offer (default 10)."""
+    """How many of the best addresses a test should offer (default 10).
+
+    This is the number that decides what the user sees. The profile's
+    ``results_limit`` does not: it only becomes the scanner's ``-p``, which
+    caps the scanner's own console output - output cfscan never reads, because
+    it parses the result file instead (measured: ``-p 1`` over five addresses
+    still wrote all five rows to the CSV).
+    """
     raw = profile.get("top_ips") or getattr(session, "top_ips", None) or 10
     try:
         number = int(raw)
@@ -245,12 +318,15 @@ def _verify_verdict(row, attempts):
 
 
 def _requested_results(profile, top_n):
-    """Ask the scanner for at least ``top_n`` rows so that many can be offered."""
-    try:
-        configured = int(profile.get("results_limit") or 0)
-    except (TypeError, ValueError):
-        configured = 0
-    return max(configured, int(top_n))
+    """What to pass the scanner as ``-p``.
+
+    ``-p`` caps the scanner's own console listing and nothing else - the result
+    file always holds every address that passed the filters (measured: ``-p 1``
+    over five addresses still wrote all five rows). cfscan reads that file, so
+    this number is cosmetic; matching it to the number cfscan will show keeps
+    the scanner's hidden log and the screen telling the same story.
+    """
+    return max(1, int(top_n))
 
 
 def _print_dry_run(console, argv, csv_path=None, log_path=None):
@@ -299,6 +375,41 @@ def _notice_about_shell_proxy_once(session):
     )
 
 
+def _notice_about_tunnel_once(session):
+    """Say once per session that every measurement goes through a tunnel.
+
+    When the default route is a tunnel, the scanner does not measure this
+    machine's connection to Cloudflare at all: it measures the path through the
+    tunnel and out of its exit. The address that wins is then the best address
+    *for that tunnel*, which is rarely the address wanted - the point of a clean
+    IP is usually to carry the tunnel, not to be reached through one.
+
+    Two measurements from one such line make it concrete: the TCP handshake came
+    back in 0.4 ms, because a TUN-mode client answers it locally rather than
+    from Cloudflare, while the TLS handshake to the same address took 920 ms.
+    Anything that judges an address by its TCP connect - TCPing mode - is
+    therefore meaningless while a tunnel is up.
+    """
+    if getattr(session, "tunnel_notice_shown", False):
+        return None
+    session.tunnel_notice_shown = True
+    line = edges_module.describe_line()
+    if not line["tunnel"]:
+        return line
+    session.console.warn(
+        f"This Mac's default route is a tunnel ({line['interface']}), so the "
+        "scan measures the path through it and out of its exit - not this "
+        "machine's own connection. The winning address will be the best one for "
+        "that tunnel. Turn the tunnel off to scan the real line; --direct does "
+        "not help, because it only clears this shell's proxy variables and "
+        "cannot change a system route."
+    )
+    session.console.line("  Results are labelled with the line they were "
+                         "measured on, so menu 12 still ranks the edge "
+                         "locations correctly for this one.")
+    return line
+
+
 def _execute_scan(session, argv, log_path, label="Scanning", timeout=None):
     """Run the scanner with a live English progress indicator.
 
@@ -309,6 +420,7 @@ def _execute_scan(session, argv, log_path, label="Scanning", timeout=None):
     if timeout is None:
         timeout = getattr(session, "scan_timeout_seconds", None)
     _notice_about_shell_proxy_once(session)
+    _notice_about_tunnel_once(session)
     state = {}
 
     def on_progress(progress):
@@ -621,7 +733,7 @@ def verify_top_candidates(session, config, profile, results, limit=None):
 
 
 def _finish_scan_results(session, config, profile, results, top_n, recommended,
-                         csv_path, flow):
+                         csv_path, flow, colo_filter=None):
     """Verify the best addresses, print the table and the offer, record a verdict.
 
     Returns ``(verified, passed, marked_ip)``: the measurements from the strict
@@ -693,6 +805,48 @@ def _finish_scan_results(session, config, profile, results, top_n, recommended,
     lines.append(f"Saved: {csv_path}")
     remember_result(session, verdict, lines,
                     title=f"{flow} - best {len(shown)} addresses")
+
+    # Every scan is one more measurement of where the fast datacentres are on
+    # this line, whether or not anything passed the strict check.
+    observed = edges_module.observe(
+        profile, results, line=edges_module.describe_line(),
+        colo_filter=colo_filter if colo_filter is not None
+        else profile.get("colo"))
+    if observed:
+        top = sorted(observed.items(), key=lambda item: item[1]["med"])[:3]
+        console.blank()
+        console.line("Datacentres in this scan: " + ", ".join(
+            f"{colo} ({stats['n']} at {stats['med']:.0f} ms)"
+            for colo, stats in top) + "  -  menu 12 ranks them over time.")
+
+    if passed:
+        # Tomorrow's scan starts from what was proven today: re-measuring these
+        # is one short run, where finding them again cost a full range scan.
+        #
+        # What is stored is the strict check's measurement, not the scan's: it
+        # is twenty attempts against the scan's handful, and it is the one that
+        # saw where the address answers from now (observed in one run: four
+        # addresses the scan recorded as FRA answered the check from AMS, MUC,
+        # VIE and LHR).
+        favourites_module.remember_many(
+            profile, [verified.get(item.ip) or item for item in passed])
+        # The profile keeps the proven winner too, so the next scan's preflight
+        # starts from an address that is known to answer.
+        if marked_ip:
+            profile["recommended_ip"] = marked_ip
+        try:
+            save_config(session.paths, config)
+        except OSError as error:  # pragma: no cover - the scan itself is done
+            console.warn(f"The verified addresses could not be saved: {error}")
+        else:
+            console.blank()
+            console.line(f"{len(passed)} verified address(es) saved to this "
+                         "profile - menu 3 re-checks them in one short run.")
+    elif observed:
+        try:
+            save_config(session.paths, config)
+        except OSError:  # pragma: no cover - the scan itself is done
+            pass
     return verified, passed, marked_ip
 
 
@@ -751,12 +905,21 @@ def _probe_candidates(profile):
 
 
 def _discard_probe_result(csv_path):
-    """Remove a preflight result file, so it is never mistaken for a scan."""
-    try:
-        if csv_path and Path(csv_path).exists():
-            Path(csv_path).unlink()
-    except OSError:  # pragma: no cover - nothing to do about it
-        pass
+    """Remove a preflight's files, so they never pile up or look like a scan.
+
+    The log goes with the result file. Keeping it only filled the results folder
+    with preflight logs that belong to no scan, and the reason a preflight
+    failed is printed on screen while it is still relevant.
+    """
+    if not csv_path:
+        return
+    candidate = Path(csv_path)
+    for path in (candidate, candidate.with_suffix(".log")):
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:  # pragma: no cover - nothing to do about it
+            pass
 
 
 #: A status code no real server returns. Asking the scanner for it makes it
@@ -951,14 +1114,15 @@ def quick_scan(session, config, profile_name=None, verify_prompt=True):
     console.heading("Quick Scan")
     console.line("The active profile is used. Press Ctrl+C at any time to stop.")
     console.blank()
-    _render_profile(console, name, profile)
+    scanned = _scan_profile(session, profile)
+    _render_profile(console, name, scanned)
 
     cfst = _cfst_path(config)
     store = ResultStore(session.paths)
     csv_path = store.new_csv(profile_slug(name))
     log_path = store.log_for(csv_path)
     top_n = _top_ips(session, profile)
-    argv = build_scan_argv(cfst, profile, csv_path,
+    argv = build_scan_argv(cfst, scanned, csv_path,
                            results_limit=_requested_results(profile, top_n))
 
     if session.dry_run:
@@ -1020,7 +1184,7 @@ def quick_scan(session, config, profile_name=None, verify_prompt=True):
 
     verified, passed, marked_ip = _finish_scan_results(
         session, config, profile, results, top_n, recommended, csv_path,
-        flow="Quick Scan",
+        flow="Quick Scan", colo_filter=scanned.get("colo"),
     )
 
     store.record_latest(config, csv_path, profile_name=name,
@@ -1138,9 +1302,28 @@ def custom_scan(session, config, profile_name=None, force_save=False,
         http_status = console.ask("Expected HTTP status code",
                                   default=base.get("http_status"),
                                   validate=validate_http_status)
+        if scheme == "https":
+            console.blank()
+            console.line("Region filter: keep only the addresses whose "
+                         "datacentre you name (FRA, AMS, LHR, ...). Leave it "
+                         "empty to measure the whole edge.")
+            colo = console.ask("Datacentres to keep",
+                               default=str(base.get("colo") or "") or "any",
+                               validate=validate_colo)
+        else:
+            # The edge answers this recipe itself with an empty CF-RAY, so the
+            # datacentre is never reported and a filter would drop everything.
+            colo = ""
+            if base.get("colo"):
+                console.warn("The region filter was cleared: it cannot work "
+                             "with scheme=http (see menu 9).")
     else:
         scheme = str(base.get("scheme") or "https").lower()
         http_status = base.get("http_status")
+        colo = ""
+        if base.get("colo"):
+            console.warn("The region filter was cleared: TCPing never learns "
+                         "which datacentre answered.")
 
     attempts = console.ask_int("Number of ping attempts", default=base.get("attempts"),
                                minimum=1, maximum=100, field="attempts")
@@ -1152,9 +1335,12 @@ def custom_scan(session, config, profile_name=None, force_save=False,
                                   maximum=60000, field="maximum latency")
     max_loss = console.ask_loss("Maximum packet loss (percent)",
                                 default=base.get("max_loss"))
-    results_limit = console.ask_int("Number of results to display",
-                                    default=base.get("results_limit"), minimum=1,
-                                    maximum=1000, field="displayed results")
+    # Not "results to display": that was the scanner's -p, which only caps the
+    # scanner's own console output - output cfscan hides. This number is the one
+    # the user actually sees, and the one the strict check re-measures.
+    top_ips = console.ask_int("How many of the best addresses to show and verify",
+                              default=base.get("top_ips") or 10, minimum=1,
+                              maximum=50, field="addresses offered")
     download_test = console.ask_yes_no(
         "Enable the download speed test (slower)?",
         default=bool(base.get("download_test")),
@@ -1184,7 +1370,8 @@ def custom_scan(session, config, profile_name=None, force_save=False,
         "concurrency": concurrency,
         "max_latency_ms": max_latency,
         "max_loss": max_loss,
-        "results_limit": results_limit,
+        "colo": colo,
+        "top_ips": top_ips,
         "download_test": download_test,
         "output_filename": filename,
     })
@@ -1214,12 +1401,13 @@ def custom_scan(session, config, profile_name=None, force_save=False,
     csv_path = store.named_csv(filename)
     log_path = store.log_for(csv_path)
     top_n = _top_ips(session, profile)
-    argv = build_scan_argv(cfst, profile, csv_path,
+    scanned = _scan_profile(session, profile)
+    argv = build_scan_argv(cfst, scanned, csv_path,
                            results_limit=_requested_results(profile, top_n))
 
     console.blank()
     console.heading("Summary")
-    _render_profile(console, new_name, profile)
+    _render_profile(console, new_name, scanned)
 
     if session.dry_run:
         _print_dry_run(console, argv, csv_path, log_path)
@@ -1277,7 +1465,7 @@ def custom_scan(session, config, profile_name=None, force_save=False,
 
     verified, passed, marked_ip = _finish_scan_results(
         session, config, profile, results, top_n, recommended, csv_path,
-        flow="Custom Scan",
+        flow="Custom Scan", colo_filter=scanned.get("colo"),
     )
 
     store.record_latest(config, csv_path, profile_name=new_name,
@@ -1293,6 +1481,162 @@ def custom_scan(session, config, profile_name=None, force_save=False,
 # Flow 3: verify a single IP
 # --------------------------------------------------------------------------
 
+def _show_saved_addresses(console, profile, saved):
+    """List a profile's proven addresses, newest first."""
+    console.blank()
+    console.line(console.style(f"Saved good IPs for {profile.get('domain')}",
+                               "bold"))
+    rows = []
+    for position, entry in enumerate(saved, start=1):
+        rtt = entry.get("rtt_ms")
+        rows.append([
+            str(position),
+            entry["ip"],
+            f"{float(rtt):.0f} ms" if rtt is not None else "-",
+            str(entry.get("colo") or "-"),
+            favourites_module.format_age(entry),
+        ])
+    console.table(["#", "IP address", "Latency", "Colo", "Proven"], rows,
+                  aligns=["r", "l", "r", "l", "l"])
+    console.line(console.style(
+        "Those numbers are from when the address was proven, not from now - "
+        "that is what this check is for.", "dim"))
+
+
+def _ask_verify_target(console, profile, version):
+    """What menu 3 should measure: ``("all", None)`` or ``("one", address)``.
+
+    The saved list is offered first because it is almost always the answer: a
+    scan's winners from yesterday are the cheapest candidates today, and
+    re-proving ten of them is one short run rather than a full range scan.
+    """
+    saved = favourites_module.entries_for(profile)
+    if not saved:
+        address = console.ask(
+            f"IP address to verify (IPv{version})",
+            default=profile.get("recommended_ip"),
+            validate=lambda value: str(validate_ip(value, version=version)),
+        )
+        return "one", address
+
+    _show_saved_addresses(console, profile, saved)
+    console.blank()
+
+    def resolve(value):
+        text = str(value).strip()
+        if text.lower() in ("a", "all"):
+            return ("all", None)
+        if text.isdigit() and 1 <= int(text) <= len(saved):
+            return ("one", saved[int(text) - 1]["ip"])
+        if text.isdigit():
+            raise ValidationError(
+                f"There is no {text} in the list above: pick 1 to {len(saved)}, "
+                "type 'all', or type an IP address."
+            )
+        return ("one", str(validate_ip(text, version=version)))
+
+    return console.ask(
+        f"Number from the list, 'all' to re-check every saved address, or an "
+        f"IPv{version} address",
+        default=profile.get("recommended_ip"),
+        validate=resolve,
+    )
+
+
+def verify_saved_flow(session, config, name, profile, saved):
+    """Re-measure every saved address of a profile in one scanner run."""
+    console = session.console
+    attempts = int(profile.get("verify_attempts") or session.verify_attempts or 20)
+    addresses = [entry["ip"] for entry in saved]
+    console.line(f"Re-checking {len(addresses)} saved address(es) with "
+                 f"{attempts} attempts each.")
+    verified = verify_addresses(session, config, profile, addresses,
+                                label="Re-checking")
+    if verified is None:
+        console.warn("The check did not produce verdicts, so nothing was "
+                     "changed.")
+        remember_result(session, "WARN",
+                        ["The saved addresses could not be re-checked."],
+                        title="Saved addresses - no verdict")
+        return EXIT_FAILED
+
+    rows = []
+    passing = []
+    for entry in saved:
+        row = verified.get(entry["ip"])
+        verdict = _verify_verdict(row, attempts)
+        if verdict == "PASS":
+            passing.append(row)
+        rows.append([
+            verdict,
+            entry["ip"],
+            row.latency_text() if row is not None else "-",
+            row.loss_text() if row is not None else "-",
+            (row.colo_text() if row is not None else None)
+            or str(entry.get("colo") or "-"),
+        ])
+    console.blank()
+    console.heading(f"Saved addresses - {len(passing)} of {len(saved)} still pass")
+    console.table(["Verdict", "IP address", "Latency", "Loss", "Colo"], rows,
+                  aligns=["l", "l", "r", "r", "l"])
+
+    if passing:
+        # Re-proving refreshes the numbers and the order; nothing is dropped for
+        # failing today, because an address that is unreachable this minute is
+        # often the fastest one an hour later.
+        favourites_module.remember_many(profile, passing)
+        best = min(passing, key=lambda row: row.latency_ms)
+        profile["recommended_ip"] = best.ip
+        try:
+            save_config(session.paths, config)
+        except OSError as error:
+            console.warn(f"The profile could not be saved: {error}")
+        console.blank()
+        console.ok(f"Fastest address that still passes: {best.ip} - "
+                   f"{best.latency_text()}, colo {best.colo_text()}.")
+        show_client_guide(console, profile, best.ip)
+        remember_result(session, "PASS", [
+            f"{len(passing)} of {len(saved)} saved addresses still pass",
+            f"Fastest: {best.ip} - {best.latency_text()}, colo {best.colo_text()}",
+            f"Client fields - Address {best.ip}, Port {profile.get('port')}, "
+            f"SNI {profile.get('domain')}, Host {profile.get('domain')}",
+        ], title=f"Saved addresses - {len(passing)}/{len(saved)} PASS")
+        return EXIT_OK
+
+    console.blank()
+    console.warn("Not one saved address answers right now. They are kept - an "
+                 "address that is unreachable this minute is often the fastest "
+                 "one an hour later - but a fresh scan (menu 1) is the way "
+                 "forward if this repeats.")
+    remember_result(session, "FAIL",
+                    [f"None of the {len(saved)} saved addresses passed."],
+                    title="Saved addresses - none pass")
+    return EXIT_FAILED
+
+
+def _point_last_result_at(session, config, store, csv_path, name, ip):
+    """Record a verified address without losing the last full scan.
+
+    Menu 4 is "show the last scan". Replacing its pointer with a single-address
+    verification file used to leave that menu showing one row, right after the
+    same screen had promised it would show the scan. So the scan keeps the
+    pointer and only the recommended address is refreshed; a verification with
+    no scan behind it does become the pointer, because then it is all there is.
+    """
+    pointer = config.get("last_result") or {}
+    stored = str(pointer.get("csv") or "")
+    if stored and Path(stored).exists() and stored != str(csv_path):
+        pointer["recommended_ip"] = ip
+        config["last_result"] = pointer
+        try:
+            save_config(session.paths, config)
+        except OSError as error:  # pragma: no cover - the verdict still stands
+            session.console.warn(f"The result pointer could not be saved: {error}")
+        return pointer
+    return store.record_latest(config, csv_path, profile_name=name,
+                               recommended_ip=ip)
+
+
 def verify_flow(session, config, ip=None, profile_name=None):
     """Prove (or disprove) one address with 20 attempts and zero loss allowed."""
     console = session.console
@@ -1303,11 +1647,10 @@ def verify_flow(session, config, ip=None, profile_name=None):
     console.heading("Verify an IP")
 
     if ip is None:
-        ip = console.ask(
-            f"IP address to verify (IPv{version})",
-            default=profile.get("recommended_ip"),
-            validate=lambda value: str(validate_ip(value, version=version)),
-        )
+        target, ip = _ask_verify_target(console, profile, version)
+        if target == "all":
+            return verify_saved_flow(session, config, name, profile,
+                                     favourites_module.entries_for(profile))
     else:
         try:
             ip = str(validate_ip(ip, version=version))
@@ -1371,8 +1714,21 @@ def verify_flow(session, config, ip=None, profile_name=None):
         )
         console.line(f"Average latency: {row.latency_text()}    "
                      f"Colo: {row.colo_text()}")
+        wanted = str(profile.get("colo") or "")
+        if wanted and row.has_colo and row.colo.upper() not in wanted.upper().split(","):
+            console.warn(f"{ip} answers from {row.colo_text()}, which is not in "
+                         f"this profile's region filter ({wanted}). It works - "
+                         "it is just not where you asked for.")
         show_client_guide(console, profile, ip)
-        store.record_latest(config, csv_path, profile_name=name, recommended_ip=ip)
+
+        # The profile keeps what was proven, so the next scan prefers it and the
+        # preflight starts from an address that is known to answer.
+        profile["recommended_ip"] = ip
+        favourites_module.remember(profile, ip, rtt_ms=row.latency_ms,
+                                   colo=row.colo)
+        _point_last_result_at(session, config, store, csv_path, name, ip)
+        console.line(f"Saved to profile '{name}' - menu 3 offers it first from "
+                     "now on.")
         remember_result(
             session, "PASS",
             [f"{ip} answered {row.received}/{row.sent} attempts, 0% packet loss",
@@ -1627,6 +1983,66 @@ def switch_ip_version(session, config):
 # Flow 8 and 9
 # --------------------------------------------------------------------------
 
+#: Scans kept when the results folder is tidied. Twenty covers weeks of normal
+#: use, and the newest one is never among the files that go.
+KEEP_RESULTS = 20
+
+
+def prunable_results(results_dir, keep=KEEP_RESULTS, protect=()):
+    """The result files a tidy-up would remove, oldest first.
+
+    A scan is one CSV plus its log, so they are counted and removed as a pair.
+    Multi-carrier sessions, candidate lists and anything the configuration still
+    points at are never touched: they are records, not leftovers.
+    """
+    directory = Path(results_dir)
+    if not directory.is_dir():
+        return []
+    protected = {str(item) for item in protect if item}
+    scans = [item for item in directory.glob("*.csv")
+             if item.is_file() and str(item) not in protected]
+    scans.sort(key=lambda item: item.stat().st_mtime_ns)
+    if len(scans) <= max(0, int(keep)):
+        return []
+    doomed = []
+    for csv_path in scans[:len(scans) - int(keep)]:
+        doomed.append(csv_path)
+        log_path = csv_path.with_suffix(".log")
+        if log_path.exists():
+            doomed.append(log_path)
+    return doomed
+
+
+def _tidy_results(session, config, directory):
+    """Offer to remove the oldest scans once the folder has grown."""
+    console = session.console
+    pointer = (config.get("last_result") or {})
+    protect = [pointer.get("csv"), pointer.get("log")]
+    doomed = prunable_results(directory, protect=protect)
+    if not doomed:
+        return
+    console.blank()
+    console.line(f"{len(doomed)} old file(s) are older than the newest "
+                 f"{KEEP_RESULTS} scans.")
+    if not console.interactive or session.assume_yes or session.dry_run:
+        console.line("Run menu 8 in a terminal to remove them.")
+        return
+    if not console.ask_yes_no(f"Delete those {len(doomed)} file(s)?",
+                              default=False):
+        console.line("Kept - nothing was deleted.")
+        return
+    removed = 0
+    for path in doomed:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as error:
+            console.warn(f"{path.name} could not be removed: {error}")
+    console.ok(f"{removed} file(s) removed; the newest {KEEP_RESULTS} scans, "
+               "every multi-carrier session and every candidate list are still "
+               "there.")
+
+
 def open_results_folder(session, config):
     console = session.console
     directory = Path(session.paths.results_dir)
@@ -1637,11 +2053,301 @@ def open_results_folder(session, config):
     except OSError as exc:
         console.error(f"The results folder could not be created: {exc}")
         return EXIT_FAILED
+    files = sorted(directory.glob("*.csv"))
+    if files:
+        console.line(f"{len(files)} saved scan(s).")
+    _tidy_results(session, config, directory)
+    console.blank()
     if results_module.open_in_finder(directory):
         console.ok("Finder opened.")
         return EXIT_OK
     console.warn("Finder could not be opened automatically. Open the path above "
                  "in Finder manually.")
+    return EXIT_OK
+
+
+def _range_age_note(info):
+    """How old a range file is, in one short phrase."""
+    if not info["exists"]:
+        return "missing"
+    parts = [f"{info['ranges']} range(s)"]
+    modified = info.get("modified")
+    if modified is not None:
+        days = max(0, (datetime.now() - modified).days)
+        parts.append(f"{modified:%Y-%m-%d}")
+        if days >= 180:
+            parts.append(f"{days // 30} months old")
+    return ", ".join(parts)
+
+
+def update_ranges_flow(session, config, profile_name=None, assume_yes=None):
+    """Download Cloudflare's current range lists over the ones on disk.
+
+    The lists that ship with the scanner are a snapshot, and a range that is
+    missing from the file is simply never scanned - so this is not cosmetic: it
+    decides which part of the edge can be found at all.
+    """
+    console = session.console
+    name, profile = _profile_pair(config, profile_name)
+    console.heading("Update IP ranges")
+    console.line("Cloudflare publishes its current ranges as plain text. The "
+                 "files below are what the scanner reads.")
+
+    targets = []
+    for version, key in ((4, "ipv4_file"), (6, "ipv6_file")):
+        path = profile.get(key) or (profile.get("ip_file")
+                                    if version == 4 else None)
+        if not path:
+            continue
+        info = ranges_module.describe_file(path)
+        targets.append((version, Path(path), info))
+
+    if not targets:  # pragma: no cover - defensive
+        console.warn("This profile names no range file to update.")
+        return EXIT_FAILED
+
+    console.blank()
+    for version, path, info in targets:
+        console.key_value(f"IPv{version}", f"{path}")
+        console.key_value("  now", _range_age_note(info))
+        console.key_value("  source", ranges_module.url_for_version(version))
+
+    if session.dry_run:
+        console.blank()
+        console.warn("Dry run - nothing was downloaded and nothing was changed.")
+        return EXIT_OK
+
+    console.blank()
+    console.line("The published list is merged into your file rather than "
+                 "swapping it: neither list contains the other. Your file "
+                 "covers 104.28-104.31, which Cloudflare does not publish and "
+                 "which answers today; the published list covers 172.68-172.71, "
+                 "which your file never had.")
+    console.line("The current file is kept next to the new one as "
+                 "'<name>.previous', so this is reversible.")
+    if assume_yes is None:
+        assume_yes = session.assume_yes
+    if not assume_yes and console.interactive:
+        if not console.ask_yes_no("Download the current lists now?", default=True):
+            console.warn("Cancelled - nothing was downloaded.")
+            return EXIT_OK
+
+    updated = 0
+    failed = 0
+    lines = []
+    for version, path, info in targets:
+        url = ranges_module.url_for_version(version)
+        console.blank()
+        console.line(f"Downloading the IPv{version} list from {url} ...")
+        try:
+            text = ranges_module.fetch_text(url)
+            found = ranges_module.parse_ranges(text, version)
+        except ranges_module.RangeError as error:
+            console.error(str(error))
+            lines.append(f"IPv{version}: not updated ({error})")
+            failed += 1
+            continue
+        mine = ranges_module.read_ranges(path, version)
+        merged, stats = ranges_module.merge_ranges(mine, found)
+        try:
+            written, backup = ranges_module.install_ranges(path, merged)
+        except ranges_module.RangeError as error:
+            console.error(str(error))
+            lines.append(f"IPv{version}: not written ({error})")
+            failed += 1
+            continue
+        gained = stats["after"] - stats["before"]
+        kept = stats["after"] - stats["published"]
+        console.ok(f"IPv{version}: {len(merged)} range(s) written to {written}.")
+        if version == 4:
+            console.line(f"  {stats['after']:,} addresses in range now "
+                         f"({gained:+,} compared with before).")
+            summary = f"{stats['after']:,} addresses ({gained:+,})"
+        else:
+            # An IPv6 address count runs to thirty digits and tells a reader
+            # nothing, so the entry count is what is shown. Fewer entries than
+            # before is normal and never a loss: this is a union, and ranges
+            # that sit inside a wider one collapse into it.
+            note = ""
+            if len(merged) < len(mine):
+                note = (f" ({len(mine)} before, collapsed into wider entries - "
+                        "the area covered only ever grows)")
+            elif len(mine):
+                note = f" ({len(mine)} before)"
+            console.line(f"  {len(merged)} range(s) now{note}.")
+            summary = f"{len(merged)} range(s), {len(mine)} before"
+        if kept > 0:
+            console.line("  Some of your ranges are not in Cloudflare's "
+                         "published list and were kept, because dropping a live "
+                         "range costs more than scanning a dead one.")
+        if backup:
+            console.line(f"  previous file kept as {backup}")
+        lines.append(f"IPv{version}: {summary}")
+        updated += 1
+
+    console.blank()
+    if updated:
+        console.line("A scan started from now on measures the new ranges. A "
+                     "candidate list built earlier (menu 10) still holds the old "
+                     "addresses - rebuild it with 'cfscan --make-pool'.")
+    remember_result(session, "PASS" if updated and not failed else
+                    ("WARN" if updated else "FAIL"),
+                    lines or ["Nothing was updated."],
+                    title="Update IP ranges")
+    return EXIT_OK if updated and not failed else EXIT_FAILED
+
+
+def _import_edge_history(session, profile, name):
+    """Build a scoreboard out of the result files already on disk.
+
+    A profile that has never recorded an observation still has months of saved
+    scans sitting in the results folder, and throwing that away to start
+    counting from zero would be silly. The line those scans were taken on is
+    unknown, so they are labelled as such rather than being claimed for the
+    line that happens to be up now.
+    """
+    directory = Path(session.paths.results_dir)
+    if not directory.is_dir():
+        return 0
+    prefix = f"cfscan-{profile_slug(name)}-"
+    files = sorted((item for item in directory.glob(f"{prefix}*.csv")
+                    if item.is_file()),
+                   key=lambda item: item.stat().st_mtime_ns)
+    imported = 0
+    for path in files[-edges_module.MAX_HISTORY:]:
+        try:
+            report = parse_results_csv(path)
+        except CsvError:
+            continue
+        when = datetime.fromtimestamp(path.stat().st_mtime)
+        if edges_module.observe(profile, report.results,
+                                line=edges_module.UNKNOWN_LINE, when=when):
+            imported += 1
+    return imported
+
+
+def _render_scoreboard(console, rows, meta):
+    table = []
+    for position, row in enumerate(rows, start=1):
+        table.append([
+            str(position),
+            row["colo"],
+            f"{row['typical']:.0f} ms",
+            f"{row['best']:.0f} ms",
+            f"{row['clean'] * 100:.0f}%",
+            str(row["samples"]),
+            str(row["scans"]),
+            "" if row["trusted"] else "too few",
+        ])
+    console.table(["#", "Colo", "Typical", "Best", "Loss-free", "Addresses",
+                   "Scans", "Note"], table,
+                  aligns=["r", "l", "r", "r", "r", "r", "r", "l"])
+    console.blank()
+    console.line(console.style(
+        "Typical is the median of each scan's median, so one bad scan cannot "
+        "move it. A row marked 'too few' has not been measured enough to mean "
+        "anything yet and never wins.", "dim"))
+
+
+def edge_locations(session, config, profile_name=None):
+    """Rank the datacentres from what has actually been measured on this line.
+
+    Distance does not decide which edge is fast, so nothing here is derived
+    from a map: the order comes from the scans this profile has run, grouped by
+    the line they ran on.
+    """
+    console = session.console
+    name, profile = _profile_pair(config, profile_name)
+    console.heading("Edge locations")
+
+    if not edges_module.entries_for(profile):
+        imported = _import_edge_history(session, profile, name)
+        if imported:
+            console.info(f"Built a first scoreboard from {imported} saved scan(s) "
+                         "in the results folder.")
+            try:
+                save_config(session.paths, config)
+            except OSError as error:  # pragma: no cover - read-only home
+                console.warn(f"It could not be saved: {error}")
+        else:
+            console.warn("No scan has recorded a datacentre yet. Run menu 1 "
+                         "once and come back.")
+            return EXIT_OK
+
+    line = edges_module.describe_line()
+    everything, _meta = edges_module.scoreboard(profile)
+    rows, meta = edges_module.scoreboard(profile, line=line["label"])
+    scope = line["label"]
+    if not rows:
+        # Nothing measured on this line yet: show what there is and say whose
+        # measurements they are, rather than pretending they describe this one.
+        rows, meta = everything, _meta
+        scope = "all lines"
+
+    console.key_value("Profile", name)
+    console.key_value("Line now", f"{line['label']}"
+                      + ("  (a tunnel - these numbers describe its path)"
+                         if line["tunnel"] else ""))
+    console.key_value("Ranking from", f"{meta['scans']} scan(s) on {scope}")
+    if len(meta["lines"]) > 1:
+        console.key_value("Lines recorded", ", ".join(meta["lines"]))
+    console.blank()
+    _render_scoreboard(console, rows, meta)
+
+    if meta["stale"]:
+        console.blank()
+        console.warn(
+            f"The recent scans were all filtered to {meta['recent_filter']}, so "
+            "the datacentres outside that filter are no longer being measured "
+            "and cannot climb back. Run one scan with the filter cleared now and "
+            "then to keep this honest."
+        )
+
+    suggestion = edges_module.recommended_filter(rows)
+    console.blank()
+    current = str(profile.get("colo") or "")
+    if not suggestion:
+        console.line("Not enough measured yet to suggest a filter. Run a few "
+                     "more scans.")
+        remember_result(session, "INFO",
+                        [f"{len(rows)} datacentre(s) ranked from "
+                         f"{meta['scans']} scan(s)"],
+                        title="Edge locations")
+        return EXIT_OK
+
+    wanted = ",".join(suggestion)
+    console.ok(f"Suggested region filter: {wanted}")
+    console.line(f"  (the fastest measured datacentres on {scope}, dropping any "
+                 "that is far slower than the best)")
+    if current:
+        console.line(f"  This profile currently uses: {current}")
+
+    if wanted == current:
+        console.line("The profile already uses exactly that.")
+    elif console.interactive and not session.assume_yes:
+        console.blank()
+        if console.ask_yes_no(f"Set this profile's region filter to {wanted}?",
+                              default=True):
+            profile["colo"] = wanted
+            problem = colo_problem(profile)
+            if problem:
+                profile["colo"] = current
+                console.error(problem)
+            else:
+                try:
+                    save_config(session.paths, config)
+                except OSError as error:
+                    console.error(f"The profile could not be saved: {error}")
+                else:
+                    console.ok(f"Profile '{name}' now scans only {wanted}.")
+    else:
+        console.line(f"  Apply it with: cfscan --colo {wanted}")
+
+    remember_result(session, "INFO", [
+        f"{len(rows)} datacentre(s) ranked from {meta['scans']} scan(s) on {scope}",
+        f"Fastest: {rows[0]['colo']} at {rows[0]['typical']:.0f} ms typical",
+        f"Suggested filter: {wanted}",
+    ], title="Edge locations")
     return EXIT_OK
 
 
@@ -1669,9 +2375,69 @@ def help_screen(session, config):
                    "off by default.")
 
     console.blank()
+    console.line(console.style("Picking the datacentre (region filter)", "bold"))
+    console.bullet("Cloudflare answers from the datacentre nearest to your line, "
+                   "and which one that is decides the latency far more than the "
+                   "address does. A region filter keeps only the addresses whose "
+                   "datacentre you name - FRA (Frankfurt), AMS (Amsterdam), LHR "
+                   "(London) - and menu 2 asks for it.")
+    console.bullet("Measured on one line here: an unfiltered scan returned 1,385 "
+                   "addresses in GYD (Baku) and two in FRA, while 'FRA,AMS,LHR' "
+                   "returned 36 addresses, all of them FRA or LHR at 138-150 ms. "
+                   "The filter is how you ask for the second result.")
+    console.bullet("It needs HTTPing with scheme=https. TCPing never reads a "
+                   "header, and plain HTTP to an HTTPS port makes the edge answer "
+                   "its own 400, whose CF-RAY header is empty - so in both cases "
+                   "the datacentre stays unknown and the filter would drop every "
+                   "address. cfscan says so instead of letting that happen.")
+    console.bullet("Verification is never filtered: the question there is whether "
+                   "one address still answers, so an address that moved to "
+                   "another datacentre is reported as moved, not as dead.")
+
+    console.bullet("Which datacentres to name is not a question of distance. "
+                   "Measured on one Iranian line over roughly six thousand "
+                   "addresses, GYD (Baku) - the nearest datacentre of all - had "
+                   "a median of 232 ms and was the slowest of every European "
+                   "colo, while FRA, some 3,000 km further away, had a median of "
+                   "176 ms and the fastest address of the whole set at 134 ms. "
+                   "What decides it is the route your carrier takes, not the "
+                   "distance.")
+    console.bullet("So menu 12 does not guess it from a map: every scan records "
+                   "which datacentres answered and how fast, and menu 12 ranks "
+                   "them from that and offers the filter. The ranking is kept "
+                   "per line - a scan taken through a tunnel describes the "
+                   "tunnel's path, not this machine's own connection, and mixing "
+                   "the two would describe neither.")
+    console.bullet("Once a filter is on, the datacentres it leaves out are never "
+                   "measured again and cannot climb back, so menu 12 says when "
+                   "the picture has stopped refreshing. Clearing the filter for "
+                   "one scan now and then keeps it honest.")
+
+    console.blank()
+    console.line(console.style("Scanning through a tunnel", "bold"))
+    console.bullet("When this Mac's default route is a tunnel, the scanner "
+                   "measures the path through it and out of its exit - so the "
+                   "address it recommends is the best one for that tunnel, which "
+                   "is rarely what a clean IP is wanted for. cfscan says so "
+                   "before the first scan.")
+    console.bullet("--direct does not help here: it only clears this shell's "
+                   "proxy variables and cannot change a system route. Turn the "
+                   "tunnel off to measure the real line.")
+    console.bullet("TCPing is meaningless while a tunnel is up. A TUN-mode "
+                   "client answers the TCP handshake locally: measured on one "
+                   "such line, the handshake came back in 0.4 ms while the TLS "
+                   "handshake to the same address took 920 ms.")
+
+    console.blank()
     console.line(console.style("Choosing an address you can trust", "bold"))
     console.bullet("Use menu 3 to verify one address with 20 attempts. It only "
                    "passes when every attempt is answered (0% packet loss).")
+    console.bullet("Every address that passes is saved on its profile, and menu 3 "
+                   "offers that list before it asks you to type anything. 'all' "
+                   "re-checks the whole list in one scanner run - seconds, where "
+                   "finding those addresses cost a full scan.")
+    console.bullet("An address that fails today is kept, not dropped: the same "
+                   "address is often the fastest one an hour later.")
     console.bullet("A pass means the address answered your port and matched your "
                    "expected status right now. Networks change, so re-verify after "
                    "switching Wi-Fi, VPN or carrier.")
@@ -1691,6 +2457,19 @@ def help_screen(session, config):
     console.line(console.style("IPv4 and IPv6", "bold"))
     console.bullet("Menu 7 switches the active profile between IPv4 and IPv6; each "
                    "version uses its own IP range file.")
+
+    console.blank()
+    console.line(console.style("Keeping the IP ranges current", "bold"))
+    console.bullet("A range that is missing from the range file is never scanned, "
+                   "so the file decides which part of Cloudflare's edge can be "
+                   "found at all. Menu 11 downloads the lists Cloudflare "
+                   "publishes today.")
+    console.bullet("It merges rather than replaces, because neither list contains "
+                   "the other: the file shipped with the scanner covers "
+                   "104.28-104.31, which Cloudflare does not publish and which "
+                   "answers today, while the published list covers 172.68-172.71, "
+                   "which the shipped file never had. The previous file is kept "
+                   "beside the new one as '<name>.previous'.")
 
     console.blank()
     console.line(console.style("Several carriers", "bold"))
@@ -1718,6 +2497,9 @@ def help_screen(session, config):
     console.bullet("cfscan --make-pool 2000    fix the candidate list for all rounds")
     console.bullet("cfscan --isp mci --pool pool-xxxx.txt   measure one carrier")
     console.bullet("cfscan --multi-isp         print the report of the last session")
+    console.bullet("cfscan --colo FRA,AMS      keep only those datacentres, this run")
+    console.bullet("cfscan --update-ranges     download the current range lists")
+    console.bullet("cfscan --edges             rank the datacentres you measured")
     console.bullet("cfscan --no-color          disable ANSI colours")
     console.bullet("Press Ctrl+C at any time to stop safely; a dry run never "
                    "executes the scanner.")
@@ -1762,8 +2544,24 @@ def _carrier_list(console, isps=None):
     for index in range(count):
         suggestion = (CARRIER_SUGGESTIONS[index]
                       if index < len(CARRIER_SUGGESTIONS) else None)
-        label = console.ask(f"Name of carrier {index + 1}", default=suggestion)
-        names.append(str(label).strip())
+        if suggestion in names:
+            suggestion = None
+        while True:
+            label = str(console.ask(f"Name of carrier {index + 1}",
+                                    default=suggestion)).strip()
+            # One carrier gets one round, so two rounds sharing a name would
+            # replace one another: the report would then promise more carriers
+            # than were ever measured.
+            if label and label.lower() in [item.lower() for item in names]:
+                console.error(f"'{label}' is already the name of carrier "
+                              f"{[item.lower() for item in names].index(label.lower()) + 1}. "
+                              "Give each carrier a name of its own.")
+                continue
+            if not label:
+                console.error("A carrier needs a name.")
+                continue
+            break
+        names.append(label)
     return names
 
 
@@ -1868,7 +2666,7 @@ def _measure_carrier(session, config, profile, name, pool_file, proved=()):
     log_path = store.log_for(csv_path)
     top_n = max(int(getattr(session, "top_ips", DEFAULT_TOP_PER_ROUND)
                     or DEFAULT_TOP_PER_ROUND), DEFAULT_TOP_PER_ROUND)
-    argv = build_scan_argv(cfst, profile, csv_path,
+    argv = build_scan_argv(cfst, _scan_profile(session, profile), csv_path,
                            results_limit=_requested_results(profile, top_n),
                            candidate_file=str(pool_file))
     if session.dry_run:
@@ -2345,25 +3143,135 @@ _HANDLERS = {
     "8": lambda session, config: open_results_folder(session, config),
     "9": lambda session, config: help_screen(session, config),
     "10": lambda session, config: multi_isp_flow(session, config),
+    "11": lambda session, config: update_ranges_flow(session, config),
+    "12": lambda session, config: edge_locations(session, config),
 }
 
 
+MENU_WIDTH = 66
+
+
+def _recipe_line(profile):
+    """The profile's test recipe as one readable line."""
+    parts = [f"port {profile.get('port')}", f"IPv{profile.get('ip_version', 4)}"]
+    mode = str(profile.get("mode") or "httping").lower()
+    if mode == "httping":
+        scheme = str(profile.get("scheme") or "https").lower()
+        parts.append(f"HTTPing/{scheme}")
+        parts.append(f"expects {profile.get('http_status')}")
+    else:
+        parts.append("TCPing")
+    colo = str(profile.get("colo") or "").strip()
+    parts.append(f"only {colo}" if colo else "any colo")
+    return "  ".join(parts)
+
+
+def _last_run_line(config):
+    """One line about the newest stored result, or None when there is none."""
+    pointer = (config.get("last_result") or {})
+    if not pointer.get("csv"):
+        return None
+    parts = []
+    address = pointer.get("recommended_ip")
+    parts.append(str(address) if address else "no address recommended")
+    when = str(pointer.get("when") or "")
+    try:
+        parts.append(f"{datetime.fromisoformat(when):%d %b %H:%M}")
+    except ValueError:
+        if when:
+            parts.append(when)
+    if not Path(str(pointer["csv"])).exists():
+        parts.append("file removed")
+    return "  ".join(parts)
+
+
+def _scanner_line(session, config, profile):
+    """One line saying whether the two things a scan needs are actually there.
+
+    A missing binary or a missing range file stops a scan seconds after it is
+    started, with an error the user then has to read. Saying it on the menu
+    turns that into something visible before anything is chosen.
+    """
+    problems = []
+    try:
+        check_cfst(_cfst_path(config))
+        scanner = "cfst ready"
+    except CfstNotFoundError:
+        scanner = "cfst MISSING"
+        problems.append("scanner")
+    info = ranges_module.describe_file(ip_file_for(profile))
+    name = Path(info["path"]).name
+    if not info["exists"]:
+        problems.append("ranges")
+        return f"{scanner}  {name} MISSING", problems
+    ranges = f"{name} {info['ranges']} ranges"
+    modified = info.get("modified")
+    if modified is not None:
+        days = max(0, (datetime.now() - modified).days)
+        # A stale list is not an error - it still scans - but it quietly hides
+        # every range Cloudflare published since, so it is worth saying.
+        if days >= 365:
+            problems.append("ranges")
+            ranges += f", {days // 365} year(s) old - menu 11 updates them"
+        else:
+            ranges += f", {modified:%Y-%m-%d}"
+    return f"{scanner}  {ranges}", problems
+
+
 def render_menu(session, config):
+    """Draw the menu screen: what is loaded, then what can be done with it."""
     console = session.console
     try:
         name, profile = get_active(config)
-        summary = (f"{profile.get('domain')}:{profile.get('port')}  |  "
-                   f"IPv{profile.get('ip_version', 4)}  |  {profile.get('mode')}")
     except UnknownProfile:  # pragma: no cover - defensive
-        name, summary = "none", "no active profile"
+        name, profile = "none", {}
 
-    console.rule()
-    console.line(f"{console.style('cfscan', 'bold', 'cyan')} - "
-                 "Cloudflare IP scanner (wraps XIU2/CloudflareSpeedTest)")
-    console.line(f"Active profile: {console.style(name, 'bold')}  ({summary})")
-    console.rule()
-    for key, label in MENU_ITEMS:
-        console.line(f"  {key}. {label}")
+    title = f"cfscan {__version__}"
+    subtitle = "clean Cloudflare IP finder"
+    if running_from_dev_link():
+        subtitle += "  [dev link]"
+    console.line(console.style("=" * MENU_WIDTH, "dim"))
+    console.line(f"  {console.style(title, 'bold', 'cyan')}  "
+                 f"{console.style(subtitle, 'dim')}")
+    console.line(console.style("=" * MENU_WIDTH, "dim"))
+
+    console.line(f"  {console.style('Profile ', 'dim')}  "
+                 f"{console.style(name, 'bold')}")
+    if profile:
+        console.line(f"  {console.style('Target  ', 'dim')}  "
+                     f"{profile.get('domain')}   "
+                     f"{console.style(_recipe_line(profile), 'dim')}")
+        scanner, problems = _scanner_line(session, config, profile)
+        console.line(f"  {console.style('Ready   ', 'dim')}  "
+                     + (console.style(scanner, 'yellow', 'bold') if problems
+                        else console.style(scanner, 'dim')))
+    last = _last_run_line(config)
+    if last:
+        saved = len(favourites_module.entries_for(profile)) if profile else 0
+        if saved:
+            last += f"  ({saved} saved IP(s) in menu 3)"
+        console.line(f"  {console.style('Last run', 'dim')}  "
+                     f"{console.style(last, 'dim')}")
+    if session.dry_run:
+        console.line("  " + console.style("Dry run - scans print their argument "
+                                          "list and never execute", "yellow"))
+    console.line(console.style("-" * MENU_WIDTH, "dim"))
+
+    labels = dict(MENU_ITEMS)
+    for group, keys in MENU_GROUPS:
+        if group:
+            console.line(f"  {console.style(group, 'bold')}")
+        for key in keys:
+            label = labels.get(key)
+            if label is None:  # pragma: no cover - guarded by a test
+                continue
+            hint = MENU_HINTS.get(key) or ""
+            entry = f"{key:>2}. {label}"
+            if hint:
+                console.line(f"   {entry.ljust(26)}{console.style(hint, 'dim')}")
+            else:
+                console.line(f"   {entry}")
+    console.line(console.style("-" * MENU_WIDTH, "dim"))
     console.blank()
 
 
@@ -2381,10 +3289,18 @@ def run_menu(session, config):
         console.warn("Dry run mode: scans print their argument list and never "
                      "execute.")
 
+    drawn = 0
     while True:
+        # The first draw joins whatever the command line already printed; every
+        # later one follows a flow the user has just dismissed with Enter, so the
+        # menu comes back on a clean screen instead of under a wall of scanner
+        # output. Nothing is lost: the terminal's scrollback still has it all.
+        if drawn:
+            console.clear()
         render_menu(session, config)
+        drawn += 1
         try:
-            choice = console.ask_raw("Choose an option (0-10)").strip()
+            choice = console.ask_raw("Choose an option (0-12)").strip()
         except Aborted:
             console.blank()
             console.warn("Cancelled.")

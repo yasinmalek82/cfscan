@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 from cfscan.menu import (
+    MENU_GROUPS,
+    MENU_HINTS,
     MENU_ITEMS,
     Session,
     custom_scan,
@@ -59,7 +61,23 @@ class MenuRenderingTests(unittest.TestCase):
             self.assertIn(label, text)
         self.assertEqual([key for key, _ in MENU_ITEMS],
                          ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-                          "0"])
+                          "11", "12", "0"])
+
+    def test_every_entry_is_in_exactly_one_group_with_a_hint(self):
+        # The screen is built from the groups, so an entry missing from them
+        # would silently disappear from the menu while staying in MENU_ITEMS.
+        grouped = [key for _title, keys in MENU_GROUPS for key in keys]
+        self.assertEqual(sorted(grouped), sorted(key for key, _ in MENU_ITEMS))
+        self.assertEqual(len(grouped), len(set(grouped)))
+        for key, _label in MENU_ITEMS:
+            self.assertIn(key, MENU_HINTS)
+
+    def test_menu_reports_a_missing_scanner_and_range_file(self):
+        fixture = make_fixture()
+        self.addCleanup(fixture.close)
+        fixture.config["cfst_path"] = "/nonexistent/cfst"
+        render_menu(fixture.session, fixture.config)
+        self.assertIn("cfst MISSING", fixture.text)
 
     def test_menu_shows_active_profile(self):
         fixture = make_fixture()
@@ -524,7 +542,7 @@ class CustomScanTests(unittest.TestCase):
         "100",              # concurrency
         "1500",             # max latency
         "10%",              # max packet loss
-        "5",                # results
+        "5",                # best addresses to show and verify
         "n",                # download test
         "office-scan.csv",  # output filename
         "y",                # save profile
@@ -541,10 +559,10 @@ class CustomScanTests(unittest.TestCase):
         self.assertIn("-t 8", text)
         self.assertIn("-tl 1500", text)
         self.assertIn("-tlr 0.10", text)
-        self.assertIn("Results to display: 5", text)
-        # The scanner is asked for at least ten rows, so ten addresses can be
-        # offered even when the profile asks for fewer rows to be displayed.
-        self.assertIn("-p 10", text)
+        self.assertRegex(text, r"Addresses offered\s*: 5")
+        # -p only shapes the scanner's own console listing, so it follows the
+        # number cfscan will show rather than a second, separate setting.
+        self.assertIn("-p 5", text)
         self.assertIn("office-scan.csv", text)
 
     def test_custom_scan_uses_tcping_without_http_flags(self):
@@ -564,7 +582,7 @@ class CustomScanTests(unittest.TestCase):
         self.assertEqual(saved["mode"], "tcp")
         self.assertEqual(saved["attempts"], 8)
         self.assertAlmostEqual(saved["max_loss"], 0.10)
-        self.assertEqual(saved["results_limit"], 5)
+        self.assertEqual(saved["top_ips"], 5)
         self.assertFalse(saved["download_test"])
 
     def test_custom_scan_uses_ipv6_range_file(self):
@@ -584,6 +602,7 @@ class CustomScanTests(unittest.TestCase):
             "1",
             "1",
             "200",
+            "",                 # region filter: keep the default (any)
             "8",
             "100",
             "1000",
@@ -609,6 +628,7 @@ class CustomScanTests(unittest.TestCase):
             "1",
             "1",
             "400",
+            "",                 # region filter: keep the default (any)
             "4",
             "200",
             "1000",
@@ -681,7 +701,7 @@ class TopIpsTests(unittest.TestCase):
         fixture = make_fixture(answers=answers, spawn=spawn)
         self.addCleanup(fixture.close)
         custom_scan(fixture.session, fixture.config)
-        self.assertIn("Top 10 IPs you can use", fixture.text)
+        self.assertIn("Top 5 IPs you can use", fixture.text)
 
     def test_the_profile_can_ask_for_a_shorter_list(self):
         spawn = ScriptedSpawn(log_text=LOG_SUCCESS, csv_text=csv_with_rows(12))
@@ -812,8 +832,11 @@ class HttpingSchemeTests(unittest.TestCase):
         self.assertEqual(saved["scheme"], "http")
 
     def test_https_scheme_is_still_the_default(self):
+        # https asks for the region filter as well; http never does, because
+        # the edge's own 400 carries no datacentre.
         answers = list(self.ANSWERS)
         answers[5] = "1"
+        answers.insert(7, "")
         fixture = make_fixture(answers=answers, dry_run=True)
         self.addCleanup(fixture.close)
         custom_scan(fixture.session, fixture.config)
@@ -1056,7 +1079,7 @@ class NewProfileTests(unittest.TestCase):
         self.assertEqual("brand-new", fixture.reload()["active_profile"])
 
     def test_editing_the_same_profile_keeps_its_filename(self):
-        answers = ["", "", "", "4", "1", "1", "400", "", "", "", "",
+        answers = ["", "", "", "4", "1", "1", "400", "", "", "", "", "",
                    "", "n", "", "n"]
         fixture = make_fixture(answers=answers, dry_run=True)
         self.addCleanup(fixture.close)

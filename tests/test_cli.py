@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import unittest
+from unittest import mock
 
 from cfscan import __version__
-from cfscan.cli import main
+from cfscan.cli import main, source_note
 
 from tests.support import CSV_TWO_ROWS, LOG_SUCCESS, Fixture, ScriptedSpawn
+
+
+def cfscan_cli_file():
+    from cfscan import cli
+
+    return cli.__file__
 
 
 def run(fixture, argv):
@@ -25,6 +33,25 @@ class VersionAndHelpTests(unittest.TestCase):
         self.addCleanup(fixture.close)
         self.assertEqual(run(fixture, ["--version"]), 0)
         self.assertIn(__version__, fixture.text)
+
+    def test_version_flag_names_the_folder_it_runs_from(self):
+        # "Is my edit live?" must be answerable from the output, not guessed.
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        self.assertEqual(run(fixture, ["--version"]), 0)
+        self.assertIn(os.path.dirname(os.path.abspath(cfscan_cli_file())),
+                      fixture.text)
+
+    def test_source_note_reports_a_dev_link_only_for_this_package(self):
+        package_dir = os.path.dirname(os.path.abspath(cfscan_cli_file()))
+        project_dir = os.path.dirname(package_dir)
+        with mock.patch.dict(os.environ, {"CFSCAN_DEV_SOURCE": project_dir}):
+            self.assertTrue(source_note().startswith("dev link:"))
+        # A stale variable pointing somewhere else must not claim a dev link.
+        with mock.patch.dict(os.environ, {"CFSCAN_DEV_SOURCE": "/nowhere"}):
+            self.assertTrue(source_note().startswith("installed:"))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(source_note().startswith("installed:"))
 
     def test_help_flag_documents_options(self):
         fixture = Fixture()
@@ -114,7 +141,7 @@ class ProfileCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         text = fixture.text
         self.assertIn("Using profile 'office' for this session", text)
-        self.assertIn("Active profile: office", text)
+        self.assertRegex(text, r"Profile\s+office")
 
 
 class AutoVerifyCliTests(unittest.TestCase):

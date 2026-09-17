@@ -22,6 +22,7 @@ __all__ = [
     "validate_domain",
     "validate_float",
     "validate_http_status",
+    "validate_colo",
     "validate_int",
     "validate_ip",
     "validate_ip_version",
@@ -291,6 +292,52 @@ def validate_loss(value, field="maximum packet loss"):
             f"Invalid {field}: {value!r} must be between 0% and 100%."
         )
     return fraction
+
+
+#: Cloudflare names a datacentre with the IATA code of its airport (FRA, AMS,
+#: LHR); the scanner also accepts two letter country codes. Anything else is a
+#: typo that would silently filter every address away.
+_COLO_RE = re.compile(r"^[A-Z]{2,4}$")
+MAX_COLO_CODES = 20
+
+
+def validate_colo(value):
+    """Validate a region filter and return it as the scanner wants it.
+
+    Accepts ``"fra, ams"``, ``"FRA,AMS"`` and ``"FRA AMS"`` alike, and returns
+    ``"FRA,AMS"``. An empty value (or "any"/"all"/"none") means no filter, which
+    is the default: the whole edge is measured.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValidationError(
+            "Invalid region filter: expected text such as 'FRA,AMS'."
+        )
+    text = value.strip()
+    if not text or text.lower() in ("none", "any", "all", "-"):
+        return ""
+    assert_no_secrets(text)
+    codes = []
+    for raw in text.replace(" ", ",").split(","):
+        code = raw.strip().upper()
+        if not code:
+            continue
+        if not _COLO_RE.match(code):
+            raise ValidationError(
+                f"Invalid region filter: {code!r} is not a Cloudflare region "
+                "code. Use the three letter airport code of a datacentre - FRA "
+                "(Frankfurt), AMS (Amsterdam), LHR (London) - or a two letter "
+                "country code such as DE, separated by commas."
+            )
+        if code not in codes:
+            codes.append(code)
+    if len(codes) > MAX_COLO_CODES:
+        raise ValidationError(
+            f"Invalid region filter: {len(codes)} region codes is more than a "
+            f"filter needs (the maximum is {MAX_COLO_CODES})."
+        )
+    return ",".join(codes)
 
 
 def validate_http_status(value):

@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__
+from . import __version__, source_note
 from .menu import (
     EXIT_FAILED,
     EXIT_INTERRUPTED,
@@ -22,16 +22,18 @@ from .menu import (
     multi_isp_round,
     quick_scan,
     run_menu,
+    edge_locations,
     show_last_results,
     show_profiles,
+    update_ranges_flow,
     verify_flow,
 )
 from .profiles import Paths, UnknownProfile, load_config
 from .runner import CfstNotFoundError, ScanError
 from .ui import Aborted, Console, supports_ansi
-from .validate import ValidationError
+from .validate import ValidationError, validate_colo
 
-__all__ = ["build_parser", "main"]
+__all__ = ["build_parser", "main", "source_note"]
 
 HELP_TEXT = """
 cfscan - a friendly wrapper around XIU2/CloudflareSpeedTest (the cfst binary).
@@ -47,6 +49,9 @@ Usage:
   cfscan --make-pool 2000             fix the candidate list for every round
   cfscan --isp NAME [--pool FILE]     measure one carrier against that list
   cfscan --multi-isp                  print the report of the stored session
+  cfscan --colo FRA,AMS               keep only those datacentres in this scan
+  cfscan --update-ranges              download Cloudflare's current range lists
+  cfscan --edges                      rank datacentres from what you measured
   cfscan --no-verify-top              skip the strict check of the best addresses
   cfscan --no-preflight               skip the one-address check made before a scan
   cfscan --direct                     scan without this shell's proxy variables
@@ -69,6 +74,26 @@ Multi-carrier scans:
   carrier, and - when nothing passed everywhere - the address covering the most
   carriers. 'cfscan --multi-isp' prints that report again from the stored file,
   and 'cfscan --isp NAME' adds a single round to the newest session.
+
+Region filter:
+  Cloudflare answers from the datacentre nearest to your line, and which one
+  that is decides the latency far more than the address does. '--colo FRA,AMS'
+  (or a filter saved in the profile) keeps only the addresses whose datacentre
+  you named, using the CF-RAY header the edge returns. Measured on one line:
+  an unfiltered scan returned 1,385 addresses in GYD and two in FRA, while
+  'FRA,AMS,LHR' returned 36 addresses, all of them in FRA or LHR at 138-150 ms.
+  It needs HTTPing with scheme=https: TCPing never reads a header, and plain
+  HTTP to an HTTPS port makes the edge answer its own 400, whose CF-RAY is
+  empty - so in both cases the filter would drop every address. cfscan says so
+  instead of letting that happen.
+  Which datacentres to name is not a question of distance - the nearest one
+  measured worst of all on the line above - so cfscan does not guess it from a
+  map. Every scan records which datacentres answered and how fast, and
+  'cfscan --edges' (menu 12) ranks them from that and suggests the filter. The
+  ranking is kept per line, because a scan taken through a tunnel describes the
+  tunnel's path and not this machine's own: mixing the two would describe
+  neither. cfscan says which line it is ranking, and warns when the default
+  route is a tunnel.
 
 Notes:
   The scanner honours the proxy variables of this shell (HTTPS_PROXY and friends),
@@ -115,6 +140,8 @@ COMMAND_FLAGS = (
     ("--make-pool", "write a candidate list"),
     ("--multi-isp", "print the multi-carrier report"),
     ("--isp", "measure one carrier"),
+    ("--update-ranges", "download the current range lists"),
+    ("--edges", "rank the datacentres measured so far"),
 )
 
 
@@ -201,6 +228,12 @@ def build_parser():
                         help="read this multi-carrier session for --multi-isp")
     parser.add_argument("--note", metavar="TEXT", default=None,
                         help="a label stored with a carrier round (access type)")
+    parser.add_argument("--colo", metavar="CODES", default=None,
+                        help="keep only these Cloudflare datacentres (FRA,AMS)")
+    parser.add_argument("--update-ranges", action="store_true",
+                        help="download Cloudflare's current IP range lists")
+    parser.add_argument("--edges", action="store_true",
+                        help="rank the datacentres measured so far")
     return parser
 
 
@@ -237,6 +270,7 @@ def main(argv=None, paths=None, console=None, spawn=None):
 
     if args.version:
         console.line(f"cfscan {__version__}")
+        console.line(source_note())
         return EXIT_OK
 
     # Any None default would hide a flag that is present but carries no value
@@ -278,7 +312,32 @@ def main(argv=None, paths=None, console=None, spawn=None):
         direct=args.direct,
     )
 
+    if args.colo is not None:
+        # A one-run override: the profile on disk is not touched, so trying a
+        # region never quietly rewrites a saved profile.
+        try:
+            wanted = validate_colo(args.colo)
+        except ValidationError as exc:
+            console.error(str(exc))
+            return EXIT_USAGE
+        target = args.profile or config.get("active_profile")
+        if target not in (config.get("profiles") or {}):
+            console.error(f"--colo needs a profile that exists; '{target}' does "
+                          "not.")
+            return EXIT_USAGE
+        # Held on the session, not written into the profile: the flows save the
+        # profile for their own reasons, and a one-run experiment must not ride
+        # along into the stored configuration.
+        session.colo_override = wanted
+        console.info(f"Region filter for this run: {wanted or 'any datacentre'}"
+                     " (the saved profile is unchanged).")
+
     try:
+        if args.update_ranges:
+            return update_ranges_flow(session, config,
+                                      profile_name=args.profile)
+        if args.edges:
+            return edge_locations(session, config, profile_name=args.profile)
         if args.list_profiles:
             return show_profiles(session, config)
         if args.make_pool is not None:

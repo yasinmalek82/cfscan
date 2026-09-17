@@ -40,6 +40,7 @@ __all__ = [
     "build_verify_argv",
     "build_verify_many_argv",
     "check_cfst",
+    "colo_problem",
     "default_spawn",
     "explain_failure",
     "extract_status_rejection",
@@ -178,6 +179,34 @@ def scheme_port_problem(profile):
     )
 
 
+def colo_problem(profile):
+    """Explain a region filter the scanner cannot honour, if any.
+
+    The filter works by reading the ``CF-RAY`` header of the edge's answer, so
+    it needs a real HTTP conversation with Cloudflare. Two settings make that
+    header useless, and in both cases the filter would quietly reject every
+    address instead of failing loudly:
+
+    * TCPing measures a bare TCP connect, so no header is ever read.
+    * Plain HTTP to an HTTPS port makes the edge answer its own 400, and that
+      answer carries an empty ``CF-RAY`` (measured: ``CF-RAY: -``), so the
+      datacentre stays unknown even though the address answers.
+    """
+    if not str(profile.get("colo") or "").strip():
+        return None
+    if str(profile.get("mode") or "httping").lower() != "httping":
+        return ("A region filter needs HTTPing: TCPing only opens a TCP "
+                "connection, so the scanner never learns which datacentre "
+                "answered. Switch the profile to HTTPing, or clear the filter.")
+    if str(profile.get("scheme") or "https").lower() == "http":
+        return ("A region filter cannot work with scheme=http on an HTTPS port: "
+                "Cloudflare answers that request itself with a 400 whose CF-RAY "
+                "header is empty, so no datacentre is reported and every address "
+                "would be filtered away. Use scheme=https for a region filter, "
+                "or clear the filter.")
+    return None
+
+
 # --------------------------------------------------------------------------
 # Argument construction
 # --------------------------------------------------------------------------
@@ -226,6 +255,13 @@ def build_scan_argv(cfst_path, profile, output_path, single_ip=None, attempts=No
     if mode == "httping":
         argv += ["-httping", "-httping-code", str(int(profile["http_status"]))]
         argv += ["-url", build_url(profile)]
+        # A region filter belongs to the search, not to the proof: verification
+        # re-measures addresses this scan already found, and filtering there
+        # would report an address that moved to another datacentre as dead
+        # rather than saying it moved. See _build_verify_argv.
+        colo = str(profile.get("colo") or "").strip()
+        if colo:
+            argv += ["-cfcolo", colo]
 
     if not profile.get("download_test"):
         argv += ["-dd"]
@@ -261,6 +297,10 @@ def _build_verify_argv(cfst_path, profile, selection, output_path, attempts,
         argv += ["-httping", "-httping-code", str(int(profile["http_status"]))]
         argv += ["-url", build_url(profile)]
 
+    # No -cfcolo here on purpose: the question being asked is "does this exact
+    # address still answer", and a region filter would turn "it answers from
+    # another datacentre now" into "it is dead". The colo of every row is parsed
+    # and shown instead, so a move is visible rather than fatal.
     argv += ["-dd"]
     argv += ["-t", str(int(attempts))]
     argv += ["-n", str(int(profile["concurrency"]))]
@@ -691,7 +731,6 @@ def run_scan(argv, log_path, spawn=None, on_progress=None,
             except OSError as error:
                 raise ScanError(f"The scanner could not be started: {error}")
 
-            last_progress = None
             while True:
                 if process.poll() is not None:
                     break
@@ -704,16 +743,12 @@ def run_scan(argv, log_path, spawn=None, on_progress=None,
                 if on_progress is not None:
                     elapsed = time.time() - started
                     if elapsed >= progress_first_after:
-                        report = read_progress_file(log_path)
-                        if report is not None:
-                            last_progress = report
-                        on_progress(report)
+                        on_progress(read_progress_file(log_path))
                         reports += 1
 
             if on_progress is not None and reports == 0 and not outcome.timed_out:
                 report = read_progress_file(log_path)
                 if report is not None:
-                    last_progress = report
                     on_progress(report)
                     reports += 1
 

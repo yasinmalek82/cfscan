@@ -28,7 +28,35 @@ The installer copies the package to `~/.local/share/cfscan/lib` and creates the
 launcher `~/.local/bin/cfscan`. If `~/.local/bin` is not on your `PATH`, the
 installer prints the one line to add to your shell profile.
 
-After changing anything in the package, replace the installed copy with:
+### Working on the code: the live link
+
+While you are editing cfscan, a copied install is in the way - every change
+would need a copy step before the terminal saw it. Link the command to this
+folder once instead:
+
+```sh
+./dev-link.sh
+```
+
+It rewrites `~/.local/bin/cfscan` so the command imports the package straight
+from this folder. From then on every edit is live on the very next `cfscan`
+run: no copy, no update step, nothing to remember. `cfscan --version` prints
+the folder it is running from, so "is my change live?" is a question the
+output answers:
+
+```
+cfscan 1.1.0
+dev link: /path/to/cfscan/cfscan (edits are live)
+```
+
+The link writes no `__pycache__` folders into the sources, and it refuses to
+run (with a clear message) if the project folder is ever moved or deleted
+rather than silently running old code.
+
+### Going back to a copied install
+
+`./install.sh` replaces the link with a normal copied install at any time.
+After that, changes need the copy step again:
 
 ```sh
 ./update.sh
@@ -60,6 +88,9 @@ cfscan --list-profiles       # list saved profiles
 cfscan --make-pool 2000      # fix the candidate list every carrier round shares
 cfscan --isp mci             # measure one carrier against that list
 cfscan --multi-isp           # print the multi-carrier report of the session
+cfscan --colo FRA,AMS        # keep only those datacentres, for this run only
+cfscan --update-ranges       # download Cloudflare's current IP range lists
+cfscan --edges               # rank the datacentres from what you measured
 cfscan --no-color            # plain output
 cfscan --version
 cfscan --help
@@ -71,13 +102,37 @@ running whichever comes first.
 ### The menu
 
 ```
-1. Quick Scan             7. Switch IPv4 / IPv6
-2. Custom Scan            8. Open Results Folder
-3. Verify an IP           9. Help
-4. Show Last Results      10. Multi-carrier scan
-5. Show Saved Profiles    0. Exit
-6. Add or Edit Profile
+==================================================================
+  cfscan 1.1.0  clean Cloudflare IP finder
+==================================================================
+  Profile   england.yasin-ai-54.ir
+  Target    england.yasin-ai-54.ir   port 443  IPv4  HTTPing/https  only FRA,AMS
+  Ready     cfst ready  ip.txt 14 ranges, 2026-09-17
+  Last run  104.16.142.237  16 Sep 12:21  (7 saved IP(s) in menu 3)
+------------------------------------------------------------------
+  Scan
+    1. Quick Scan            scan the range with the active profile
+    2. Custom Scan           ask for every setting, then scan
+   10. Multi-carrier scan    compare carriers on one fixed candidate list
+  Check one address
+    3. Verify an IP          re-check a saved address, or any address you type
+  Results
+    4. Show Last Results     the newest saved result file
+    8. Open Results Folder   reveal the CSV and log files in Finder
+  Setup
+    5. Show Saved Profiles   what is stored and which one is active
+    6. Add or Edit Profile   add, edit, activate or delete a profile
+    7. Switch IPv4 / IPv6    switch the active profile's address family
+   11. Update IP ranges      download Cloudflare's current range lists
+   12. Edge locations        rank the datacentres from what you measured
+    9. Help                  what every setting means
+    0. Exit
+------------------------------------------------------------------
 ```
+
+The block above the list is the state a scan depends on, so a missing scanner,
+a missing range file or a range file that is years old is visible **before**
+anything is chosen rather than seconds into a run.
 
 **Quick Scan** shows the active profile, asks for confirmation, runs `cfst`,
 then prints a ranked table:
@@ -208,6 +263,149 @@ closes cfscan. Pressing it at the menu prompt itself (or choosing `0`) is what
 leaves the program. One-shot commands (`cfscan --quick`, `cfscan --verify IP`)
 print their result and exit, which is what a script wants.
 
+### Picking the datacentre
+
+Cloudflare answers from the datacentre nearest to your line, and which one that
+is decides the latency far more than the address does. A region filter keeps
+only the addresses whose datacentre you name:
+
+```sh
+cfscan --colo FRA,AMS --quick --yes     # this run only
+```
+
+Menu 2 asks for it as well, and stores it on the profile. Measured on one line
+here:
+
+| Scan | Result |
+| --- | --- |
+| no filter | 1,385 addresses in GYD (Baku), 190 in SOF, 53 in ARN, **2 in FRA** |
+| `-cfcolo FRA,AMS,LHR` | **36 addresses, all FRA or LHR**, 138-150 ms |
+
+**Which datacentres to name is not a question of distance.** On the line above,
+the nearest datacentre of all is the slowest:
+
+| colo | samples | min | median |
+| --- | --- | --- | --- |
+| SOF (Sofia) | 299 | 155 ms | **172 ms** |
+| FRA (Frankfurt) | 1,707 | **134 ms** | 176 ms |
+| MUC (Munich) | 791 | 147 ms | 186 ms |
+| **GYD (Baku)** | 2,771 | 214 ms | **232 ms** |
+| IAD (Washington) | 5 | 304 ms | 363 ms |
+
+What decides the number is the route the carrier takes, not the kilometres. So
+cfscan does not guess the filter from a map - see **Ranking the edge locations**
+below.
+
+The filter needs HTTPing with `scheme: https`, because it reads the datacentre
+out of the edge's `CF-RAY` header. TCPing never reads a header, and plain HTTP
+to an HTTPS port makes the edge answer its own 400, whose `CF-RAY` is empty
+(measured: `CF-RAY: -`) - so in both cases the filter would silently drop every
+address. cfscan refuses to set up that combination and says why instead.
+
+Verification is never filtered. The question there is whether one address still
+answers, so an address that moved to another datacentre is reported as having
+moved rather than as dead.
+
+### Ranking the edge locations
+
+Every scan records which datacentres answered and how fast. Menu 12 (or
+`cfscan --edges`) turns that history into an order, and offers the filter that
+follows from it:
+
+```
+ #  Colo  Typical    Best  Loss-free  Addresses  Scans  Note
+--  ----  -------  ------  ---------  ---------  -----  -------
+ 1  SOF    171 ms  155 ms       100%        299      2
+ 2  FRA    190 ms  134 ms       100%        156      2
+ 3  GYD    233 ms  214 ms       100%       2771      2
+ 4  LHR    331 ms  324 ms       100%          2      1  too few
+
+Suggested region filter: SOF,FRA
+```
+
+*Typical* is the median of each scan's median, so one bad scan cannot move it.
+A row marked *too few* has not been measured enough to mean anything and never
+wins, so two lucky addresses cannot outrank a datacentre measured a thousand
+times. On a profile with no history yet, the scoreboard is built from the
+result files already in the results folder.
+
+Two things keep it honest rather than merely convenient:
+
+**A score belongs to the line that measured it.** A scan taken through a tunnel
+describes the tunnel's path, not this machine's own connection, and mixing the
+two produces a ranking that is true of neither. Every entry is labelled with
+the line it came from, and the screen says which line it is describing.
+Tunnels are grouped by kind rather than by number, because macOS hands out
+`utun18` today and `utun19` tomorrow for the same tunnel.
+
+**A filter narrows what can be learned.** Once one is applied, later scans only
+ever see the datacentres it allows, so a colo that becomes good can never be
+discovered again. Entries record the filter they ran under, and the screen
+warns when the picture has stopped refreshing.
+
+### Scanning through a tunnel
+
+When this Mac's default route is a tunnel, the scanner measures the path
+through it and out of its exit - so the address it recommends is the best one
+*for that tunnel*, which is rarely what a clean IP is wanted for. cfscan says
+so before the first scan of a session:
+
+```
+! This Mac's default route is a tunnel (utun19), so the scan measures the path
+  through it and out of its exit - not this machine's own connection.
+```
+
+`--direct` does not help here: it clears this shell's proxy variables and
+cannot change a system route. Turn the tunnel off to measure the real line.
+
+TCPing is meaningless while a tunnel is up, because a TUN-mode client answers
+the TCP handshake locally. Measured on one such line: the handshake came back
+in **0.4 ms** while the TLS handshake to the same address took **920 ms**.
+
+### Addresses you already proved
+
+A full scan measures thousands of addresses to offer ten. Those ten are the
+cheapest candidates tomorrow, so every address that passes the strict check is
+saved on its profile, and menu 3 offers the list before it asks you to type
+anything:
+
+```
+Saved good IPs for england.yasin-ai-54.ir
+#  IP address       Latency  Colo  Proven
+-- ---------------- -------- ----- --------
+ 1  104.16.142.237    134 ms  FRA   2 h ago
+ 2  172.64.78.249     149 ms  FRA   2 h ago
+
+Number from the list, 'all' to re-check every saved address, or an IPv4 address:
+```
+
+`all` re-measures the whole list in **one** scanner run - seconds, where
+finding those addresses cost a full scan. An address that fails today is kept
+rather than dropped: the same address is often the fastest one an hour later.
+
+### Keeping the IP ranges current
+
+A range that is missing from the range file is never scanned, so that file
+decides which part of Cloudflare's edge can be found at all. The list shipped
+with the scanner is a snapshot - the one on this Mac was written in January
+2023. Menu 11 (or `cfscan --update-ranges`) downloads what Cloudflare publishes
+today.
+
+It **merges** rather than replaces, because neither list contains the other:
+
+| | Covers |
+| --- | --- |
+| shipped file (2023) | `104.16.0.0/12`, so 104.28-104.31 - which Cloudflare does not publish, and which answers today (`104.28.173.174`, FRA, 140 ms) |
+| published list | `172.64.0.0/13`, so 172.68-172.71 - which the shipped file never had |
+| merged | 14 entries, 1,786,880 addresses (+262,400) |
+
+Keeping a range Cloudflare no longer publishes costs a little scanning time;
+dropping a live one means never finding the address behind it. The previous
+file is kept beside the new one as `<name>.previous`.
+
+A candidate list built earlier for a carrier comparison still holds the old
+addresses - rebuild it with `cfscan --make-pool` after an update.
+
 ## Configuration
 
 Everything lives in one file: `~/.config/cfscan/config.json` (mode `0600`,
@@ -226,6 +424,7 @@ written atomically).
       "scheme": "https",
       "url_path": "/",
       "http_status": 400,
+      "colo": "FRA,AMS",
       "ip_version": 4,
       "ip_file": "/Users/you/.local/share/cloudflare-speedtest/ip.txt",
       "ipv6_file": "/Users/you/.local/share/cloudflare-speedtest/ipv6.txt",
@@ -234,9 +433,11 @@ written atomically).
       "max_latency_ms": 1000,
       "max_loss": 0.25,
       "results_limit": 20,
+      "top_ips": 10,
       "download_test": false,
       "recommended_ip": "104.21.54.105",
-      "verify_attempts": 20
+      "verify_attempts": 20,
+      "favourites": []
     }
   }
 }
@@ -255,11 +456,14 @@ written atomically).
 | `concurrency` | Parallel workers (`-n`, 1-1000) |
 | `max_latency_ms` | Addresses slower than this are dropped (`-tl`) |
 | `max_loss` | Fraction `0.0`-`1.0`, e.g. `0.25` for 25% (`-tlr`) |
-| `results_limit` | Rows written by the scanner (`-p`); cfscan always asks for at least 10 so ten addresses can be offered |
-| `top_ips` | How many of the best addresses are listed after a scan (default `10`) |
+| `colo` | Cloudflare datacentres to keep, e.g. `"FRA,AMS"` (`-cfcolo`); empty means the whole edge. Needs `mode: httping` with `scheme: https` |
+| `results_limit` | Legacy. It only ever became the scanner's `-p`, which caps the scanner's own console listing - output cfscan hides, because it reads the result file instead. Measured: `-p 1` over five addresses still wrote all five rows. `top_ips` is the setting that decides what you see |
+| `top_ips` | How many of the best addresses are listed **and verified** after a scan (default `10`). Menu 2 asks for this one |
+| `favourites` | Addresses this profile has proven, newest first. Menu 3 offers them before asking you to type an address |
+| `edge_history` | One summary per scan of which datacentres answered and how fast, labelled with the line it was measured on. Menu 12 ranks the edge locations from it |
 | `verify_top_ips` | `true` (default) re-measures those addresses with 20 attempts each before they are listed; `false` skips that step |
 | `download_test` | `false` adds `-dd` (faster scans) |
-| `recommended_ip` | Your verified IP; highlighted when it appears in a scan. Custom Scan clears it automatically when you change the domain or port, because the IP was verified against the old target |
+| `recommended_ip` | Your verified IP; highlighted when it appears in a scan, and rewritten whenever a verification passes. Custom Scan clears it automatically when you change the domain or port, because the IP was verified against the old target |
 
 Profiles can also be created and edited from the menu (option 6). The built-in
 `gerr-yasin-ai-54` profile cannot be deleted, so a working fallback always

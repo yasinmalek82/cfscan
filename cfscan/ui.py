@@ -132,6 +132,19 @@ class Console(object):
         except (ValueError, OSError):  # pragma: no cover - closed stream
             pass
 
+    def clear(self):
+        """Clear the visible screen, when there is a terminal to clear.
+
+        Only the screen: the sequence used here is the one ``clear`` sends, so
+        everything printed before stays in the terminal's scrollback and can
+        still be scrolled back to. A pipe or a captured stream gets nothing at
+        all, which keeps saved output free of escape codes.
+        """
+        if not self.color or not self._is_tty:
+            return False
+        self.write("\x1b[H\x1b[2J")
+        return True
+
     def heading(self, text):
         self.blank()
         self.line(self._c(text, "bold", "cyan"))

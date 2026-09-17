@@ -1,0 +1,18 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Local tool state, not source
+.freebuff/
+
+# Scanner output that lands in the project folder when cfst is run from here.
+# Real results belong in ~/Documents/Cloudflare Scanner Results/.
+result.csv
