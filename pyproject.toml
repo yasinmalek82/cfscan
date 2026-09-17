@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfscan"
+version = "1.1.0"
+description = "A friendly interactive wrapper around XIU2/CloudflareSpeedTest (cfst)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["cloudflare", "cdn", "speedtest", "cfst", "networking"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet",
+    "Topic :: System :: Networking",
+]
+dependencies = []
+
+[project.scripts]
+cfscan = "cfscan.cli:main"
+# The certificate helper is a standalone module, independent of the package.
+pgcert = "pgcert:main"
+
+[tool.setuptools]
+packages = ["cfscan"]
+py-modules = ["pgcert"]
