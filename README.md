@@ -565,6 +565,15 @@ slower because every candidate is downloaded from.
 * Colours appear only when the terminal supports them (`NO_COLOR` is honoured);
   every screen stays readable without colour.
 
+## The certificate helper
+
+`pgcert` used to live in this folder and is now its own project, at
+`../pgcert`. It shares no code with cfscan - it imports only the standard
+library, and cfscan never referred to it. The Persian walkthrough that used to
+be `docs/ssl-cert-macos-fa.html` went with it: it is mostly about certificates,
+though it also carries cfscan troubleshooting, so it was moved whole rather
+than split in two.
+
 ## Development
 
 ```sh

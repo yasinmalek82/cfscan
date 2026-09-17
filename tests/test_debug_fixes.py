@@ -2,9 +2,9 @@
 
 Each test here started life as a real failure on the machine, not as a guess:
 an IPv6 profile reaching a traceback from the menu, a candidate list size that
-was silently clamped, a re-measured carrier that destroyed a stored session, a
-report whose columns collided, and a read-only pgcert command that rewrote the
-paste-ready files. They are kept together so the story stays readable.
+was silently clamped, a re-measured carrier that destroyed a stored session,
+and a report whose columns collided. They are kept together so the story stays
+readable. (One more belonged to pgcert, which is now its own project.)
 """
 
 from __future__ import annotations

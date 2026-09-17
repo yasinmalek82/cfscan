@@ -22,9 +22,6 @@ dependencies = []
 
 [project.scripts]
 cfscan = "cfscan.cli:main"
-# The certificate helper is a standalone module, independent of the package.
-pgcert = "pgcert:main"
 
 [tool.setuptools]
 packages = ["cfscan"]
-py-modules = ["pgcert"]
