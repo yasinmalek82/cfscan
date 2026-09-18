@@ -39,6 +39,7 @@ __all__ = [
     "build_url",
     "build_verify_argv",
     "build_verify_many_argv",
+    "certificate_depth_hint",
     "check_cfst",
     "colo_problem",
     "default_spawn",
@@ -176,6 +177,44 @@ def scheme_port_problem(profile):
         "plain HTTP response and the scanner rejects every address with "
         "\"server gave HTTP response to HTTPS client\". Use scheme=http for "
         f"this port, or move the test URL to an HTTPS port ({https_ports})."
+    )
+
+
+def certificate_depth_hint(domain):
+    """Why a hostname this deep usually has no certificate at the edge, if so.
+
+    A TLS wildcard matches exactly one label (RFC 6125), and Cloudflare's
+    Universal SSL issues only ``example.com`` and ``*.example.com``. So
+    ``a.example.com`` is covered and ``a.b.example.com`` is not - the edge then
+    refuses the handshake for it while happily serving its siblings.
+
+    Measured on one zone: the edge presented ``CN=yasin-ai-54.ir`` with
+    ``DNS:yasin-ai-54.ir, DNS:*.yasin-ai-54.ir``; two hostnames one label deep
+    answered, and ``ws.tr.yasin-ai-54.ir`` was refused at the handshake.
+
+    Returns ``None`` for a hostname that is not deep enough for this to be the
+    explanation. Where it does return a hint it says "likely", because knowing
+    the real zone needs a public suffix list, which this tool does not carry:
+    ``co.ir`` and ``ac.ir`` exist, so four labels is a strong signal and not a
+    proof.
+    """
+    labels = [item for item in str(domain or "").split(".") if item]
+    if len(labels) < 4:
+        return None
+    parent = ".".join(labels[1:])
+    # The certificate almost certainly lives on the registrable domain, which
+    # for a four label name is the last two. That is where to look, while the
+    # sentence above explains the rule with the immediate parent.
+    zone = ".".join(labels[-2:])
+    return (
+        f"{domain} is more than one level below its zone, and that is the usual "
+        "reason an edge refuses TLS for a name while serving its siblings: a "
+        "wildcard certificate matches exactly one label, and Cloudflare's "
+        "Universal SSL only issues the zone and *.zone - so a certificate that "
+        f"covers {parent} does not cover {domain}. To see which names the "
+        f"certificate really lists, ask a hostname that does work, or the zone "
+        f"itself:  openssl s_client -connect {zone}:443 -servername {zone} "
+        "</dev/null 2>/dev/null | openssl x509 -noout -ext subjectAltName"
     )
 
 

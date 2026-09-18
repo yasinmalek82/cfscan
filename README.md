@@ -89,6 +89,7 @@ cfscan --make-pool 2000      # fix the candidate list every carrier round shares
 cfscan --isp mci             # measure one carrier against that list
 cfscan --multi-isp           # print the multi-carrier report of the session
 cfscan --colo FRA,AMS        # keep only those datacentres, for this run only
+cfscan --colo any            # ignore the profile's filter, measure everything
 cfscan --update-ranges       # download Cloudflare's current IP range lists
 cfscan --edges               # rank the datacentres from what you measured
 cfscan --no-color            # plain output
@@ -124,7 +125,7 @@ running whichever comes first.
     6. Add or Edit Profile   add, edit, activate or delete a profile
     7. Switch IPv4 / IPv6    switch the active profile's address family
    11. Update IP ranges      download Cloudflare's current range lists
-   12. Edge locations        rank the datacentres from what you measured
+   12. Edge locations        rank the datacentres, or clear the filter
     9. Help                  what every setting means
     0. Exit
 ------------------------------------------------------------------
@@ -305,6 +306,44 @@ address. cfscan refuses to set up that combination and says why instead.
 Verification is never filtered. The question there is whether one address still
 answers, so an address that moved to another datacentre is reported as having
 moved rather than as dead.
+
+**Turning it off is always one choice away.** Menu 2 and menu 12 both offer
+*"measure every datacentre"* as a choice on screen, menu 6 edits it without
+running a scan, and one run can ignore a saved filter entirely:
+
+```sh
+cfscan --colo any --quick --yes     # the saved profile is not touched
+```
+
+### When no address can work: a missing certificate
+
+A hostname the edge has no certificate for fails in a way that looks exactly
+like a dead network. The scanner cannot tell them apart - its Go client wraps
+the TLS alert in its own timeout, so the log says `context deadline exceeded`
+for both - so cfscan asks the question a second way. Plain HTTP to an HTTPS
+port is answered by Cloudflare itself and needs no certificate, so an address
+that answers *that* while failing the TLS probe settles it:
+
+```
+x The edge answers for ws.tr.yasin-ai-54.ir over plain HTTP but refuses TLS for
+  it, so this is a certificate problem, not an address problem.
+  - No clean IP can fix it. ...
+```
+
+The usual cause is depth. A TLS wildcard matches **exactly one label**, and
+Cloudflare's Universal SSL issues only the zone and `*.zone`:
+
+| hostname | labels below the zone | covered by `*.yasin-ai-54.ir` |
+| --- | --- | --- |
+| `england.yasin-ai-54.ir` | 1 | yes |
+| `wsturkey.yasin-ai-54.ir` | 1 | yes |
+| `ws.tr.yasin-ai-54.ir` | **2** | **no** |
+
+The ways out are a hostname one level below the zone, Cloudflare's Advanced
+Certificate Manager / Total TLS, or a custom certificate - which is what the
+sibling `pgcert` project issues. Setting `scheme: http` is **not** one of them:
+it makes the scan produce rows again while the client still cannot connect, so
+cfscan says so rather than letting it look like a fix.
 
 ### Ranking the edge locations
 

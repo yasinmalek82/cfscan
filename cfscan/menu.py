@@ -42,6 +42,7 @@ from .profiles import (
 from .results import ResultStore, latest_result_path, timestamp_label
 from .runner import (
     CLOUDFLARE_HTTPS_PORTS,
+    certificate_depth_hint,
     colo_problem,
     PROBE_ADDRESSES,
     CfstNotFoundError,
@@ -981,6 +982,80 @@ def _report_edge_status(console, profile, rejection):
                    "443), so these addresses can serve the client too.")
 
 
+def _tls_capability_check(session, cfst, name, profile, address):
+    """Does the edge serve this hostname at all, when TLS is taken out of it?
+
+    This is the only way to tell "the edge has no certificate for this name"
+    from "the network is down", because the scanner cannot tell them apart: its
+    Go client wraps the TLS alert in its own timeout, so a hostname the edge
+    refuses to do TLS for is reported as ``context deadline exceeded`` - exactly
+    what an unreachable address reports (measured against a hostname whose
+    handshake curl showed failing instantly).
+
+    So the question is asked a second way. Plain HTTP to an HTTPS port is
+    answered by Cloudflare itself with a 400 and needs no certificate at all, so
+    an address that answers *that* while failing the TLS probe proves the edge is
+    alive for this hostname and the certificate is what is missing.
+
+    Returns True (the edge answered without TLS), False (it did not) or None
+    (the question does not apply, or the user stopped it).
+    """
+    if str(profile.get("mode") or "httping").lower() != "httping":
+        return None
+    if str(profile.get("scheme") or "https").lower() != "https":
+        return None
+    try:
+        if int(profile.get("port")) not in CLOUDFLARE_HTTPS_PORTS:
+            # On any other port the edge does not answer a plain request itself,
+            # so a failure there would say nothing about the certificate.
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    store = ResultStore(session.paths)
+    csv_path = store.new_csv(f"tlscheck-{profile_slug(name)}")
+    log_path = store.log_for(csv_path)
+    plain = dict(profile, scheme="http", http_status=400)
+    argv = build_probe_argv(cfst, plain, address, csv_path, attempts=2)
+    session.console.line("Checking whether the edge serves this hostname at all "
+                         "without TLS ...")
+    outcome = _execute_scan(session, argv, log_path, label="TLS check")
+    answered = outcome.has_result
+    _discard_probe_result(csv_path)
+    if outcome.interrupted:
+        return None
+    return answered
+
+
+def _report_missing_certificate(console, profile):
+    """Say that the edge is alive but has no certificate for this hostname."""
+    domain = profile.get("domain")
+    console.blank()
+    console.error(
+        f"The edge answers for {domain} over plain HTTP but refuses TLS for it, "
+        "so this is a certificate problem, not an address problem."
+    )
+    console.bullet(
+        "No clean IP can fix it. Every Cloudflare address will behave the same "
+        "way, and your client will fail for the same reason the scan does - it "
+        "needs the same TLS handshake."
+    )
+    hint = certificate_depth_hint(domain)
+    if hint:
+        console.bullet(hint)
+    console.bullet(
+        "Ways out: use a hostname one level below the zone (a.example.com "
+        "rather than a.b.example.com), buy Cloudflare's Advanced Certificate "
+        "Manager / Total TLS for the deeper wildcard, or upload a custom "
+        "certificate - which is what the pgcert project issues with acme.sh."
+    )
+    console.bullet(
+        "Setting scheme=http would make this scan produce results again, but it "
+        "would not fix anything: the edge answers that probe itself, so the scan "
+        "would measure the edge while your client still could not connect."
+    )
+
+
 def preflight_probe(session, config, name, profile):
     """Measure one address with the profile's own test URL before a full scan.
 
@@ -1041,6 +1116,21 @@ def preflight_probe(session, config, name, profile):
     console.warn(f"Preflight failed: none of the {len(candidates)} Cloudflare "
                  "addresses tried answered this profile's test URL, so a full "
                  "scan is expected to return nothing.")
+
+    # Before guessing from the log, ask the one question the log cannot answer:
+    # is the edge serving this hostname at all? A "yes" here means the addresses
+    # are fine and the certificate is not.
+    if _tls_capability_check(session, cfst, name, profile, address):
+        _report_missing_certificate(console, profile)
+        if outcome is not None and outcome.log_path:
+            console.line(f"Preflight scanner log: {outcome.log_path}")
+        if not console.interactive or session.assume_yes:
+            console.warn("Not scanning the range: it cannot produce a usable "
+                         "address while the certificate is missing.")
+            return False
+        console.blank()
+        return console.ask_yes_no("Scan the whole range anyway?", default=False)
+
     hints = explain_failure(outcome.log_text if outcome is not None else "",
                             profile, address)
     if not hints:
@@ -1215,6 +1305,50 @@ def quick_scan(session, config, profile_name=None, verify_prompt=True):
 # Flow 2: custom scan
 # --------------------------------------------------------------------------
 
+def _ask_region_filter(console, current):
+    """Ask which datacentres to keep, with "none of them" always on screen.
+
+    An earlier version asked for the list as free text and told the user to
+    "leave it empty" to measure the whole edge. That was wrong twice over: an
+    empty answer makes :meth:`Console.ask` fall back to the default, so pressing
+    Enter *kept* the filter, and the only spellings that really cleared it -
+    "any", "all", "none" - were never shown anywhere. A filter that cannot be
+    switched off from the screen that sets it is a trap, so the choice is on
+    screen instead of being a word you have to know.
+    """
+    current = str(current or "").strip()
+    console.blank()
+    console.line("A region filter keeps only the addresses whose datacentre you "
+                 "name (FRA, AMS, LHR, ...). Without one, the whole edge is "
+                 "measured - which is what you want when you do not yet know "
+                 "which datacentres are fast on your line (menu 12 ranks them).")
+    if not current:
+        answer = console.ask_choice(
+            "Region filter",
+            [("1", "Measure every datacentre (no filter)"),
+             ("2", "Keep only the datacentres I name")],
+            default="1",
+        )
+        if answer == "1":
+            return ""
+        return console.ask("Datacentres to keep", default="FRA,AMS",
+                           validate=validate_colo)
+
+    answer = console.ask_choice(
+        "Region filter",
+        [("1", f"Keep {current}"),
+         ("2", "Measure every datacentre (clear the filter)"),
+         ("3", "Type a different list")],
+        default="1",
+    )
+    if answer == "1":
+        return current
+    if answer == "2":
+        return ""
+    return console.ask("Datacentres to keep", default=current,
+                       validate=validate_colo)
+
+
 def _ask_profile_name(console, config, current, force_save):
     """Ask for the profile name, refusing to replace one by accident.
 
@@ -1263,8 +1397,14 @@ def _offer_to_activate(session, config, name):
 
 
 def custom_scan(session, config, profile_name=None, force_save=False,
-                save_prompt=True):
-    """Ask for every setting, then optionally save and run it."""
+                save_prompt=True, scan=True):
+    """Ask for every setting, then optionally save and run it.
+
+    ``scan=False`` stops after the profile is saved and shown. Menu 6 needs
+    that: it is called "Add or Edit Profile" and had no way to change a setting
+    that did not also cost a full scan, which is how the region filter ended up
+    feeling permanent.
+    """
     console = session.console
     name, base = _profile_pair(config, profile_name)
 
@@ -1303,13 +1443,7 @@ def custom_scan(session, config, profile_name=None, force_save=False,
                                   default=base.get("http_status"),
                                   validate=validate_http_status)
         if scheme == "https":
-            console.blank()
-            console.line("Region filter: keep only the addresses whose "
-                         "datacentre you name (FRA, AMS, LHR, ...). Leave it "
-                         "empty to measure the whole edge.")
-            colo = console.ask("Datacentres to keep",
-                               default=str(base.get("colo") or "") or "any",
-                               validate=validate_colo)
+            colo = _ask_region_filter(console, base.get("colo"))
         else:
             # The edge answers this recipe itself with an empty CF-RAY, so the
             # datacentre is never reported and a filter would drop everything.
@@ -1408,6 +1542,20 @@ def custom_scan(session, config, profile_name=None, force_save=False,
     console.blank()
     console.heading("Summary")
     _render_profile(console, new_name, scanned)
+
+    if not scan:
+        console.blank()
+        if save_it:
+            console.ok(f"Profile '{new_name}' saved. Nothing was scanned.")
+        else:
+            console.warn("These settings were not saved, and nothing was "
+                         "scanned.")
+        remember_result(session, "INFO",
+                        [f"Profile '{new_name}' "
+                         + ("saved" if save_it else "left unsaved"),
+                         "No scan was run."],
+                        title="Edit profile")
+        return EXIT_OK
 
     if session.dry_run:
         _print_dry_run(console, argv, csv_path, log_path)
@@ -1869,7 +2017,8 @@ def manage_profiles(session, config):
         "What would you like to do?",
         [("1", "Make a profile active"),
          ("2", "Add a new profile"),
-         ("3", "Delete a profile"),
+         ("3", "Edit the active profile (no scan)"),
+         ("4", "Delete a profile"),
          ("0", "Back to the main menu")],
         default="0",
     )
@@ -1879,6 +2028,12 @@ def manage_profiles(session, config):
     if choice == "2":
         return custom_scan(session, config, force_save=True, save_prompt=False)
     if choice == "3":
+        # Editing works on the active profile because every prompt starts from
+        # its values; editing another one from here would copy the active
+        # profile's settings onto it. Option 1 switches first.
+        return custom_scan(session, config, force_save=True, save_prompt=False,
+                           scan=False)
+    if choice == "4":
         return _delete_profile_flow(session, config)
     return EXIT_OK
 
@@ -2322,13 +2477,24 @@ def edge_locations(session, config, profile_name=None):
     if current:
         console.line(f"  This profile currently uses: {current}")
 
-    if wanted == current:
-        console.line("The profile already uses exactly that.")
-    elif console.interactive and not session.assume_yes:
+    if console.interactive and not session.assume_yes:
+        # Clearing has to be on this screen. It is the screen that warns the
+        # filter has stopped the ranking from refreshing, and offering no way to
+        # act on that warning is what made the filter feel like a one-way door.
+        options = []
+        if wanted != current:
+            options.append(("1", f"Use the suggested filter: {wanted}"))
+        if current:
+            options.append(("2", "Measure every datacentre (clear the filter)"))
+            options.append(("3", f"Keep {current}"))
+        else:
+            options.append(("3", "Keep measuring every datacentre"))
         console.blank()
-        if console.ask_yes_no(f"Set this profile's region filter to {wanted}?",
-                              default=True):
-            profile["colo"] = wanted
+        answer = console.ask_choice("What should this profile scan?", options,
+                                    default=options[0][0])
+        if answer in ("1", "2"):
+            chosen = wanted if answer == "1" else ""
+            profile["colo"] = chosen
             problem = colo_problem(profile)
             if problem:
                 profile["colo"] = current
@@ -2339,9 +2505,15 @@ def edge_locations(session, config, profile_name=None):
                 except OSError as error:
                     console.error(f"The profile could not be saved: {error}")
                 else:
-                    console.ok(f"Profile '{name}' now scans only {wanted}.")
+                    console.ok(f"Profile '{name}' now scans "
+                               + (f"only {chosen}." if chosen
+                                  else "every datacentre."))
+    elif wanted == current:
+        console.line("The profile already uses exactly that.")
     else:
         console.line(f"  Apply it with: cfscan --colo {wanted}")
+        if current:
+            console.line("  Or clear it with: cfscan --colo any")
 
     remember_result(session, "INFO", [
         f"{len(rows)} datacentre(s) ranked from {meta['scans']} scan(s) on {scope}",
@@ -2412,6 +2584,10 @@ def help_screen(session, config):
                    "measured again and cannot climb back, so menu 12 says when "
                    "the picture has stopped refreshing. Clearing the filter for "
                    "one scan now and then keeps it honest.")
+    console.bullet("Turning it off is always one choice away: menu 2 and menu 12 "
+                   "both offer \"measure every datacentre\", menu 6 edits it "
+                   "without running a scan, and 'cfscan --colo any' ignores the "
+                   "saved filter for a single run.")
 
     console.blank()
     console.line(console.style("Scanning through a tunnel", "bold"))

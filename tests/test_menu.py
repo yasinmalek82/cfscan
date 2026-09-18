@@ -473,7 +473,7 @@ class ProfilesViewTests(unittest.TestCase):
 
 class ManageProfilesTests(unittest.TestCase):
     def test_delete_profile_with_confirmation(self):
-        fixture = make_fixture(answers=["3", "2", "y"])
+        fixture = make_fixture(answers=["4", "2", "y"])
         self.addCleanup(fixture.close)
         fixture.config["profiles"]["office"] = dict(fixture.profile())
         fixture.save()
@@ -481,7 +481,7 @@ class ManageProfilesTests(unittest.TestCase):
         self.assertNotIn("office", fixture.reload()["profiles"])
 
     def test_delete_can_be_cancelled(self):
-        fixture = make_fixture(answers=["3", "2", "n"])
+        fixture = make_fixture(answers=["4", "2", "n"])
         self.addCleanup(fixture.close)
         fixture.config["profiles"]["office"] = dict(fixture.profile())
         fixture.save()
@@ -489,7 +489,7 @@ class ManageProfilesTests(unittest.TestCase):
         self.assertIn("office", fixture.reload()["profiles"])
 
     def test_default_profile_cannot_be_deleted(self):
-        fixture = make_fixture(answers=["3", "1", "y"])
+        fixture = make_fixture(answers=["4", "1", "y"])
         self.addCleanup(fixture.close)
         manage_profiles(fixture.session, fixture.config)
         self.assertIn(DEFAULT_KEY, fixture.reload()["profiles"])

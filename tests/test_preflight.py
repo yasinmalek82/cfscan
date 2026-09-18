@@ -17,6 +17,7 @@ from cfscan.profiles import default_profile
 from cfscan.runner import (
     CLOUDFLARE_HTTPS_PORTS,
     build_probe_argv,
+    certificate_depth_hint,
     explain_failure,
     scheme_port_problem,
 )
@@ -311,6 +312,126 @@ class EdgeStatusTests(unittest.TestCase):
         # Probe and scan only: the profile measures the origin by itself.
         self.assertEqual(2, len(spawn.calls))
         self.assertNotIn("Edge check", fixture.text)
+
+
+class CertificateDepthHintTests(unittest.TestCase):
+    def test_a_name_more_than_one_level_deep_gets_the_hint(self):
+        hint = certificate_depth_hint("ws.tr.yasin-ai-54.ir")
+        self.assertIn("one level below its zone", hint)
+        # It must name the parent, because that is what the certificate covers,
+        # and point openssl at the zone, which is where the certificate lives.
+        self.assertIn("covers tr.yasin-ai-54.ir", hint)
+        self.assertIn("-servername yasin-ai-54.ir", hint)
+
+    def test_a_name_one_level_deep_gets_nothing(self):
+        # *.zone covers exactly one label, so these are fine.
+        self.assertIsNone(certificate_depth_hint("wsturkey.yasin-ai-54.ir"))
+        self.assertIsNone(certificate_depth_hint("england.yasin-ai-54.ir"))
+
+    def test_an_apex_or_a_nonsense_value_gets_nothing(self):
+        for value in ("yasin-ai-54.ir", "", None, "localhost"):
+            self.assertIsNone(certificate_depth_hint(value))
+
+    def test_it_never_claims_certainty(self):
+        # co.ir and ac.ir exist and there is no public suffix list here, so four
+        # labels is a strong signal and not a proof.
+        self.assertIn("usual reason", certificate_depth_hint("a.b.example.com"))
+
+
+class MissingCertificateTests(unittest.TestCase):
+    """Telling "the edge has no certificate for this name" from "it is down".
+
+    The scanner cannot tell them apart: its Go client wraps the TLS alert in its
+    own timeout, so a hostname the edge refuses TLS for is reported as
+    "context deadline exceeded" - exactly what a dead address reports (measured
+    against a hostname whose handshake curl showed failing instantly). So the
+    question is asked a second way, with a probe that needs no certificate.
+    """
+
+    @staticmethod
+    def flat(text):
+        """The output with its wrapping removed, so assertions survive it."""
+        return " ".join(str(text).split())
+
+    def make_fixture(self, spawn, answers=(), tty=False):
+        fixture = Fixture(answers=answers, spawn=spawn, preflight=True, tty=tty)
+        self.addCleanup(fixture.close)
+        fixture.session.verify_top_ips = False
+        profile = fixture.profile()
+        profile["domain"] = "ws.tr.yasin-ai-54.ir"
+        profile["port"] = 443
+        profile["scheme"] = "https"
+        return fixture
+
+    def timing_out_then_answering(self):
+        """Every TLS probe times out; the plain-HTTP probe answers."""
+        return ScriptedSpawn(
+            log_text=LOG_NO_RESULTS,
+            csv_sequence=[None, None, None, CSV_TWO_ROWS],
+        )
+
+    def test_the_certificate_is_named_as_the_problem(self):
+        fixture = self.make_fixture(self.timing_out_then_answering())
+        fixture.session.assume_yes = True
+        profile = fixture.profile()
+
+        went_ahead = preflight_probe(fixture.session, fixture.config,
+                                     fixture.config["active_profile"], profile)
+
+        text = fixture.text
+        self.assertFalse(went_ahead)
+        self.assertIn("refuses TLS", self.flat(text))
+        self.assertIn("certificate problem, not an address problem",
+                      self.flat(text))
+        self.assertIn("No clean IP can fix it", self.flat(text))
+
+    def test_the_depth_hint_is_included_for_a_deep_name(self):
+        fixture = self.make_fixture(self.timing_out_then_answering())
+        fixture.session.assume_yes = True
+        preflight_probe(fixture.session, fixture.config,
+                        fixture.config["active_profile"], fixture.profile())
+        self.assertIn("one level below its zone", self.flat(fixture.text))
+
+    def test_switching_scheme_is_not_offered_as_a_fix(self):
+        # It makes the scan produce rows while the client still cannot connect.
+        fixture = self.make_fixture(self.timing_out_then_answering())
+        fixture.session.assume_yes = True
+        preflight_probe(fixture.session, fixture.config,
+                        fixture.config["active_profile"], fixture.profile())
+        self.assertIn("would not fix anything", self.flat(fixture.text))
+
+    def test_the_check_leaves_no_files_behind(self):
+        fixture = self.make_fixture(self.timing_out_then_answering())
+        fixture.session.assume_yes = True
+        preflight_probe(fixture.session, fixture.config,
+                        fixture.config["active_profile"], fixture.profile())
+        left = sorted(item.name for item in
+                      Path(fixture.paths.results_dir).glob("*tlscheck*"))
+        self.assertEqual(left, [])
+
+    def test_an_address_problem_is_still_reported_as_one(self):
+        # Nothing answers, not even the probe that needs no certificate.
+        spawn = ScriptedSpawn(log_text=LOG_ORIGIN_UNREACHABLE, create_csv=False)
+        fixture = self.make_fixture(spawn)
+        fixture.session.assume_yes = True
+
+        preflight_probe(fixture.session, fixture.config,
+                        fixture.config["active_profile"], fixture.profile())
+
+        text = fixture.text
+        self.assertNotIn("certificate problem", self.flat(text))
+        self.assertIn("Why this profile cannot work", self.flat(text))
+
+    def test_a_working_profile_never_runs_the_extra_check(self):
+        spawn = ScriptedSpawn(log_text=LOG_SUCCESS, csv_text=CSV_TWO_ROWS)
+        fixture = self.make_fixture(spawn)
+        fixture.session.assume_yes = True
+
+        preflight_probe(fixture.session, fixture.config,
+                        fixture.config["active_profile"], fixture.profile())
+
+        self.assertEqual(len(spawn.calls), 1)
+        self.assertNotIn("without TLS", fixture.text)
 
 
 class ProfileRenderingTests(unittest.TestCase):

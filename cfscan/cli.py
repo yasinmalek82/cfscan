@@ -50,6 +50,8 @@ Usage:
   cfscan --isp NAME [--pool FILE]     measure one carrier against that list
   cfscan --multi-isp                  print the report of the stored session
   cfscan --colo FRA,AMS               keep only those datacentres in this scan
+  cfscan --colo any                   measure every datacentre, ignoring the
+                                      filter saved in the profile
   cfscan --update-ranges              download Cloudflare's current range lists
   cfscan --edges                      rank datacentres from what you measured
   cfscan --no-verify-top              skip the strict check of the best addresses
@@ -86,6 +88,9 @@ Region filter:
   HTTP to an HTTPS port makes the edge answer its own 400, whose CF-RAY is
   empty - so in both cases the filter would drop every address. cfscan says so
   instead of letting that happen.
+  The filter is never a one-way door: menu 2 and menu 12 both offer "measure
+  every datacentre" as a choice on screen, menu 6 edits it without running a
+  scan, and 'cfscan --colo any' ignores the saved filter for one run.
   Which datacentres to name is not a question of distance - the nearest one
   measured worst of all on the line above - so cfscan does not guess it from a
   map. Every scan records which datacentres answered and how fast, and
@@ -229,7 +234,8 @@ def build_parser():
     parser.add_argument("--note", metavar="TEXT", default=None,
                         help="a label stored with a carrier round (access type)")
     parser.add_argument("--colo", metavar="CODES", default=None,
-                        help="keep only these Cloudflare datacentres (FRA,AMS)")
+                        help="keep only these Cloudflare datacentres (FRA,AMS); "
+                             "'any' measures all of them for this run")
     parser.add_argument("--update-ranges", action="store_true",
                         help="download Cloudflare's current IP range lists")
     parser.add_argument("--edges", action="store_true",

@@ -203,7 +203,7 @@ class EdgeLocationsFlowTests(unittest.TestCase):
         self.assertIn("No scan has recorded a datacentre yet", fixture.text)
 
     def test_the_ranking_is_shown_and_can_be_applied(self):
-        fixture = Fixture(answers=["y"], tty=True)
+        fixture = Fixture(answers=["1"], tty=True)
         self.addCleanup(fixture.close)
         profile = fixture.profile()
         line = edges.describe_line()["label"]
@@ -225,7 +225,7 @@ class EdgeLocationsFlowTests(unittest.TestCase):
         self.assertEqual(saved["colo"], "SOF,FRA")
 
     def test_a_suggestion_that_cannot_work_is_refused_not_saved(self):
-        fixture = Fixture(answers=["y"], tty=True)
+        fixture = Fixture(answers=["1"], tty=True)
         self.addCleanup(fixture.close)
         profile = fixture.profile()
         # TCPing never learns a datacentre, so a filter there would drop
