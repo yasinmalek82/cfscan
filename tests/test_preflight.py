@@ -23,6 +23,8 @@ from cfscan.runner import (
 )
 
 from tests.support import (
+    FIXTURE_DOMAIN,
+    FIXTURE_PORT,
     CSV_TWO_ROWS,
     LOG_HTTPS_ON_HTTP_PORT,
     LOG_NO_RESULTS,
@@ -36,8 +38,13 @@ CFST = "/opt/homebrew/bin/cfst"
 
 
 def profile_with(**overrides):
-    """The built in profile with a few values replaced."""
+    """The built in profile, given a target, with a few values replaced.
+
+    The shipped default is a placeholder that scans refuse to run against, so
+    these tests supply their own domain the way a set-up profile would.
+    """
     profile = default_profile()
+    profile.update(domain=FIXTURE_DOMAIN, port=FIXTURE_PORT)
     profile.update(overrides)
     return profile
 
@@ -82,7 +89,7 @@ class ProbeArgumentTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("-p") + 1], "1")
         self.assertEqual(argv[argv.index("-tp") + 1], "2087")
         self.assertEqual(argv[argv.index("-url") + 1],
-                         "https://gerr.yasin-ai-54.ir:2087/")
+                         "https://node.example.test:2087/")
         self.assertIn("-debug", argv)
         self.assertIn("-dd", argv)
 
@@ -165,7 +172,7 @@ class PreflightFlowTests(unittest.TestCase):
         fixture = self.make_fixture(spawn)
         fixture.session.assume_yes = True
         fixture.config["profiles"]["england"] = profile_with(
-            name="england.yasin-ai-54.ir", domain="england.yasin-ai-54.ir",
+            name="node.example.test", domain="node.example.test",
             port=8080, scheme="https",
         )
         fixture.config["profiles"]["england"]["ip_file"] = str(fixture.ipv4)
@@ -190,7 +197,7 @@ class PreflightFlowTests(unittest.TestCase):
         # Enter confirms "Run this scan now?", then "n" refuses the range scan.
         fixture = self.make_fixture(spawn, answers=["", "n"], tty=True)
         fixture.config["profiles"]["england"] = profile_with(
-            name="england.yasin-ai-54.ir", domain="england.yasin-ai-54.ir",
+            name="node.example.test", domain="node.example.test",
             port=8080, scheme="https",
         )
         fixture.config["profiles"]["england"]["ip_file"] = str(fixture.ipv4)
@@ -219,14 +226,14 @@ class PreflightFlowTests(unittest.TestCase):
     def test_the_probe_returns_true_when_switched_off(self):
         fixture = self.make_fixture(ScriptedSpawn(), preflight=False)
         self.assertTrue(preflight_probe(fixture.session, fixture.config,
-                                        "gerr-yasin-ai-54", fixture.profile()))
+                                        "example", fixture.profile()))
 
     def test_the_probe_is_skipped_for_a_dry_run(self):
         spawn = ScriptedSpawn()
         fixture = self.make_fixture(spawn)
         fixture.session.dry_run = True
         self.assertTrue(preflight_probe(fixture.session, fixture.config,
-                                        "gerr-yasin-ai-54", fixture.profile()))
+                                        "example", fixture.profile()))
         self.assertEqual([], spawn.calls)
 
 
@@ -246,8 +253,8 @@ class EdgeStatusTests(unittest.TestCase):
     def edge_profile(self):
         # Exactly the working recipe: plain HTTP on 443, where Cloudflare itself
         # answers 400 (verified against the live edge).
-        return profile_with(name="england.yasin-ai-54.ir",
-                            domain="england.yasin-ai-54.ir",
+        return profile_with(name="node.example.test",
+                            domain="node.example.test",
                             port=443, scheme="http", http_status=400)
 
     def test_the_edge_probe_is_recognised(self):
@@ -280,16 +287,16 @@ class EdgeStatusTests(unittest.TestCase):
         self.assertIn("plain-HTTP probe", text)
         # The third call is the real scan, with the profile's plain HTTP URL.
         self.assertEqual(
-            "http://england.yasin-ai-54.ir:443/",
+            "http://node.example.test:443/",
             spawn.calls[2][spawn.calls[2].index("-url") + 1],
         )
         self.assertEqual("599", spawn.calls[1][spawn.calls[1].index("-httping-code") + 1])
-        self.assertIn("https://england.yasin-ai-54.ir:443/",
+        self.assertIn("https://node.example.test:443/",
                       spawn.calls[1][spawn.calls[1].index("-url") + 1])
 
     def test_a_served_hostname_is_reported_as_good_news(self):
         served = ("IP: 104.24.28.30, 延迟测速终止，HTTP 状态码: 404, "
-                  "指定的 HTTP 状态码 599, 测速地址: https://england.yasin-ai-54.ir:443/\n")
+                  "指定的 HTTP 状态码 599, 测速地址: https://node.example.test:443/\n")
         spawn = ScriptedSpawn(
             log_sequence=[LOG_SUCCESS, served, LOG_SUCCESS],
             csv_sequence=[CSV_TWO_ROWS, None, CSV_TWO_ROWS],
@@ -304,7 +311,7 @@ class EdgeStatusTests(unittest.TestCase):
     def test_a_tls_profile_runs_no_extra_check(self):
         spawn = ScriptedSpawn(log_text=LOG_SUCCESS, csv_text=CSV_TWO_ROWS)
         fixture = self.make_fixture(
-            spawn, profile_with(name="england", domain="england.yasin-ai-54.ir",
+            spawn, profile_with(name="node", domain="node.example.test",
                                 port=443, scheme="https", http_status=400))
 
         quick_scan(fixture.session, fixture.config, verify_prompt=False)
@@ -316,20 +323,20 @@ class EdgeStatusTests(unittest.TestCase):
 
 class CertificateDepthHintTests(unittest.TestCase):
     def test_a_name_more_than_one_level_deep_gets_the_hint(self):
-        hint = certificate_depth_hint("ws.tr.yasin-ai-54.ir")
+        hint = certificate_depth_hint("ws.node.example.test")
         self.assertIn("one level below its zone", hint)
         # It must name the parent, because that is what the certificate covers,
         # and point openssl at the zone, which is where the certificate lives.
-        self.assertIn("covers tr.yasin-ai-54.ir", hint)
-        self.assertIn("-servername yasin-ai-54.ir", hint)
+        self.assertIn("covers node.example.test", hint)
+        self.assertIn("-servername example.test", hint)
 
     def test_a_name_one_level_deep_gets_nothing(self):
         # *.zone covers exactly one label, so these are fine.
-        self.assertIsNone(certificate_depth_hint("wsturkey.yasin-ai-54.ir"))
-        self.assertIsNone(certificate_depth_hint("england.yasin-ai-54.ir"))
+        self.assertIsNone(certificate_depth_hint("edge.example.test"))
+        self.assertIsNone(certificate_depth_hint("node.example.test"))
 
     def test_an_apex_or_a_nonsense_value_gets_nothing(self):
-        for value in ("yasin-ai-54.ir", "", None, "localhost"):
+        for value in ("example.test", "", None, "localhost"):
             self.assertIsNone(certificate_depth_hint(value))
 
     def test_it_never_claims_certainty(self):
@@ -358,7 +365,7 @@ class MissingCertificateTests(unittest.TestCase):
         self.addCleanup(fixture.close)
         fixture.session.verify_top_ips = False
         profile = fixture.profile()
-        profile["domain"] = "ws.tr.yasin-ai-54.ir"
+        profile["domain"] = "ws.node.example.test"
         profile["port"] = 443
         profile["scheme"] = "https"
         return fixture

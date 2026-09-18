@@ -100,7 +100,7 @@ def validate_domain(value):
     if "://" in text or "/" in text or "@" in text:
         raise ValidationError(
             f"Invalid domain: {text!r} should be a plain hostname such as "
-            "'gerr.yasin-ai-54.ir' (no scheme, no path)."
+            "'node.example.com' (no scheme, no path)."
         )
     if len(text) > _MAX_DOMAIN_LENGTH:
         raise ValidationError("Invalid domain: the name is longer than 253 characters.")

@@ -25,6 +25,8 @@ __all__ = [
     "DEFAULT_IPV4_FILE",
     "DEFAULT_IPV6_FILE",
     "DEFAULT_PROFILE_KEY",
+    "PLACEHOLDER_DOMAINS",
+    "is_placeholder",
     "DEFAULT_RECOMMENDED_IP",
     "Paths",
     "UnknownProfile",
@@ -45,11 +47,18 @@ __all__ = [
 
 CONFIG_VERSION = 1
 
-DEFAULT_DOMAIN = "gerr.yasin-ai-54.ir"
-DEFAULT_PORT = 2087
+#: The profile a fresh installation starts with. It is a placeholder on purpose:
+#: a scan measures thousands of addresses against whatever domain is configured,
+#: so shipping a real one would point every installation of this tool at someone
+#: else's server. cfscan says the profile is a placeholder until it is changed.
+DEFAULT_DOMAIN = "example.com"
+DEFAULT_PORT = 443
 DEFAULT_HTTP_STATUS = 400
-DEFAULT_RECOMMENDED_IP = "104.21.54.105"
-DEFAULT_PROFILE_KEY = "gerr-yasin-ai-54"
+DEFAULT_RECOMMENDED_IP = None
+DEFAULT_PROFILE_KEY = "example"
+
+#: Domains that mean "nothing has been configured yet" rather than a target.
+PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net")
 
 DEFAULT_CFST_PATH = "/opt/homebrew/bin/cfst"
 DEFAULT_SHARE_DIR = str(Path.home() / ".local" / "share" / "cloudflare-speedtest")
@@ -138,6 +147,17 @@ def new_config(cfst_path=None):
         "active_profile": DEFAULT_PROFILE_KEY,
         "profiles": {DEFAULT_PROFILE_KEY: default_profile()},
     }
+
+
+def is_placeholder(profile):
+    """True while a profile still points at the shipped placeholder domain.
+
+    Everything downstream - the menu header, the scan flows - uses this to ask
+    the user for their own domain instead of measuring ``example.com``, which
+    no Cloudflare edge serves for them.
+    """
+    domain = str((profile or {}).get("domain") or "").strip().lower()
+    return domain in PLACEHOLDER_DOMAINS
 
 
 def ip_file_for(profile):
@@ -283,9 +303,12 @@ def load_config(paths):
         if not _is_mapping(profile):
             continue
         repaired[str(name)] = _merge_profile(profile)
-    # The built in profile always exists, so a broken file can never lock the
-    # user out of the tool.
-    repaired.setdefault(DEFAULT_PROFILE_KEY, default_profile())
+    # At least one profile always exists, so a broken file can never lock the
+    # user out of the tool. It is only re-created when nothing else is left:
+    # re-adding it beside the user's own profiles would resurrect a profile they
+    # deleted on purpose, every single time the configuration was read.
+    if not repaired:
+        repaired[DEFAULT_PROFILE_KEY] = default_profile()
     config["profiles"] = repaired
 
     active = config.get("active_profile")

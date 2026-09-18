@@ -122,14 +122,14 @@ class ProfileCliTests(unittest.TestCase):
         self.addCleanup(fixture.close)
         code = run(fixture, ["--quick", "--profile", "ghost"])
         self.assertEqual(code, 2)
-        self.assertIn("gerr-yasin-ai-54", fixture.text)
+        self.assertIn("example", fixture.text)
 
     def test_show_profiles_flag(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
         code = run(fixture, ["--list-profiles"])
         self.assertEqual(code, 0)
-        self.assertIn("gerr-yasin-ai-54", fixture.text)
+        self.assertIn("example", fixture.text)
 
     def test_profile_flag_switches_the_menu_session(self):
         fixture = Fixture(answers=["0"])
@@ -177,11 +177,11 @@ class VerifyCliTests(unittest.TestCase):
     def test_verify_dry_run_prints_argv(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)
-        code = run(fixture, ["--verify", "104.21.54.105", "--dry-run"])
+        code = run(fixture, ["--verify", "104.16.0.1", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(fixture.spawn.calls, [])
         text = fixture.text
-        self.assertIn("-ip 104.21.54.105", text)
+        self.assertIn("-ip 104.16.0.1", text)
         self.assertIn("-t 20", text)
 
     def test_verify_rejects_invalid_ip(self):
@@ -193,7 +193,7 @@ class VerifyCliTests(unittest.TestCase):
     def test_verify_returns_failure_code(self):
         fixture = Fixture(spawn=ScriptedSpawn(log_text="", create_csv=False))
         self.addCleanup(fixture.close)
-        self.assertEqual(run(fixture, ["--verify", "104.21.54.105"]), 1)
+        self.assertEqual(run(fixture, ["--verify", "104.16.0.1"]), 1)
 
 
 class ColourTests(unittest.TestCase):

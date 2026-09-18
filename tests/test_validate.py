@@ -22,7 +22,7 @@ from cfscan.validate import (
 
 class DomainTests(unittest.TestCase):
     def test_accepts_normal_domains(self):
-        for value in ("gerr.yasin-ai-54.ir", "example.com", "a.b.co", "SUB.Example.COM"):
+        for value in ("node.example.test", "example.com", "a.b.co", "SUB.Example.COM"):
             with self.subTest(value=value):
                 self.assertEqual(validate_domain(value), value.strip().lower())
 
@@ -61,19 +61,19 @@ class DomainTests(unittest.TestCase):
 
 class IpTests(unittest.TestCase):
     def test_accepts_ipv4_and_ipv6(self):
-        self.assertEqual(str(validate_ip("104.21.54.105")), "104.21.54.105")
+        self.assertEqual(str(validate_ip("104.16.0.1")), "104.16.0.1")
         self.assertEqual(str(validate_ip("2606:4700::1111")), "2606:4700::1111")
 
     def test_rejects_invalid_addresses(self):
-        for value in ("999.1.1.1", "1.2.3", "abc", "1.2.3.4/24", "", "104.21.54.105:8443"):
+        for value in ("999.1.1.1", "1.2.3", "abc", "1.2.3.4/24", "", "104.16.0.1:8443"):
             with self.subTest(value=value):
                 with self.assertRaises(ValidationError):
                     validate_ip(value)
 
     def test_enforces_requested_version(self):
-        self.assertEqual(str(validate_ip("104.21.54.105", version=4)), "104.21.54.105")
+        self.assertEqual(str(validate_ip("104.16.0.1", version=4)), "104.16.0.1")
         with self.assertRaises(ValidationError):
-            validate_ip("104.21.54.105", version=6)
+            validate_ip("104.16.0.1", version=6)
         with self.assertRaises(ValidationError):
             validate_ip("2606:4700::1111", version=4)
 
@@ -206,7 +206,7 @@ class OutputFilenameTests(unittest.TestCase):
 
 class SecretTests(unittest.TestCase):
     def test_accepts_harmless_values(self):
-        for value in ("gerr.yasin-ai-54.ir", "104.21.54.105", "my-profile", "", "8443"):
+        for value in ("node.example.test", "104.16.0.1", "my-profile", "", "8443"):
             with self.subTest(value=value):
                 assert_no_secrets(value)
 

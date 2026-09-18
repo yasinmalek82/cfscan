@@ -28,8 +28,8 @@ class NewResultPathTests(unittest.TestCase):
 
     def test_builds_timestamped_name(self):
         when = datetime(2026, 9, 15, 16, 35, 1)
-        path = new_result_path(self.dir, "gerr-yasin-ai-54-ir", when=when)
-        self.assertEqual(path.name, "cfscan-gerr-yasin-ai-54-ir-20260915-163501.csv")
+        path = new_result_path(self.dir, "example-ir", when=when)
+        self.assertEqual(path.name, "cfscan-example-ir-20260915-163501.csv")
         self.assertEqual(path.parent, self.dir)
 
     def test_creates_results_directory(self):
@@ -72,23 +72,23 @@ class ResultStoreTests(unittest.TestCase):
         self.store = ResultStore(self.paths)
 
     def test_csv_and_log_live_side_by_side(self):
-        csv_path = self.store.new_csv("gerr-yasin-ai-54-ir")
+        csv_path = self.store.new_csv("example-ir")
         log_path = self.store.log_for(csv_path)
         self.assertEqual(log_path.name, csv_path.name.replace(".csv", ".log"))
         self.assertEqual(log_path.parent, csv_path.parent)
 
     def test_record_latest_updates_config(self):
-        csv_path = self.store.new_csv("gerr-yasin-ai-54-ir")
+        csv_path = self.store.new_csv("example-ir")
         self.store.record_latest(
             self.config,
             csv_path,
-            profile_name="gerr-yasin-ai-54-ir",
-            recommended_ip="104.21.54.105",
+            profile_name="example-ir",
+            recommended_ip="104.16.0.1",
         )
         saved = read_config(self.paths)["last_result"]
         self.assertEqual(saved["csv"], str(csv_path))
-        self.assertEqual(saved["recommended_ip"], "104.21.54.105")
-        self.assertEqual(saved["profile"], "gerr-yasin-ai-54-ir")
+        self.assertEqual(saved["recommended_ip"], "104.16.0.1")
+        self.assertEqual(saved["profile"], "example-ir")
         self.assertIn("when", saved)
 
     def test_latest_pointer_survives_round_trip(self):

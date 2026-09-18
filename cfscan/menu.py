@@ -29,6 +29,7 @@ from .parser import CsvError, rank_results, parse_results_csv, recommend
 from .profiles import (
     DEFAULT_PROFILE_KEY,
     UnknownProfile,
+    is_placeholder,
     delete_profile,
     find_cfst,
     get_active,
@@ -153,7 +154,7 @@ MENU_HINTS = {
     "9": "what every setting means",
     "10": "compare carriers on one fixed candidate list",
     "11": "download Cloudflare's current range lists",
-    "12": "rank the datacentres from what you measured",
+    "12": "rank the datacentres, or clear the filter",
     "0": "",
 }
 
@@ -1154,6 +1155,35 @@ def preflight_probe(session, config, name, profile):
     return console.ask_yes_no("Scan the whole range anyway?", default=False)
 
 
+def _refuse_placeholder(session, name, profile):
+    """Stop a scan aimed at the shipped placeholder domain.
+
+    ``example.com`` is not served by any Cloudflare edge for this user, so the
+    scan would measure thousands of addresses and find nothing - and the reason
+    would look like a network problem rather than "you have not set this up".
+    """
+    if not is_placeholder(profile):
+        return False
+    console = session.console
+    console.blank()
+    console.error(
+        f"Profile '{name}' still points at {profile.get('domain')}, the "
+        "placeholder a fresh installation starts with. Nothing can be measured "
+        "against it."
+    )
+    console.bullet("Menu 6, option 3 edits the active profile - put the domain "
+                   "your own service answers on into it. Menu 9 explains what "
+                   "each setting means.")
+    console.bullet("The domain is the name your client sends as SNI; cfscan "
+                   "finds Cloudflare addresses that serve it quickly.")
+    remember_result(session, "FAIL",
+                    [f"Profile '{name}' is still the placeholder "
+                     f"({profile.get('domain')}).",
+                     "Set your own domain first: menu 6, option 3."],
+                    title="Not set up yet")
+    return True
+
+
 def _guard(session, config, argv, log_path, csv_path, flow="Scan"):
     """Shared tail for scan flows: run, then return the outcome or a code."""
     try:
@@ -1202,6 +1232,8 @@ def quick_scan(session, config, profile_name=None, verify_prompt=True):
     name, profile = _profile_pair(config, profile_name)
 
     console.heading("Quick Scan")
+    if _refuse_placeholder(session, name, profile):
+        return EXIT_USAGE
     console.line("The active profile is used. Press Ctrl+C at any time to stop.")
     console.blank()
     scanned = _scan_profile(session, profile)
@@ -1566,6 +1598,9 @@ def custom_scan(session, config, profile_name=None, force_save=False,
     except CfstNotFoundError as exc:
         console.error(str(exc))
         return EXIT_MISSING_TOOL
+
+    if _refuse_placeholder(session, new_name, profile):
+        return EXIT_USAGE
 
     range_file = Path(ip_file_for(profile))
     if not range_file.exists():
@@ -2067,8 +2102,8 @@ def _delete_profile_flow(session, config):
         return EXIT_USAGE
     name = names[index]
 
-    if name == DEFAULT_PROFILE_KEY:
-        console.warn(f"The built-in default profile '{DEFAULT_PROFILE_KEY}' cannot "
+    if len(config.get("profiles") or {}) <= 1:
+        console.warn(f"'{name}' is the only profile left, and it cannot "
                      "be deleted, so there is always a working fallback.")
         return EXIT_OK
 
@@ -2235,7 +2270,8 @@ def _range_age_note(info):
     return ", ".join(parts)
 
 
-def update_ranges_flow(session, config, profile_name=None, assume_yes=None):
+def update_ranges_flow(session, config, profile_name=None, assume_yes=None,
+                       allow_unattended=False):
     """Download Cloudflare's current range lists over the ones on disk.
 
     The lists that ship with the scanner are a snapshot, and a range that is
@@ -2282,9 +2318,19 @@ def update_ranges_flow(session, config, profile_name=None, assume_yes=None):
                  "'<name>.previous', so this is reversible.")
     if assume_yes is None:
         assume_yes = session.assume_yes
-    if not assume_yes and console.interactive:
-        if not console.ask_yes_no("Download the current lists now?", default=True):
-            console.warn("Cancelled - nothing was downloaded.")
+    if not assume_yes:
+        if console.interactive:
+            if not console.ask_yes_no("Download the current lists now?",
+                                      default=True):
+                console.warn("Cancelled - nothing was downloaded.")
+                return EXIT_OK
+        elif not allow_unattended:
+            # Reached from the menu with nothing to answer with. Downloading a
+            # file and overwriting the range lists is not something to do when
+            # the question cannot be asked.
+            console.warn("Nothing was downloaded: this was started from the "
+                         "menu with no terminal to confirm in. Run "
+                         "'cfscan --update-ranges' instead.")
             return EXIT_OK
 
     updated = 0
@@ -2667,7 +2713,7 @@ def help_screen(session, config):
     console.line(console.style("Command line", "bold"))
     console.bullet("cfscan                     open this menu")
     console.bullet("cfscan --quick --yes       run the active profile right away")
-    console.bullet("cfscan --verify 104.21.54.105   strict 20-attempt check")
+    console.bullet("cfscan --verify 104.16.0.1  strict 20-attempt check")
     console.bullet("cfscan --quick --dry-run   print the argument list only")
     console.bullet("cfscan --profile NAME      use another saved profile")
     console.bullet("cfscan --make-pool 2000    fix the candidate list for all rounds")
@@ -3059,6 +3105,8 @@ def multi_isp_flow(session, config, profile_name=None, isps=None, pool_path=None
     name, profile = _profile_pair(config, profile_name)
 
     console.heading("Multi-carrier scan")
+    if _refuse_placeholder(session, name, profile):
+        return EXIT_USAGE
     console.line("One round per carrier. Every round measures the same candidate "
                  "list, so the carriers can be compared address by address.")
     console.blank()
@@ -3204,6 +3252,8 @@ def multi_isp_round(session, config, profile_name=None, isp=None, pool_path=None
         verdict = str(console.ask("Carrier name", default="carrier")).strip()
 
     console.heading(f"Carrier round - {verdict}")
+    if _refuse_placeholder(session, name, profile):
+        return EXIT_USAGE
     record, repeated = _reusable_session(session, profile, verdict)
     if record is None:
         pool_file, sha, count, seed = _prepare_pool(session, profile, console,
@@ -3428,6 +3478,10 @@ def render_menu(session, config):
             last += f"  ({saved} saved IP(s) in menu 3)"
         console.line(f"  {console.style('Last run', 'dim')}  "
                      f"{console.style(last, 'dim')}")
+    if profile and is_placeholder(profile):
+        console.line("  " + console.style(
+            "Not set up yet - this profile is a placeholder. Put your own "
+            "domain in it with menu 6, option 3.", "yellow"))
     if session.dry_run:
         console.line("  " + console.style("Dry run - scans print their argument "
                                           "list and never execute", "yellow"))

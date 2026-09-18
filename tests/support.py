@@ -19,6 +19,13 @@ from pathlib import Path
 # Paths / home directory
 # --------------------------------------------------------------------------
 
+#: What the fixture profile targets. Not a real domain anywhere: ".test" is
+#: reserved by RFC 6761 precisely so it can never resolve.
+FIXTURE_DOMAIN = "node.example.test"
+FIXTURE_PORT = 2087
+FIXTURE_RECOMMENDED_IP = "104.16.0.1"
+
+
 def make_paths(root):
     """Build a Paths object whose home directory is a temporary directory."""
     from cfscan.profiles import Paths
@@ -179,13 +186,13 @@ CSV_HEADER = "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(
 
 CSV_TWO_ROWS = (
     "\ufeff" + CSV_HEADER + "\r\n"
-    "104.21.54.105,4,4,0.00,438.32,0.00,N/A\r\n"
+    "104.16.0.1,4,4,0.00,438.32,0.00,N/A\r\n"
     "172.67.213.151,4,3,0.25,512.10,0.00,SJC\r\n"
 )
 
 CSV_VERIFY_PASS = (
     "\ufeff" + CSV_HEADER + "\r\n"
-    "104.21.54.105,20,20,0.00,431.07,0.00,N/A\r\n"
+    "104.16.0.1,20,20,0.00,431.07,0.00,N/A\r\n"
 )
 
 
@@ -229,7 +236,7 @@ LOG_SUCCESS = (
     "0 / 24 [______] 可用: 12 \n"
     "24 / 24 [------] 可用: 12 \n"
     "IP 地址           已发送  已接收  丢包率  平均延迟  下载速度(MB/s)  地区码  \n"
-    "104.21.54.105     4       4       0.00    438.32    0.00            N/A     \n"
+    "104.16.0.1     4       4       0.00    438.32    0.00            N/A     \n"
     "\n"
     "完整测速结果已写入 /tmp/out.csv 文件，可使用记事本/表格软件查看。\n"
 )
@@ -243,8 +250,8 @@ LOG_NO_RESULTS = (
 
 LOG_STATUS_REJECT = (
     "开始延迟测速（模式：HTTP, 端口：2087, 范围：0 ~ 1000 ms, 丢包：0.25)\n"
-    "[调试] IP: 104.21.54.105, 延迟测速终止，HTTP 状态码: 520, "
-    "指定的 HTTP 状态码 400, 测速地址: https://gerr.yasin-ai-54.ir:2087/\n"
+    "[调试] IP: 104.16.0.1, 延迟测速终止，HTTP 状态码: 520, "
+    "指定的 HTTP 状态码 400, 测速地址: https://node.example.test:2087/\n"
     "[信息] 完整测速结果 IP 数量为 0，跳过输出结果。\n"
 )
 
@@ -254,9 +261,9 @@ LOG_HTTPS_ON_HTTP_PORT = (
     "# XIU2/CloudflareSpeedTest v2.3.5 \n"
     "开始延迟测速（模式：HTTP, 端口：8080, 范围：0 ~ 1000 ms, 丢包：1.00)\n"
     "0 / 1  可用:    IP: 104.24.28.30, 延迟测速失败，错误信息: "
-    "Head \"https://england.yasin-ai-54.ir:8080/\": "
+    "Head \"https://node.example.test:8080/\": "
     "http: server gave HTTP response to HTTPS client, "
-    "测速地址: https://england.yasin-ai-54.ir:8080/\n"
+    "测速地址: https://node.example.test:8080/\n"
     "1 / 1  可用: 0  \n"
     " 完整测速结果 IP 数量为 0，跳过输出结果。\n"
 )
@@ -265,7 +272,7 @@ LOG_HTTPS_ON_HTTP_PORT = (
 # origin to forward to for that hostname.
 LOG_ORIGIN_UNREACHABLE = (
     "0 / 1  可用:    IP: 104.24.28.30, 延迟测速终止，HTTP 状态码: 521, "
-    "指定的 HTTP 状态码 400, 测速地址: https://england.yasin-ai-54.ir:443/\n"
+    "指定的 HTTP 状态码 400, 测速地址: https://node.example.test:443/\n"
     "1 / 1  可用: 0  \n"
 )
 
@@ -297,6 +304,13 @@ class Fixture:
         for profile in loaded["profiles"].values():
             profile["ip_file"] = str(self.ipv4)
             profile["ipv6_file"] = str(self.ipv6)
+            # These tests are about scanning behaviour, and a scan refuses to
+            # run against the shipped placeholder domain on purpose. Give the
+            # fixture a target of its own; PlaceholderTests covers the refusal.
+            if str(profile.get("domain") or "").lower() in ("example.com",):
+                profile["domain"] = FIXTURE_DOMAIN
+                profile["port"] = FIXTURE_PORT
+                profile["recommended_ip"] = FIXTURE_RECOMMENDED_IP
         loaded["cfst_path"] = str(self.cfst)
         save_config_file(self.paths, loaded)
         self.config = load_config_file(self.paths)

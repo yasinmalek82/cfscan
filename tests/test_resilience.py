@@ -285,7 +285,7 @@ class EmptyAndDamagedResultTests(TempHome):
         text = (
             "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码\r\n"
             "not-an-ip,4,4,0.00,100.00,0.00,N/A\r\n"
-            "104.21.54.105,4,4,0.00,N/A,0.00,N/A\r\n"
+            "104.16.0.1,4,4,0.00,N/A,0.00,N/A\r\n"
             "172.67.213.151,4,4,0.00,438.32,0.00,SJC\r\n"
         )
 
@@ -298,7 +298,7 @@ class EmptyAndDamagedResultTests(TempHome):
         """A row with no readable latency used to become 0 ms and win the ranking."""
         text = (
             "IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码\r\n"
-            "104.21.54.105,4,4,0.00,N/A,0.00,N/A\r\n"
+            "104.16.0.1,4,4,0.00,N/A,0.00,N/A\r\n"
             "172.67.213.151,4,4,0.00,438.32,0.00,SJC\r\n"
         )
 
@@ -425,7 +425,7 @@ class EntryPointTests(unittest.TestCase):
         text = out.getvalue()
         self.assertNotEqual(code, EXIT_OK)
         self.assertIn("ghost", text)
-        self.assertIn("does not exist", text)
+        self.assertIn("Unknown profile", text)
 
 
 if __name__ == "__main__":

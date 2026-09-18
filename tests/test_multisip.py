@@ -27,7 +27,7 @@ def entry(ip, verdict="PASS", rtt=100.0, loss=0.0, colo="SOF", sent=20,
 
 def make_session(rounds):
     """A session from ``[(carrier, [entry, ...]), ...]``."""
-    session = vantages.new_session(PROFILE, "england.yasin-ai-54.ir", 443,
+    session = vantages.new_session(PROFILE, "node.example.test", 443,
                                    "/tmp/pool-abc.txt", "abc123",
                                    [name for name, _ in rounds])
     for name, entries in rounds:
@@ -231,7 +231,7 @@ class SessionStoreTests(unittest.TestCase):
         path = vantages.save_session(self.results, session)
         self.assertTrue(path.exists())
         self.assertEqual(path.parent.parent.name, "multi-isp")
-        self.assertEqual(path.parent.name, "england-yasin-ai-54-ir")
+        self.assertEqual(path.parent.name, "node-example-test")
         loaded = vantages.load_session(path)
         self.assertEqual(vantages.isp_names(loaded), ["mci", "irancell"])
         self.assertEqual(loaded["pool_sha256"], "abc123")
@@ -241,7 +241,7 @@ class SessionStoreTests(unittest.TestCase):
         vantages.save_session(self.results, first)
         second = make_session([("mokhaberat", [entry("104.16.0.9")])])
         path = vantages.save_session(self.results, second)
-        latest = vantages.latest_session(self.results, "england.yasin-ai-54.ir")
+        latest = vantages.latest_session(self.results, "node.example.test")
         self.assertEqual(latest, path)
 
     def test_saving_twice_keeps_one_file(self):

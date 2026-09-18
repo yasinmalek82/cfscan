@@ -24,7 +24,7 @@ class ParseCsvTextTests(unittest.TestCase):
     def test_parses_chinese_header_with_colo(self):
         text = (
             BOM_HEADER + "\r\n"
-            "104.21.54.105,4,4,0.00,438.32,0.00,N/A\r\n"
+            "104.16.0.1,4,4,0.00,438.32,0.00,N/A\r\n"
             "172.67.213.151,4,3,0.25,512.10,0.00,SJC\r\n"
         )
         report = parse_csv_text(text)
@@ -32,7 +32,7 @@ class ParseCsvTextTests(unittest.TestCase):
         self.assertEqual(len(report.results), 2)
 
         first = report.results[0]
-        self.assertEqual(first.ip, "104.21.54.105")
+        self.assertEqual(first.ip, "104.16.0.1")
         self.assertEqual(first.sent, 4)
         self.assertEqual(first.received, 4)
         self.assertEqual(first.loss, 0.0)
@@ -48,7 +48,7 @@ class ParseCsvTextTests(unittest.TestCase):
     def test_parses_csv_without_colo_column(self):
         text = (
             "\ufeffIP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s)\r\n"
-            "104.21.54.105,4,4,0.00,438.32,0.00\r\n"
+            "104.16.0.1,4,4,0.00,438.32,0.00\r\n"
         )
         report = parse_csv_text(text)
         self.assertEqual(len(report.results), 1)
@@ -57,7 +57,7 @@ class ParseCsvTextTests(unittest.TestCase):
     def test_parses_english_header(self):
         text = (
             "IP Address,Sent,Received,Loss,Latency,Download (MB/s),Colo\n"
-            "104.21.54.105,4,4,0.00,438.32,0.00,HKG\n"
+            "104.16.0.1,4,4,0.00,438.32,0.00,HKG\n"
         )
         report = parse_csv_text(text)
         self.assertEqual(report.results[0].colo, "HKG")
@@ -66,7 +66,7 @@ class ParseCsvTextTests(unittest.TestCase):
     def test_tolerates_unparseable_lines(self):
         text = (
             BOM_HEADER + "\r\n"
-            "104.21.54.105,4,4,0.00,438.32,0.00,N/A\r\n"
+            "104.16.0.1,4,4,0.00,438.32,0.00,N/A\r\n"
             "this line is broken\r\n"
             "\r\n"
             "not-an-ip,4,4,0.00,1.00,0.00,N/A\r\n"
@@ -76,7 +76,7 @@ class ParseCsvTextTests(unittest.TestCase):
         self.assertTrue(report.warnings)
 
     def test_positional_fallback_when_header_unknown(self):
-        text = "104.21.54.105,4,4,0.00,438.32,0.00,N/A\n"
+        text = "104.16.0.1,4,4,0.00,438.32,0.00,N/A\n"
         report = parse_csv_text(text)
         self.assertEqual(len(report.results), 1)
         self.assertTrue(report.used_positional_fallback)
@@ -110,18 +110,18 @@ class ParseResultsCsvTests(unittest.TestCase):
     def test_reads_file_from_disk(self):
         path = self.dir / "result.csv"
         path.write_text(
-            BOM_HEADER + "\r\n104.21.54.105,4,4,0.00,438.32,0.00,N/A\r\n",
+            BOM_HEADER + "\r\n104.16.0.1,4,4,0.00,438.32,0.00,N/A\r\n",
             encoding="utf-8",
         )
         report = parse_results_csv(path)
         self.assertEqual(len(report.results), 1)
-        self.assertEqual(report.results[0].ip, "104.21.54.105")
+        self.assertEqual(report.results[0].ip, "104.16.0.1")
 
     def test_undecodable_bytes_are_tolerated(self):
         path = self.dir / "result.csv"
         path.write_bytes(
             BOM_HEADER.encode("utf-8")
-            + b"\r\n104.21.54.105,4,4,0.00,438.32,0.00,N/A\r\n\xff\xfe\r\n"
+            + b"\r\n104.16.0.1,4,4,0.00,438.32,0.00,N/A\r\n\xff\xfe\r\n"
         )
         report = parse_results_csv(path)
         self.assertEqual(len(report.results), 1)
@@ -155,10 +155,10 @@ class RankAndRecommendTests(unittest.TestCase):
         results = self.make(
             BOM_HEADER + "\r\n"
             "1.1.1.2,4,4,0.00,100.00,0.00,N/A\r\n"
-            "104.21.54.105,4,4,0.00,438.32,0.00,N/A\r\n"
+            "104.16.0.1,4,4,0.00,438.32,0.00,N/A\r\n"
         )
-        picked = recommend(results, preferred_ip="104.21.54.105")
-        self.assertEqual(picked.ip, "104.21.54.105")
+        picked = recommend(results, preferred_ip="104.16.0.1")
+        self.assertEqual(picked.ip, "104.16.0.1")
 
     def test_recommend_falls_back_to_fastest(self):
         results = self.make(
@@ -166,7 +166,7 @@ class RankAndRecommendTests(unittest.TestCase):
             "1.1.1.9,4,4,0.00,900.00,0.00,N/A\r\n"
             "1.1.1.2,4,4,0.00,100.00,0.00,N/A\r\n"
         )
-        picked = recommend(results, preferred_ip="104.21.54.105")
+        picked = recommend(results, preferred_ip="104.16.0.1")
         self.assertEqual(picked.ip, "1.1.1.2")
 
     def test_recommend_prefers_loss_free_candidates(self):
@@ -179,7 +179,7 @@ class RankAndRecommendTests(unittest.TestCase):
         self.assertEqual(picked.ip, "1.1.1.9")
 
     def test_recommend_returns_none_for_empty_results(self):
-        self.assertIsNone(recommend([], preferred_ip="104.21.54.105"))
+        self.assertIsNone(recommend([], preferred_ip="104.16.0.1"))
 
 
 if __name__ == "__main__":

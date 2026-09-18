@@ -188,9 +188,9 @@ def certificate_depth_hint(domain):
     ``a.example.com`` is covered and ``a.b.example.com`` is not - the edge then
     refuses the handshake for it while happily serving its siblings.
 
-    Measured on one zone: the edge presented ``CN=yasin-ai-54.ir`` with
-    ``DNS:yasin-ai-54.ir, DNS:*.yasin-ai-54.ir``; two hostnames one label deep
-    answered, and ``ws.tr.yasin-ai-54.ir`` was refused at the handshake.
+    Measured on one zone: the edge presented a certificate listing
+    ``zone.example`` and ``*.zone.example``; two hostnames one label deep
+    answered, and ``a.b.zone.example`` was refused at the handshake.
 
     Returns ``None`` for a hostname that is not deep enough for this to be the
     explanation. Where it does return a hint it says "likely", because knowing
@@ -272,7 +272,7 @@ def build_scan_argv(cfst_path, profile, output_path, single_ip=None, attempts=No
     The default profile produces exactly::
 
         cfst -f <ip.txt> -tp 2087 -httping -httping-code 400 \\
-             -url https://gerr.yasin-ai-54.ir:2087/ -dd -t 4 -n 200 \\
+             -url https://node.example.com:2087/ -dd -t 4 -n 200 \\
              -tl 1000 -tlr 0.25 -p 20 -o <timestamped-output.csv>
 
     ``candidate_file`` scans an explicit list of addresses instead of the

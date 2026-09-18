@@ -37,7 +37,7 @@ from tests.support import (
     csv_with_rows,
 )
 
-DEFAULT_KEY = "gerr-yasin-ai-54"
+DEFAULT_KEY = "example"
 
 
 def make_fixture(answers=(), dry_run=False, spawn=None, verify_top=False):
@@ -83,7 +83,7 @@ class MenuRenderingTests(unittest.TestCase):
         fixture = make_fixture()
         self.addCleanup(fixture.close)
         render_menu(fixture.session, fixture.config)
-        self.assertIn("gerr.yasin-ai-54.ir", fixture.text)
+        self.assertIn("node.example.test", fixture.text)
 
 
 class RunMenuTests(unittest.TestCase):
@@ -121,7 +121,7 @@ class QuickScanTests(unittest.TestCase):
         quick_scan(fixture.session, fixture.config)
         text = fixture.text
         self.assertIn("Domain", text)
-        self.assertIn("gerr.yasin-ai-54.ir", text)
+        self.assertIn("node.example.test", text)
         self.assertIn("2087", text)
         self.assertIn("Expected status", text)
 
@@ -153,7 +153,7 @@ class QuickScanTests(unittest.TestCase):
         text = fixture.text
         for header in ("#", "IP address", "Sent", "Received", "Loss", "Latency", "Colo"):
             self.assertIn(header, text)
-        self.assertIn("104.21.54.105", text)
+        self.assertIn("104.16.0.1", text)
         self.assertIn("172.67.213.151", text)
         self.assertIn("438.32", text)
 
@@ -208,7 +208,7 @@ class QuickScanTests(unittest.TestCase):
         self.addCleanup(fixture.close)
         quick_scan(fixture.session, fixture.config)
         text = fixture.text
-        self.assertIn("Recommended IP: 104.21.54.105", text)
+        self.assertIn("Recommended IP: 104.16.0.1", text)
         for field in ("Address", "Port", "SNI", "Host"):
             self.assertIn(field, text)
 
@@ -231,7 +231,7 @@ class QuickScanTests(unittest.TestCase):
         quick_scan(fixture.session, fixture.config)
         last = fixture.reload()["last_result"]
         self.assertTrue(Path(last["csv"]).exists())
-        self.assertEqual(last["recommended_ip"], "104.21.54.105")
+        self.assertEqual(last["recommended_ip"], "104.16.0.1")
 
     def test_offers_stronger_verification(self):
         spawn = ScriptedSpawn(
@@ -244,7 +244,7 @@ class QuickScanTests(unittest.TestCase):
         self.assertEqual(len(spawn.calls), 2)
         second = spawn.calls[1]
         self.assertEqual(second[second.index("-t") + 1], "20")
-        self.assertEqual(second[second.index("-ip") + 1], "104.21.54.105")
+        self.assertEqual(second[second.index("-ip") + 1], "104.16.0.1")
         self.assertIn("PASS", fixture.text)
 
     def test_empty_results_are_explained(self):
@@ -339,7 +339,7 @@ class VerifyFlowTests(unittest.TestCase):
         spawn = ScriptedSpawn(log_text="", csv_text=CSV_VERIFY_PASS)
         fixture = make_fixture(answers=[], spawn=spawn)
         self.addCleanup(fixture.close)
-        code = verify_flow(fixture.session, fixture.config, ip="104.21.54.105")
+        code = verify_flow(fixture.session, fixture.config, ip="104.16.0.1")
         self.assertEqual(code, 0)
         text = fixture.text
         self.assertIn("PASS", text)
@@ -353,7 +353,7 @@ class VerifyFlowTests(unittest.TestCase):
         spawn = ScriptedSpawn(log_text=LOG_STATUS_REJECT, create_csv=False)
         fixture = make_fixture(answers=[], spawn=spawn)
         self.addCleanup(fixture.close)
-        code = verify_flow(fixture.session, fixture.config, ip="104.21.54.105")
+        code = verify_flow(fixture.session, fixture.config, ip="104.16.0.1")
         self.assertEqual(code, 1)
         text = fixture.text
         self.assertIn("FAIL", text)
@@ -362,12 +362,12 @@ class VerifyFlowTests(unittest.TestCase):
     def test_packet_loss_is_reported_as_failure(self):
         csv_text = (
             "\ufeffIP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码\r\n"
-            "104.21.54.105,20,17,0.15,431.07,0.00,N/A\r\n"
+            "104.16.0.1,20,17,0.15,431.07,0.00,N/A\r\n"
         )
         spawn = ScriptedSpawn(log_text="", csv_text=csv_text)
         fixture = make_fixture(answers=[], spawn=spawn)
         self.addCleanup(fixture.close)
-        code = verify_flow(fixture.session, fixture.config, ip="104.21.54.105")
+        code = verify_flow(fixture.session, fixture.config, ip="104.16.0.1")
         self.assertEqual(code, 1)
         self.assertIn("FAIL", fixture.text)
         self.assertIn("packet loss", fixture.text.lower())
@@ -378,7 +378,7 @@ class VerifyFlowTests(unittest.TestCase):
         spawn = ScriptedSpawn(log_text="", create_csv=False)
         fixture = make_fixture(answers=[], spawn=spawn)
         self.addCleanup(fixture.close)
-        code = verify_flow(fixture.session, fixture.config, ip="104.21.54.105")
+        code = verify_flow(fixture.session, fixture.config, ip="104.16.0.1")
         self.assertEqual(code, 1)
         text = fixture.text
         self.assertIn("FAIL", text)
@@ -406,21 +406,21 @@ class VerifyFlowTests(unittest.TestCase):
     def test_dry_run_never_spawns(self):
         fixture = make_fixture(answers=[], dry_run=True)
         self.addCleanup(fixture.close)
-        code = verify_flow(fixture.session, fixture.config, ip="104.21.54.105")
+        code = verify_flow(fixture.session, fixture.config, ip="104.16.0.1")
         self.assertEqual(code, 0)
         self.assertEqual(fixture.spawn.calls, [])
-        self.assertIn("-ip 104.21.54.105", fixture.text)
+        self.assertIn("-ip 104.16.0.1", fixture.text)
 
     def test_missing_binary_is_reported(self):
         fixture = make_fixture(answers=[], spawn=ScriptedSpawn(
             error=FileNotFoundError("no cfst")))
         self.addCleanup(fixture.close)
         self.assertEqual(verify_flow(fixture.session, fixture.config,
-                                     ip="104.21.54.105"), 3)
+                                     ip="104.16.0.1"), 3)
 
     def test_prompts_for_ip_when_missing(self):
         spawn = ScriptedSpawn(log_text="", csv_text=CSV_VERIFY_PASS)
-        fixture = make_fixture(answers=["not-an-ip", "104.21.54.105"], spawn=spawn)
+        fixture = make_fixture(answers=["not-an-ip", "104.16.0.1"], spawn=spawn)
         self.addCleanup(fixture.close)
         code = verify_flow(fixture.session, fixture.config)
         self.assertEqual(code, 0)
@@ -431,7 +431,7 @@ class VerifyFlowTests(unittest.TestCase):
                                spawn=ScriptedSpawn(
                                    error=OSError("Exec format error")))
         self.addCleanup(fixture.close)
-        code = verify_flow(fixture.session, fixture.config, ip="104.21.54.105")
+        code = verify_flow(fixture.session, fixture.config, ip="104.16.0.1")
         self.assertEqual(code, 1)
         self.assertIn("could not be started", fixture.text)
 
@@ -673,7 +673,7 @@ class TopIpsTests(unittest.TestCase):
         self.assertNotIn("104.21.0.12", text)
         self.assertIn("The best 10 of 12 are shown; menu 4", text)
         self.assertIn("Port 2087", text)
-        self.assertIn("SNI/Host gerr.yasin-ai-54.ir", text)
+        self.assertIn("SNI/Host node.example.test", text)
         marked = [line for line in text.splitlines() if line.rstrip().endswith("*")]
         self.assertTrue(any("104.21.0.1" in line for line in marked))
 
@@ -807,7 +807,7 @@ class HttpingSchemeTests(unittest.TestCase):
 
     ANSWERS = [
         DEFAULT_KEY,            # profile name (the built-in profile)
-        "gerr.yasin-ai-54.ir",  # domain
+        "node.example.test",  # domain
         "2087",                 # port
         "4",                    # IPv4
         "1",                    # HTTPing
@@ -827,7 +827,7 @@ class HttpingSchemeTests(unittest.TestCase):
         fixture = make_fixture(answers=self.ANSWERS, dry_run=True)
         self.addCleanup(fixture.close)
         custom_scan(fixture.session, fixture.config)
-        self.assertIn("-url http://gerr.yasin-ai-54.ir:2087/", fixture.text)
+        self.assertIn("-url http://node.example.test:2087/", fixture.text)
         saved = fixture.reload()["profiles"][DEFAULT_KEY]
         self.assertEqual(saved["scheme"], "http")
 
@@ -840,7 +840,7 @@ class HttpingSchemeTests(unittest.TestCase):
         fixture = make_fixture(answers=answers, dry_run=True)
         self.addCleanup(fixture.close)
         custom_scan(fixture.session, fixture.config)
-        self.assertIn("-url https://gerr.yasin-ai-54.ir:2087/", fixture.text)
+        self.assertIn("-url https://node.example.test:2087/", fixture.text)
         saved = fixture.reload()["profiles"][DEFAULT_KEY]
         self.assertEqual(saved["scheme"], "https")
 
@@ -858,13 +858,13 @@ class VerifiedIpInheritanceTests(unittest.TestCase):
     def test_same_target_keeps_the_verified_ip(self):
         answers = list(CustomScanTests.ANSWERS)
         answers[0] = DEFAULT_KEY
-        answers[1] = "gerr.yasin-ai-54.ir"
+        answers[1] = "node.example.test"
         answers[2] = "2087"
         fixture = make_fixture(answers=answers, dry_run=True)
         self.addCleanup(fixture.close)
         custom_scan(fixture.session, fixture.config)
         saved = fixture.reload()["profiles"][DEFAULT_KEY]
-        self.assertEqual(saved["recommended_ip"], "104.21.54.105")
+        self.assertEqual(saved["recommended_ip"], "104.16.0.1")
 
 
 class _AbortAtInput(object):
@@ -901,12 +901,12 @@ class BackToMenuTests(unittest.TestCase):
 
     def test_verify_result_is_repeated_then_the_menu_returns(self):
         spawn = ScriptedSpawn(log_text="", csv_text=CSV_VERIFY_PASS)
-        fixture = Fixture(answers=["3", "104.21.54.105", "", "0"], spawn=spawn,
+        fixture = Fixture(answers=["3", "104.16.0.1", "", "0"], spawn=spawn,
                           tty=True)
         self.addCleanup(fixture.close)
         self.assertEqual(run_menu(fixture.session, fixture.config), 0)
         text = fixture.text
-        self.assertIn("[PASS] Verify 104.21.54.105 - PASS", text)
+        self.assertIn("[PASS] Verify 104.16.0.1 - PASS", text)
         self.assertGreaterEqual(text.count("1. Quick Scan"), 2)
 
     def test_piped_output_never_waits_for_enter(self):
@@ -956,7 +956,7 @@ class LastResultsTests(unittest.TestCase):
         fixture.out.seek(0)
         code = show_last_results(fixture.session, fixture.config)
         self.assertEqual(code, 0)
-        self.assertIn("104.21.54.105", fixture.text)
+        self.assertIn("104.16.0.1", fixture.text)
 
     def test_recommended_ip_from_the_scan_is_highlighted(self):
         spawn = ScriptedSpawn(log_text=LOG_SUCCESS, csv_text=CSV_TWO_ROWS)
@@ -968,7 +968,7 @@ class LastResultsTests(unittest.TestCase):
         show_last_results(fixture.session, fixture.config)
         text = fixture.text
         self.assertIn("* = recommended IP", text)
-        self.assertIn("Recommended IP: 104.21.54.105", text)
+        self.assertIn("Recommended IP: 104.16.0.1", text)
 
     def test_invalid_csv_is_reported(self):
         fixture = make_fixture()

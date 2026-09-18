@@ -102,13 +102,13 @@ class VerifyWriteBackTests(unittest.TestCase):
         fixture = Fixture(spawn=spawn)
         self.addCleanup(fixture.close)
 
-        code = verify_flow(fixture.session, fixture.config, ip="104.21.54.105")
+        code = verify_flow(fixture.session, fixture.config, ip="104.16.0.1")
 
         self.assertEqual(code, 0)
         saved = fixture.reload()["profiles"][fixture.config["active_profile"]]
-        self.assertEqual(saved["recommended_ip"], "104.21.54.105")
+        self.assertEqual(saved["recommended_ip"], "104.16.0.1")
         self.assertEqual([item["ip"] for item in saved["favourites"]],
-                         ["104.21.54.105"])
+                         ["104.16.0.1"])
 
     def test_a_verification_does_not_replace_the_last_scan(self):
         # Menu 4 promises the last scan. A single-address verification file used
@@ -121,11 +121,11 @@ class VerifyWriteBackTests(unittest.TestCase):
         scan_csv = fixture.reload()["last_result"]["csv"]
 
         fixture.session.spawn = ScriptedSpawn(log_text="", csv_text=CSV_VERIFY_PASS)
-        verify_flow(fixture.session, fixture.config, ip="104.21.54.105")
+        verify_flow(fixture.session, fixture.config, ip="104.16.0.1")
 
         pointer = fixture.reload()["last_result"]
         self.assertEqual(pointer["csv"], scan_csv)
-        self.assertEqual(pointer["recommended_ip"], "104.21.54.105")
+        self.assertEqual(pointer["recommended_ip"], "104.16.0.1")
 
     def test_a_scan_remembers_the_addresses_that_passed(self):
         rows = [("104.21.0.1", 4, 4, 0.0, 100.0, "FRA"),
@@ -215,7 +215,7 @@ class Menu3Tests(unittest.TestCase):
 
     def test_typing_an_address_still_works_with_a_saved_list(self):
         spawn = ScriptedSpawn(log_text="", csv_text=CSV_VERIFY_PASS)
-        fixture = self._with_saved(["104.21.54.105"], spawn=spawn)
+        fixture = self._with_saved(["104.16.0.1"], spawn=spawn)
         self.assertEqual(verify_flow(fixture.session, fixture.config), 0)
         self.assertIn("PASS", fixture.text)
 

@@ -25,6 +25,7 @@ from cfscan.runner import (
     translate_log,
 )
 
+from tests.support import FIXTURE_DOMAIN, FIXTURE_PORT
 from tests.support import (
     LOG_NO_RESULTS,
     LOG_PROGRESS,
@@ -35,12 +36,14 @@ from tests.support import (
 )
 
 CFST = "/opt/homebrew/bin/cfst"
-IP_FILE = "/Users/yasin_mst/.local/share/cloudflare-speedtest/ip.txt"
-IPV6_FILE = "/Users/yasin_mst/.local/share/cloudflare-speedtest/ipv6.txt"
+IP_FILE = "/Users/example/.local/share/cloudflare-speedtest/ip.txt"
+IPV6_FILE = "/Users/example/.local/share/cloudflare-speedtest/ipv6.txt"
 
 
 def spec_profile():
     profile = default_profile(cfst_path=CFST)
+    # The shipped default is a placeholder; these tests want a configured one.
+    profile.update(domain=FIXTURE_DOMAIN, port=FIXTURE_PORT)
     profile["ip_file"] = IP_FILE
     profile["ipv6_file"] = IPV6_FILE
     return profile
@@ -61,7 +64,7 @@ class BuildScanArgvTests(unittest.TestCase):
                 "-httping-code",
                 "400",
                 "-url",
-                "https://gerr.yasin-ai-54.ir:2087/",
+                "https://node.example.test:2087/",
                 "-dd",
                 "-t",
                 "4",
@@ -109,10 +112,10 @@ class BuildScanArgvTests(unittest.TestCase):
 
     def test_single_ip_replaces_range_file(self):
         argv = build_scan_argv(
-            CFST, spec_profile(), "/tmp/out.csv", single_ip="104.21.54.105"
+            CFST, spec_profile(), "/tmp/out.csv", single_ip="104.16.0.1"
         )
         self.assertNotIn("-f", argv)
-        self.assertEqual(argv[argv.index("-ip") + 1], "104.21.54.105")
+        self.assertEqual(argv[argv.index("-ip") + 1], "104.16.0.1")
 
     def test_attempt_override_is_respected(self):
         argv = build_scan_argv(CFST, spec_profile(), "/tmp/out.csv", attempts=20)
@@ -127,14 +130,14 @@ class BuildScanArgvTests(unittest.TestCase):
         profile = spec_profile()
         profile["scheme"] = "http"
         argv = build_scan_argv(CFST, profile, "/tmp/out.csv")
-        self.assertEqual(argv[argv.index("-url") + 1], "http://gerr.yasin-ai-54.ir:2087/")
+        self.assertEqual(argv[argv.index("-url") + 1], "http://node.example.test:2087/")
 
     def test_custom_path_is_used(self):
         profile = spec_profile()
         profile["url_path"] = "/cdn-cgi/trace"
         argv = build_scan_argv(CFST, profile, "/tmp/out.csv")
         self.assertEqual(
-            argv[argv.index("-url") + 1], "https://gerr.yasin-ai-54.ir:2087/cdn-cgi/trace"
+            argv[argv.index("-url") + 1], "https://node.example.test:2087/cdn-cgi/trace"
         )
 
     def test_no_shell_metacharacters_in_argv(self):
@@ -146,8 +149,8 @@ class BuildScanArgvTests(unittest.TestCase):
 
 class BuildVerifyArgvTests(unittest.TestCase):
     def test_verify_uses_twenty_attempts_and_asks_for_any_loss(self):
-        argv = build_verify_argv(CFST, spec_profile(), "104.21.54.105", "/tmp/v.csv")
-        self.assertEqual(argv[argv.index("-ip") + 1], "104.21.54.105")
+        argv = build_verify_argv(CFST, spec_profile(), "104.16.0.1", "/tmp/v.csv")
+        self.assertEqual(argv[argv.index("-ip") + 1], "104.16.0.1")
         self.assertEqual(argv[argv.index("-t") + 1], "20")
         # The scanner must report the address even when packets are lost, so
         # cfscan can show the real numbers instead of a silent rejection.
@@ -159,16 +162,16 @@ class BuildVerifyArgvTests(unittest.TestCase):
 
     def test_verify_attempts_can_be_overridden(self):
         argv = build_verify_argv(
-            CFST, spec_profile(), "104.21.54.105", "/tmp/v.csv", attempts=5
+            CFST, spec_profile(), "104.16.0.1", "/tmp/v.csv", attempts=5
         )
         self.assertEqual(argv[argv.index("-t") + 1], "5")
 
     def test_verify_keeps_http_mode_and_status(self):
-        argv = build_verify_argv(CFST, spec_profile(), "104.21.54.105", "/tmp/v.csv")
+        argv = build_verify_argv(CFST, spec_profile(), "104.16.0.1", "/tmp/v.csv")
         self.assertIn("-httping", argv)
         self.assertEqual(argv[argv.index("-httping-code") + 1], "400")
         self.assertEqual(
-            argv[argv.index("-url") + 1], "https://gerr.yasin-ai-54.ir:2087/"
+            argv[argv.index("-url") + 1], "https://node.example.test:2087/"
         )
 
 
@@ -250,7 +253,7 @@ class ExtractStatusRejectionTests(unittest.TestCase):
         self.assertIsNotNone(info)
         self.assertEqual(info["observed"], 520)
         self.assertEqual(info["expected"], 400)
-        self.assertEqual(info["ip"], "104.21.54.105")
+        self.assertEqual(info["ip"], "104.16.0.1")
 
     def test_returns_none_without_rejection(self):
         self.assertIsNone(extract_status_rejection(LOG_SUCCESS))

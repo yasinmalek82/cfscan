@@ -4,7 +4,7 @@ The scanner writes a UTF-8 CSV with a byte order mark, CRLF line endings and a
 Chinese header. It looks like this::
 
     IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码
-    104.21.54.105,4,4,0.00,438.32,0.00,N/A
+    104.16.0.1,4,4,0.00,138.32,0.00,FRA
 
 The last column (``地区码`` / colo) only exists in HTTPing mode. Parsing stays
 tolerant: unknown headers fall back to positional columns, unreadable rows are

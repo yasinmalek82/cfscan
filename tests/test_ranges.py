@@ -189,9 +189,43 @@ class DescribeTests(unittest.TestCase):
 
 class UpdateFlowTests(unittest.TestCase):
     def _fixture(self, answers=("y",)):
-        fixture = Fixture(answers=list(answers))
+        # tty=True because these exercise the confirmation; without a terminal
+        # to ask in, the menu flow deliberately downloads nothing.
+        fixture = Fixture(answers=list(answers), tty=True)
         self.addCleanup(fixture.close)
         return fixture
+
+    def test_the_menu_never_downloads_when_it_cannot_ask(self):
+        fixture = Fixture()          # no terminal: nothing to confirm with
+        self.addCleanup(fixture.close)
+        before = Path(fixture.ipv4).read_text(encoding="utf-8")
+
+        def explode(url, **kwargs):  # pragma: no cover - must never run
+            raise AssertionError("a download needs a confirmation first")
+
+        original = ranges.fetch_text
+        ranges.fetch_text = explode
+        self.addCleanup(setattr, ranges, "fetch_text", original)
+
+        self.assertEqual(update_ranges_flow(fixture.session, fixture.config), 0)
+        self.assertEqual(Path(fixture.ipv4).read_text(encoding="utf-8"), before)
+        self.assertIn("no terminal to confirm in", fixture.text)
+
+    def test_the_typed_command_may_run_unattended(self):
+        # A script that types 'cfscan --update-ranges' has already said yes.
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        payloads = {ranges.IPV4_URL: IPV4_LIST, ranges.IPV6_URL: IPV6_LIST}
+        original = ranges.fetch_text
+        ranges.fetch_text = lambda url, **kw: payloads[url]
+        self.addCleanup(setattr, ranges, "fetch_text", original)
+
+        code = update_ranges_flow(fixture.session, fixture.config,
+                                  allow_unattended=True)
+
+        self.assertEqual(code, 0)
+        self.assertIn("172.64.0.0/13",
+                      Path(fixture.ipv4).read_text(encoding="utf-8"))
 
     def test_both_families_are_updated_and_reported(self):
         fixture = self._fixture()

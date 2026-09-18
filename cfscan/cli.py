@@ -318,6 +318,15 @@ def main(argv=None, paths=None, console=None, spawn=None):
         direct=args.direct,
     )
 
+    # Validated once, here, rather than inside the flows that happen to use it:
+    # "--profile nosuch --list-profiles" used to list the profiles and say
+    # nothing, so a typo looked like it had worked.
+    if args.profile is not None and args.profile not in (config.get("profiles") or {}):
+        available = ", ".join(config.get("profiles") or {}) or "none"
+        console.error(f"Unknown profile '{args.profile}'. "
+                      f"Available profiles: {available}.")
+        return EXIT_USAGE
+
     if args.colo is not None:
         # A one-run override: the profile on disk is not touched, so trying a
         # region never quietly rewrites a saved profile.
@@ -340,8 +349,10 @@ def main(argv=None, paths=None, console=None, spawn=None):
 
     try:
         if args.update_ranges:
+            # Typed by the user, so it may run unattended in a script.
             return update_ranges_flow(session, config,
-                                      profile_name=args.profile)
+                                      profile_name=args.profile,
+                                      allow_unattended=True)
         if args.edges:
             return edge_locations(session, config, profile_name=args.profile)
         if args.list_profiles:

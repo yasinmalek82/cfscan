@@ -173,7 +173,7 @@ def measured_ip_list(session):
 
 
 def session_slug(domain, when=None):
-    """``england-yasin-ai-54-ir-20260916-124530`` for a session.
+    """``example-com-20260916-124530`` for a session.
 
     Seconds are part of the name so two sessions for one domain never land in
     the same file, even when they are started within the same minute.

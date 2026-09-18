@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from cfscan.profiles import (
+    is_placeholder,
     DEFAULT_PROFILE_KEY,
     Paths,
     atomic_write_json,
@@ -41,8 +42,11 @@ class PathsTests(unittest.TestCase):
 class DefaultProfileTests(unittest.TestCase):
     def test_default_profile_matches_specification(self):
         profile = default_profile()
-        self.assertEqual(profile["domain"], "gerr.yasin-ai-54.ir")
-        self.assertEqual(profile["port"], 2087)
+        # A fresh installation must not point at anybody's real server: a scan
+        # would send thousands of requests to whatever domain is configured.
+        self.assertEqual(profile["domain"], "example.com")
+        self.assertTrue(is_placeholder(profile))
+        self.assertEqual(profile["port"], 443)
         self.assertEqual(profile["mode"], "httping")
         self.assertEqual(profile["scheme"], "https")
         self.assertEqual(profile["http_status"], 400)
@@ -53,7 +57,7 @@ class DefaultProfileTests(unittest.TestCase):
         self.assertEqual(profile["max_latency_ms"], 1000)
         self.assertEqual(profile["results_limit"], 20)
         self.assertFalse(profile["download_test"])
-        self.assertEqual(profile["recommended_ip"], "104.21.54.105")
+        self.assertIsNone(profile["recommended_ip"])
         self.assertEqual(profile["verify_attempts"], 20)
 
     def test_default_profile_has_no_secret_fields(self):
@@ -109,7 +113,7 @@ class LoadConfigTests(unittest.TestCase):
         config = load_config(self.paths)
         profile = config["profiles"]["custom"]
         self.assertEqual(profile["domain"], "example.com")
-        self.assertEqual(profile["port"], 2087)
+        self.assertEqual(profile["port"], 443)
         self.assertEqual(profile["attempts"], 4)
 
     def test_corrupt_config_is_backed_up_and_replaced(self):
@@ -125,13 +129,23 @@ class LoadConfigTests(unittest.TestCase):
         config = load_config(self.paths)
         self.assertIn(config["active_profile"], config["profiles"])
 
-    def test_default_profile_always_present(self):
+    def test_a_deleted_shipped_profile_stays_deleted(self):
+        # It used to be re-added on every load, so a profile the user deleted
+        # on purpose came back every time the configuration was read.
         write_config(
             self.paths,
-            {"active_profile": "custom", "profiles": {"custom": {"domain": "example.com"}}},
+            {"active_profile": "mine",
+             "profiles": {"mine": {"domain": "mine.test"}}},
         )
         config = load_config(self.paths)
+        self.assertNotIn(DEFAULT_PROFILE_KEY, config["profiles"])
+        self.assertEqual(config["active_profile"], "mine")
+
+    def test_a_profile_always_exists_when_none_is_left(self):
+        write_config(self.paths, {"active_profile": "gone", "profiles": {}})
+        config = load_config(self.paths)
         self.assertIn(DEFAULT_PROFILE_KEY, config["profiles"])
+        self.assertEqual(config["active_profile"], DEFAULT_PROFILE_KEY)
 
 
 class AtomicWriteTests(unittest.TestCase):
@@ -193,7 +207,7 @@ class ProfileMutationTests(unittest.TestCase):
     def test_get_active_and_set_active(self):
         name, profile = get_active(self.config)
         self.assertEqual(name, DEFAULT_PROFILE_KEY)
-        self.assertEqual(profile["domain"], "gerr.yasin-ai-54.ir")
+        self.assertEqual(profile["domain"], "example.com")
 
         upsert_profile(self.config, "second", {"domain": "second.example.com"})
         set_active(self.config, "second")
@@ -216,7 +230,7 @@ class ProfileMutationTests(unittest.TestCase):
 
 class ProfileSlugTests(unittest.TestCase):
     def test_makes_safe_filenames(self):
-        self.assertEqual(profile_slug("gerr.yasin-ai-54.ir"), "gerr-yasin-ai-54-ir")
+        self.assertEqual(profile_slug("node.example.test"), "node-example-test")
         self.assertEqual(profile_slug("My Profile!"), "my-profile")
         self.assertEqual(profile_slug("  "), "profile")
 

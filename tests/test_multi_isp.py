@@ -32,11 +32,19 @@ from cfscan.menu import (
 from cfscan.profiles import default_profile
 from cfscan.validate import ValidationError
 
-from tests.support import Fixture, ScriptedSpawn, csv_with_measurements
+from tests.support import (
+    FIXTURE_DOMAIN,
+    FIXTURE_PORT,
+    Fixture,
+    ScriptedSpawn,
+    csv_with_measurements,
+)
 
 # The profile the test fixture ships with, so assertions read from the same
-# place the code does instead of hard-coding a domain twice.
-PROFILE = default_profile()
+# place the code does instead of hard-coding a domain twice. The shipped
+# default is a placeholder that scans refuse to run against, so the fixture
+# gives it a target and these follow.
+PROFILE = dict(default_profile(), domain=FIXTURE_DOMAIN, port=FIXTURE_PORT)
 DOMAIN = PROFILE["domain"]
 PORT = PROFILE["port"]
 

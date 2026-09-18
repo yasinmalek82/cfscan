@@ -66,10 +66,10 @@ class ConsoleOutputTests(unittest.TestCase):
     def test_remains_readable_without_colour(self):
         console, out = self.make(color=False)
         console.heading("Active profile")
-        console.line("Domain: gerr.yasin-ai-54.ir")
+        console.line("Domain: node.example.test")
         text = out.getvalue()
         self.assertIn("Active profile", text)
-        self.assertIn("Domain: gerr.yasin-ai-54.ir", text)
+        self.assertIn("Domain: node.example.test", text)
 
     def test_colour_output_has_escape_codes(self):
         console, out = self.make(color=True)
@@ -80,7 +80,7 @@ class ConsoleOutputTests(unittest.TestCase):
         console, out = self.make(color=False)
         console.table(
             ["Rank", "IP", "Sent"],
-            [["1", "104.21.54.105", "4"], ["2", "172.67.213.151", "4"]],
+            [["1", "104.16.0.1", "4"], ["2", "172.67.213.151", "4"]],
             highlight_rows={0},
         )
         lines = [line for line in out.getvalue().splitlines() if line.strip()]
@@ -93,7 +93,7 @@ class ConsoleOutputTests(unittest.TestCase):
         console, out = self.make(color=True)
         console.table(
             ["Rank", "IP"],
-            [["1", "104.21.54.105"], ["2", "172.67.213.151"]],
+            [["1", "104.16.0.1"], ["2", "172.67.213.151"]],
             highlight_rows={0},
         )
         plain = out.getvalue()
@@ -116,8 +116,8 @@ class ConsolePromptTests(unittest.TestCase):
 
     def test_ask_uses_default_for_empty_answer(self):
         console, _ = self.make([""])
-        self.assertEqual(console.ask("Domain", default="gerr.yasin-ai-54.ir"),
-                         "gerr.yasin-ai-54.ir")
+        self.assertEqual(console.ask("Domain", default="node.example.test"),
+                         "node.example.test")
 
     def test_ask_requires_value_without_default(self):
         console, out = self.make(["", "example.com"])

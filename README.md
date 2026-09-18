@@ -81,7 +81,7 @@ cfscan                       # interactive menu (recommended)
 cfscan --quick --yes         # scan with the active profile right away
 cfscan --quick --dry-run     # print the exact cfst argument list, run nothing
 cfscan --quick --no-verify-top  # scan without the strict check of the best ten
-cfscan --verify 104.21.54.105  # strict 20-attempt check of one address
+cfscan --verify 104.16.0.1  # strict 20-attempt check of one address
 cfscan --profile office      # use another saved profile (menu or one-shot run)
 cfscan --show-last           # show the newest saved result
 cfscan --list-profiles       # list saved profiles
@@ -92,6 +92,9 @@ cfscan --colo FRA,AMS        # keep only those datacentres, for this run only
 cfscan --colo any            # ignore the profile's filter, measure everything
 cfscan --update-ranges       # download Cloudflare's current IP range lists
 cfscan --edges               # rank the datacentres from what you measured
+cfscan --no-preflight        # skip the one-address check made before a scan
+cfscan --isp mci --note 4g   # label a carrier round with the access type
+cfscan --multi-isp --session FILE   # report a specific stored session
 cfscan --no-color            # plain output
 cfscan --version
 cfscan --help
@@ -106,8 +109,8 @@ running whichever comes first.
 ==================================================================
   cfscan 1.1.0  clean Cloudflare IP finder
 ==================================================================
-  Profile   england.yasin-ai-54.ir
-  Target    england.yasin-ai-54.ir   port 443  IPv4  HTTPing/https  only FRA,AMS
+  Profile   node.example.com
+  Target    node.example.com   port 443  IPv4  HTTPing/https  only FRA,AMS
   Ready     cfst ready  ip.txt 14 ranges, 2026-09-17
   Last run  104.16.142.237  16 Sep 12:21  (7 saved IP(s) in menu 3)
 ------------------------------------------------------------------
@@ -141,7 +144,7 @@ then prints a ranked table:
 ```
 #  IP address       Sent  Received  Loss  Latency    Colo
 -- ---------------- ---- --------- ----- ---------- ----
- 1  104.21.54.105 * 4    4         0%    438.32 ms  -
+ 1  104.16.0.1 * 4    4         0%    438.32 ms  -
  2  172.67.213.151   4    3         25%   512.10 ms  SJC
 ```
 
@@ -152,11 +155,11 @@ every line with the result of that check:
 ```
 Top 10 IPs you can use
 ----------------------
-  1. PASS 104.19.10.61     146.09 ms   0%  FRA  Port 2087  SNI/Host gerr.yasin-ai-54.ir  *
-  2. PASS 104.18.210.173   149.02 ms   0%  FRA  Port 2087  SNI/Host gerr.yasin-ai-54.ir
-  3. FAIL 162.159.206.2    149.74 ms  15%  FRA  Port 2087  SNI/Host gerr.yasin-ai-54.ir
-  4. DEAD 104.20.126.138          -     -  -    Port 2087  SNI/Host gerr.yasin-ai-54.ir
- 10. PASS 104.25.79.140    154.96 ms   0%  FRA  Port 2087  SNI/Host gerr.yasin-ai-54.ir
+  1. PASS 104.19.10.61     146.09 ms   0%  FRA  Port 2087  SNI/Host node.example.com  *
+  2. PASS 104.18.210.173   149.02 ms   0%  FRA  Port 2087  SNI/Host node.example.com
+  3. FAIL 162.159.206.2    149.74 ms  15%  FRA  Port 2087  SNI/Host node.example.com
+  4. DEAD 104.20.126.138          -     -  -    Port 2087  SNI/Host node.example.com
+ 10. PASS 104.25.79.140    154.96 ms   0%  FRA  Port 2087  SNI/Host node.example.com
 ```
 
 * **PASS** - every one of the 20 attempts was answered, 0% packet loss. Safe to
@@ -246,11 +249,11 @@ you see last:
 
 ```
 ----------------------------------------------------------------
-[PASS] Verify 104.21.54.105 - PASS
-  104.21.54.105 answered 20/20 attempts, 0% packet loss
+[PASS] Verify 104.16.0.1 - PASS
+  104.16.0.1 answered 20/20 attempts, 0% packet loss
   Average latency 431.07 ms    Colo FRA
-  Client fields - Address 104.21.54.105, Port 2087, SNI gerr.yasin-ai-54.ir,
-  Host gerr.yasin-ai-54.ir
+  Client fields - Address 104.16.0.1, Port 2087, SNI node.example.com,
+  Host node.example.com
 
 Press Enter to return to the menu:
 ```
@@ -325,7 +328,7 @@ port is answered by Cloudflare itself and needs no certificate, so an address
 that answers *that* while failing the TLS probe settles it:
 
 ```
-x The edge answers for ws.tr.yasin-ai-54.ir over plain HTTP but refuses TLS for
+x The edge answers for ws.node.example.com over plain HTTP but refuses TLS for
   it, so this is a certificate problem, not an address problem.
   - No clean IP can fix it. ...
 ```
@@ -333,11 +336,11 @@ x The edge answers for ws.tr.yasin-ai-54.ir over plain HTTP but refuses TLS for
 The usual cause is depth. A TLS wildcard matches **exactly one label**, and
 Cloudflare's Universal SSL issues only the zone and `*.zone`:
 
-| hostname | labels below the zone | covered by `*.yasin-ai-54.ir` |
+| hostname | labels below the zone | covered by `*.example.com` |
 | --- | --- | --- |
-| `england.yasin-ai-54.ir` | 1 | yes |
-| `wsturkey.yasin-ai-54.ir` | 1 | yes |
-| `ws.tr.yasin-ai-54.ir` | **2** | **no** |
+| `node.example.com` | 1 | yes |
+| `edge.example.com` | 1 | yes |
+| `ws.node.example.com` | **2** | **no** |
 
 The ways out are a hostname one level below the zone, Cloudflare's Advanced
 Certificate Manager / Total TLS, or a custom certificate - which is what the
@@ -409,7 +412,7 @@ saved on its profile, and menu 3 offers the list before it asks you to type
 anything:
 
 ```
-Saved good IPs for england.yasin-ai-54.ir
+Saved good IPs for node.example.com
 #  IP address       Latency  Colo  Proven
 -- ---------------- -------- ----- --------
  1  104.16.142.237    134 ms  FRA   2 h ago
@@ -454,10 +457,10 @@ written atomically).
 {
   "version": 1,
   "cfst_path": "/opt/homebrew/bin/cfst",
-  "active_profile": "gerr-yasin-ai-54",
+  "active_profile": "example",
   "profiles": {
-    "gerr-yasin-ai-54": {
-      "domain": "gerr.yasin-ai-54.ir",
+    "example": {
+      "domain": "node.example.com",
       "port": 2087,
       "mode": "httping",
       "scheme": "https",
@@ -474,7 +477,7 @@ written atomically).
       "results_limit": 20,
       "top_ips": 10,
       "download_test": false,
-      "recommended_ip": "104.21.54.105",
+      "recommended_ip": "104.16.0.1",
       "verify_attempts": 20,
       "favourites": []
     }
@@ -505,7 +508,7 @@ written atomically).
 | `recommended_ip` | Your verified IP; highlighted when it appears in a scan, and rewritten whenever a verification passes. Custom Scan clears it automatically when you change the domain or port, because the IP was verified against the old target |
 
 Profiles can also be created and edited from the menu (option 6). The built-in
-`gerr-yasin-ai-54` profile cannot be deleted, so a working fallback always
+`example` profile cannot be deleted, so a working fallback always
 exists. Editing the JSON by hand is safe: missing fields are filled in with
 defaults and unknown fields are preserved.
 
@@ -516,9 +519,9 @@ For the default profile, a Quick Scan is exactly equivalent to:
 ```sh
 cfst -f ~/.local/share/cloudflare-speedtest/ip.txt \
      -tp 2087 -httping -httping-code 400 \
-     -url https://gerr.yasin-ai-54.ir:2087/ \
+     -url https://node.example.com:2087/ \
      -dd -t 4 -n 200 -tl 1000 -tlr 0.25 -p 20 \
-     -o "$HOME/Documents/Cloudflare Scanner Results/cfscan-gerr-yasin-ai-54-<timestamp>.csv"
+     -o "$HOME/Documents/Cloudflare Scanner Results/cfscan-example-<timestamp>.csv"
 ```
 
 Use `cfscan --quick --dry-run` (or the `--dry-run` flag with any scan) to print
@@ -588,6 +591,45 @@ menu. Nothing is left running.
 disabled (`download_test: false`, `-dd`). Enabling the download test is much
 slower because every candidate is downloaded from.
 
+## What this depends on, and what you may ship
+
+cfscan is **MIT licensed** (see `LICENSE`) and has **no Python dependencies**:
+it imports only the standard library, which the test suite checks.
+
+It does not contain, bundle or link any third-party code. It *runs* one
+external program, which you install yourself:
+
+| Program | Role | Licence |
+| --- | --- | --- |
+| [XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) (`cfst`) | does the measuring | GPL-3.0 |
+
+cfscan starts `cfst` as a separate process with an argument list - it never
+links against it and never copies its code - so distributing cfscan does not
+distribute `cfst`, and the MIT licence above covers everything in this
+repository. If you redistribute the `cfst` **binary** alongside it, GPL-3.0
+applies to that binary and its terms are yours to meet; the simplest route is
+what this README already tells users to do, which is to install it themselves.
+
+The names in this repository (`example.com`, `node.example.com`) are reserved
+for documentation by RFC 2606 and resolve to nothing. There is no real domain,
+address or credential anywhere in the source, and a test guards against one
+creeping back in.
+
+## Supported platforms
+
+Written for and tested on **macOS**. Three things are macOS-specific and
+degrade rather than crash elsewhere:
+
+| What | Where | Off macOS |
+| --- | --- | --- |
+| `open` to reveal the results folder | menu 8 | prints the path instead |
+| `route -n get default` to detect a tunnel | menu 12, scan notices | the line is labelled `unknown`, ranking still works |
+| `/opt/homebrew/bin/cfst` as the fallback path | first run | `cfst` is found on `PATH` first, so set `cfst_path` if it is elsewhere |
+
+Everything else - the scanning, parsing, ranking, profiles and result files -
+is plain Python and portable. Linux support is a small change in those three
+places if you want it.
+
 ## Safety
 
 * The scanner is started with an argument list and `shell=False`; there is no
@@ -619,15 +661,19 @@ than split in two.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-After a change, run `./update.sh` before trying `cfscan` again: the launcher reads
-the installed copy in `~/.local/share/cfscan/lib`, not this folder, so an old
-version would otherwise keep answering.
+560 tests, on Python 3.9 and newer.
+
+Run `./dev-link.sh` once and the `cfscan` command reads this folder, so every
+edit is live on the next run (see **Working on the code: the live link**
+above). Without it, the launcher reads the copy in `~/.local/share/cfscan/lib`
+and an old version keeps answering until `./update.sh` is run.
 
 The suite uses temporary directories only - it never touches your real
 configuration or results - and fakes exactly one boundary: the execution of the
 external `cfst` binary. It covers validation, argument construction, log
 translation, CSV parsing, profile persistence, atomic writes, menu flows,
-dry-run behaviour and error handling.
+dry-run behaviour, error handling, the first-run defaults and the region
+filter.
 
 ## Uninstall
 
