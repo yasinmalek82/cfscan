@@ -348,6 +348,80 @@ class CliTests(unittest.TestCase):
         self.assertIn("could not be read", fixture.text)
 
 
+class RegionFilterTests(unittest.TestCase):
+    """A multi-carrier run inherits the profile colo unless this run overrides it.
+
+    The wizard can drop the filter for the sitting. ``--isp`` keeps it, and
+    says so, until ``--colo any`` (or ``--colo CODES``) sets the same one-run
+    override a quick scan already uses. None of these rewrite the saved profile.
+    """
+
+    def _with_colo(self, answers, colo="FRA,MUC,AMS,SOF", **kwargs):
+        fixture = Fixture(answers=answers, spawn=ScriptedSpawn(), dry_run=True,
+                          **kwargs)
+        self.addCleanup(fixture.close)
+        fixture.profile()["colo"] = colo
+        fixture.save()
+        return fixture
+
+    def test_the_wizard_can_measure_any_datacentre_without_editing_the_profile(self):
+        fixture = self._with_colo(["2", "2", "", ""])
+        self.assertEqual(multi_isp_flow(fixture.session, fixture.config),
+                         EXIT_FAILED)
+        self.assertIn("Measure any datacentre (this run only)", fixture.text)
+        self.assertIn("cfscan --colo any", fixture.text)
+        self.assertIn("any datacentre (this run)", fixture.text)
+        self.assertNotIn("-cfcolo", fixture.text)
+        self.assertEqual(fixture.session.colo_override, "")
+        saved = fixture.reload()["profiles"][fixture.config["active_profile"]]
+        self.assertEqual(saved["colo"], "FRA,MUC,AMS,SOF")
+
+    def test_keeping_the_filter_is_the_wizard_default_and_still_passes_cfcolo(self):
+        fixture = self._with_colo(["", "2", "", ""], colo="FRA,AMS")
+        self.assertEqual(multi_isp_flow(fixture.session, fixture.config),
+                         EXIT_FAILED)
+        self.assertIn("-cfcolo", fixture.text)
+        self.assertIn("FRA,AMS", fixture.text)
+        self.assertIsNone(fixture.session.colo_override)
+        saved = fixture.reload()["profiles"][fixture.config["active_profile"]]
+        self.assertEqual(saved["colo"], "FRA,AMS")
+
+    def test_isp_without_an_override_still_passes_cfcolo(self):
+        fixture = self._with_colo([], colo="FRA,AMS")
+        code = main(["--isp", "mci", "--dry-run"], paths=fixture.paths,
+                    console=fixture.console, spawn=fixture.spawn)
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("-cfcolo", fixture.text)
+        self.assertIn("FRA,AMS", fixture.text)
+        self.assertIn("cfscan --colo any clears it for this run", fixture.text)
+        saved = fixture.reload()["profiles"][fixture.config["active_profile"]]
+        self.assertEqual(saved["colo"], "FRA,AMS")
+
+    def test_colo_any_with_isp_omits_cfcolo(self):
+        fixture = self._with_colo([], colo="FRA,AMS")
+        code = main(["--colo", "any", "--isp", "mci", "--dry-run"],
+                    paths=fixture.paths, console=fixture.console,
+                    spawn=fixture.spawn)
+        self.assertEqual(code, EXIT_OK)
+        self.assertNotIn("-cfcolo", fixture.text)
+        self.assertNotIn("clears it for this run", fixture.text)
+        self.assertIn("any datacentre", fixture.text)
+        saved = fixture.reload()["profiles"][fixture.config["active_profile"]]
+        self.assertEqual(saved["colo"], "FRA,AMS")
+
+    def test_colo_codes_with_isp_replace_the_profile_filter_for_this_run(self):
+        fixture = self._with_colo([], colo="FRA,AMS")
+        code = main(["--colo", "LHR", "--isp", "mci", "--dry-run"],
+                    paths=fixture.paths, console=fixture.console,
+                    spawn=fixture.spawn)
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("-cfcolo", fixture.text)
+        self.assertIn("LHR", fixture.text)
+        self.assertNotIn("FRA,AMS", fixture.text)
+        saved = fixture.reload()["profiles"][fixture.config["active_profile"]]
+        self.assertEqual(saved["colo"], "FRA,AMS")
+
+
 class SessionFileTests(unittest.TestCase):
     def test_the_session_file_is_readable_json(self):
         spawn = ScriptedSpawn(csv_sequence=[ROUND_ONE_SCAN, ROUND_ONE_VERIFY])

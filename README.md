@@ -45,7 +45,7 @@ the folder it is running from, so "is my change live?" is a question the
 output answers:
 
 ```
-cfscan 1.4.0
+cfscan 1.4.1
 dev link: /path/to/cfscan/cfscan (edits are live)
 ```
 
@@ -90,6 +90,8 @@ cfscan --isp mci             # measure one carrier against that list
 cfscan --multi-isp           # print the multi-carrier report of the session
 cfscan --colo FRA,AMS        # keep only those datacentres, for this run only
 cfscan --colo any            # ignore the profile's filter, measure everything
+cfscan --colo any --isp mci  # one carrier round, every datacentre
+cfscan --colo FRA,AMS --isp mci   # one carrier round, only those datacentres
 cfscan --update-ranges       # download Cloudflare's current IP range lists
 cfscan --edges               # rank the datacentres from what you measured
 cfscan --no-preflight        # skip the one-address check made before a scan
@@ -111,7 +113,7 @@ running whichever comes first.
 
 ```
 ==================================================================
-  cfscan 1.4.0  clean Cloudflare IP finder
+  cfscan 1.4.1  clean Cloudflare IP finder
 ==================================================================
   Profile   node.example.com
   Target    node.example.com   port 443  IPv4  HTTPing/https  only FRA,AMS
@@ -245,6 +247,24 @@ The same thing step by step, for scripting: `cfscan --make-pool 2000` writes the
 candidate list, `cfscan --isp mci --pool <file>` measures one carrier, and any
 further `--isp NAME --pool <file>` continues the same session.
 
+**The region filter is inherited.** A profile with `colo: FRA,MUC,AMS,SOF`
+passes `-cfcolo FRA,MUC,AMS,SOF` on every carrier round, wizard and `--isp`
+alike, until you say otherwise. Menu 10 asks before it builds the shared list:
+keep that filter (the default when one is saved), or measure any datacentre
+for this sitting. That second choice is the same one-run override as
+`cfscan --colo any` — the saved profile is not rewritten. From the command
+line:
+
+```sh
+cfscan --colo FRA,AMS --isp mci     # this round only
+cfscan --colo any --isp mci         # every datacentre, profile unchanged
+```
+
+With no `--colo`, `--isp` keeps the saved filter and prints one line saying so,
+including the `cfscan --colo any` way to clear it for that run. The shared
+candidate list is a sample of the IP ranges and is **not** colo-filtered; only
+the measurement pass receives `-cfcolo`.
+
 ### What happens after a test
 
 Every flow (quick scan, custom scan, verify, last results) prints its full
@@ -320,7 +340,13 @@ running a scan, and one run can ignore a saved filter entirely:
 
 ```sh
 cfscan --colo any --quick --yes     # the saved profile is not touched
+cfscan --colo any --isp mci         # the same, for one carrier round
+cfscan --colo FRA,AMS --isp mci     # or name the datacentres for that round
 ```
+
+Menu 10 asks the same question before a multi-carrier sitting. `--isp` without
+`--colo` keeps the profile filter and says so in one line. The candidate list
+the rounds share is not filtered; `-cfcolo` applies only while measuring.
 
 ### When no address can work: a missing certificate
 

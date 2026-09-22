@@ -72,7 +72,11 @@ Multi-carrier scans:
   fixes the candidate list once - 'cfscan --make-pool 2000' writes it - and every
   round measures that same list. Menu 10 does all of it in one sitting: it asks
   how many carriers first, then one round each, waiting between rounds so the
-  connection can be switched. Each round is stored as it finishes under the
+  connection can be switched. Rounds inherit the profile's region filter.
+  Menu 10 asks whether to keep it or measure any datacentre for this sitting,
+  and '--colo any --isp NAME' (or '--colo CODES --isp NAME') does the same for
+  one scripted round. The shared candidate list is not filtered; '-cfcolo' is
+  applied only on the measurement pass. Each round is stored as it finishes under the
   results folder (multi-isp/<domain>/<session>.json), so a dropped hotspot costs
   one round and not the session. The report lists the addresses that passed on
   every carrier (ranked by worst-case latency, so an address that is fast on one
@@ -94,7 +98,9 @@ Region filter:
   instead of letting that happen.
   The filter is never a one-way door: menu 2 and menu 12 both offer "measure
   every datacentre" as a choice on screen, menu 6 edits it without running a
-  scan, and 'cfscan --colo any' ignores the saved filter for one run.
+  scan, and 'cfscan --colo any' ignores the saved filter for one run, including
+  a carrier round ('cfscan --colo any --isp NAME'). With no override, '--isp'
+  keeps the profile filter and says so.
   Which datacentres to name is not a question of distance - the nearest one
   measured worst of all on the line above - so cfscan does not guess it from a
   map. Every scan records which datacentres answered and how fast, and
