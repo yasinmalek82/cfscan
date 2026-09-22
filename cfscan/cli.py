@@ -28,10 +28,11 @@ from .menu import (
     update_ranges_flow,
     verify_flow,
 )
+from .measure import DEFAULT_DOWNLOAD_URL, DEFAULT_UPLOAD_URL
 from .profiles import Paths, UnknownProfile, load_config
 from .runner import CfstNotFoundError, ScanError
 from .ui import Aborted, Console, supports_ansi
-from .validate import ValidationError, validate_colo
+from .validate import ValidationError, validate_colo, validate_speed_url
 
 __all__ = ["build_parser", "main", "source_note"]
 
@@ -57,6 +58,9 @@ Usage:
   cfscan --no-verify-top              skip the strict check of the best addresses
   cfscan --no-preflight               skip the one-address check made before a scan
   cfscan --direct                     scan without this shell's proxy variables
+  cfscan --download                   measure download speed (separate URL)
+  cfscan --upload                     measure upload speed (separate URL)
+  cfscan --no-jitter                  skip jitter samples (on by default)
   cfscan --no-color                   disable ANSI colours
   cfscan --version                    print the version
   cfscan --help                       print this help
@@ -105,6 +109,27 @@ Notes:
   so a VPN proxy exported in the terminal carries every test request. cfscan says
   which variables were inherited before the first scan. Use --direct (or unset
   them) when the numbers should describe this machine's own connection instead.
+  Jitter and upload probes follow the same rule: --direct opens them straight
+  to the address, and without it an http or socks5 proxy in the environment
+  is used.
+
+Measurements:
+  Jitter is on by default. After a scan, the best addresses get a few TCP
+  handshakes and the mean gap between those samples is shown in milliseconds.
+  Ranking keeps loss-free, lower-latency order; jitter only reorders addresses
+  whose latency is within 20 ms of each other.
+  Download uses cfst. It is off by default because cfst has a single -url,
+  shared by the latency check and the download, and it records 0.00 MB/s
+  unless that URL returns HTTP 200 with a large body. --download (or
+  download_test in the profile) runs a second cfst pass against --download-url
+  or the profile's download_url, dialing each candidate address on that URL's
+  port. With no URL saved, --download uses
+  https://speed.cloudflare.com/__down?bytes=200000000 . -dn and -dt follow
+  download_count and download_seconds (default 10 and 10). When download ran,
+  ranking prefers higher speed, then latency and jitter inside a 1 MB/s band.
+  Upload is not a cfst feature. --upload POSTs to --upload-url (default
+  https://speed.cloudflare.com/__up when none is saved) through each candidate
+  address. It stays off until you ask for it.
   Before a scan, one Cloudflare address is measured with the profile's own test
   URL. When that fails, cfscan says why - a scheme the port does not speak, a
   hostname Cloudflare does not serve, an origin that is down - instead of
@@ -220,6 +245,22 @@ def build_parser():
                         help="skip the one-address check made before a scan")
     parser.add_argument("--direct", action="store_true",
                         help="run the scanner without this shell's proxy variables")
+    parser.add_argument("--download", action="store_true",
+                        help="measure download speed for this run")
+    parser.add_argument("--no-download", action="store_true",
+                        help="do not measure download speed for this run")
+    parser.add_argument("--download-url", metavar="URL", default=None,
+                        help="file URL for the download pass (implies --download)")
+    parser.add_argument("--upload", action="store_true",
+                        help="measure upload speed for this run")
+    parser.add_argument("--no-upload", action="store_true",
+                        help="do not measure upload speed for this run")
+    parser.add_argument("--upload-url", metavar="URL", default=None,
+                        help="POST target for the upload test (implies --upload)")
+    parser.add_argument("--jitter", action="store_true",
+                        help="measure jitter for this run (the default)")
+    parser.add_argument("--no-jitter", action="store_true",
+                        help="do not measure jitter for this run")
     parser.add_argument("--make-pool", metavar="SIZE", nargs="?", const=0,
                         type=pool_size_value, default=None,
                         help="write the candidate list every carrier round shares")
@@ -252,7 +293,44 @@ def _make_console(no_color=False):
     return Console(color=supports_ansi(no_color=no_color))
 
 
-def main(argv=None, paths=None, console=None, spawn=None):
+def _measurement_override(args):
+    """One-run switches for jitter, download and upload. Not saved.
+
+    ``--download`` with no URL fills the public speed-test file only when the
+    profile itself has none, so a saved download_url is kept. The same applies
+    to upload.
+    """
+    if args.download and args.no_download:
+        raise UsageError("Use only one of --download and --no-download.")
+    if args.upload and args.no_upload:
+        raise UsageError("Use only one of --upload and --no-upload.")
+    if args.jitter and args.no_jitter:
+        raise UsageError("Use only one of --jitter and --no-jitter.")
+    override = {}
+    if args.no_download:
+        override["download_test"] = False
+    if args.download or args.download_url:
+        override["download_test"] = True
+    if args.download_url:
+        override["download_url"] = validate_speed_url(args.download_url)
+    elif args.download:
+        override["download_url_if_empty"] = DEFAULT_DOWNLOAD_URL
+    if args.no_upload:
+        override["upload_test"] = False
+    if args.upload or args.upload_url:
+        override["upload_test"] = True
+    if args.upload_url:
+        override["upload_url"] = validate_speed_url(args.upload_url)
+    elif args.upload:
+        override["upload_url_if_empty"] = DEFAULT_UPLOAD_URL
+    if args.jitter:
+        override["jitter_test"] = True
+    if args.no_jitter:
+        override["jitter_test"] = False
+    return override
+
+
+def main(argv=None, paths=None, console=None, spawn=None, probes=None):
     """Entry point. Returns the process exit code."""
     argv = list(sys.argv[1:]) if argv is None else list(argv)
     parser = build_parser()
@@ -307,6 +385,21 @@ def main(argv=None, paths=None, console=None, spawn=None):
         console.error(f"The configuration could not be read or created: {exc}")
         return EXIT_FAILED
 
+    try:
+        measurements = _measurement_override(args)
+    except UsageError as exc:
+        console.error(f"Invalid usage: {exc}")
+        return EXIT_USAGE
+    except ValidationError as exc:
+        console.error(str(exc))
+        return EXIT_USAGE
+
+    # A replaced scanner is the test boundary. Probes stay off unless the
+    # caller opts in, so the suite never opens a socket. A normal process
+    # (spawn is the real one) measures jitter and upload for real.
+    if probes is None:
+        probes = spawn is None
+
     session = Session(
         paths=paths,
         console=console,
@@ -316,6 +409,8 @@ def main(argv=None, paths=None, console=None, spawn=None):
         verify_top_ips=not args.no_verify_top,
         preflight=not args.no_preflight,
         direct=args.direct,
+        measurement_override=measurements or None,
+        probes=probes,
     )
 
     # Validated once, here, rather than inside the flows that happen to use it:

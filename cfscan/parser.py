@@ -18,18 +18,31 @@ import csv
 import io
 import ipaddress
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
 __all__ = [
     "CsvError",
+    "LATENCY_BAND_MS",
     "ParseReport",
+    "SPEED_BAND_MBPS",
     "ScanResult",
+    "apply_measurements",
     "parse_csv_text",
     "parse_results_csv",
     "rank_results",
     "recommend",
+    "write_enriched_csv",
 ]
+
+#: Latencies inside one band are "about the same". Jitter may reorder them;
+#: a clearly slower address still loses. 20 ms is enough to catch a stable
+#: neighbour without letting a 200 ms address outrank a 140 ms one.
+LATENCY_BAND_MS = 20.0
+
+#: Download (or upload) speeds inside one megabyte per second are about the
+#: same, so latency and jitter still matter. A gap of a whole MB/s is not.
+SPEED_BAND_MBPS = 1.0
 
 
 class CsvError(Exception):
@@ -48,6 +61,11 @@ _HEADER_KEYS = {
     "download": ("下载速度(mb/s)", "下载速度", "download", "download(mb/s)",
                  "downloadspeed(mb/s)", "下载速度(mb/s)"),
     "colo": ("地区码", "colo", "colocode", "region", "datacenter"),
+    # Not written by cfst. cfscan adds them after its own jitter and upload
+    # probes so "show last results" can rank the same way the scan did.
+    "jitter": ("抖动(ms)", "抖动", "jitter", "jitter(ms)", "jitterms"),
+    "upload": ("上传速度(mb/s)", "上传速度", "upload", "upload(mb/s)",
+               "uploadspeed(mb/s)"),
 }
 
 _PROGRESS_HEADER_CHARS = set("[]_-# ")
@@ -64,6 +82,11 @@ class ScanResult:
     latency_ms: float
     download_mbps: float = 0.0
     colo: Optional[str] = None
+    #: ``None`` means the probe did not run (or no sample came back). Zero is a
+    #: real measurement: the round trip did not fluctuate.
+    jitter_ms: Optional[float] = None
+    #: ``None`` means upload was not measured. Zero is a failed or empty send.
+    upload_mbps: Optional[float] = None
 
     @property
     def loss_percent(self) -> float:
@@ -85,6 +108,19 @@ class ScanResult:
 
     def colo_text(self) -> str:
         return self.colo if self.has_colo else "-"
+
+    def jitter_text(self) -> str:
+        if self.jitter_ms is None:
+            return "-"
+        return f"{self.jitter_ms:.2f} ms"
+
+    def download_text(self) -> str:
+        return f"{self.download_mbps:.2f} MB/s"
+
+    def upload_text(self) -> str:
+        if self.upload_mbps is None:
+            return "-"
+        return f"{self.upload_mbps:.2f} MB/s"
 
 
 @dataclass
@@ -155,6 +191,21 @@ def _parse_int(value: str, default: int = 0) -> int:
     return default
 
 
+def _parse_optional_float(value: str):
+    """A float, or ``None`` when the cell is empty or not a number.
+
+    Used for columns cfscan itself adds. An empty cell must stay "not
+    measured": treating it as ``0`` would rank an address that was never
+    probed as perfectly stable, or as a failed upload.
+    """
+    text = _clean_cell(value)
+    if not text or text in ("-", "n/a", "N/A"):
+        return None
+    if re.fullmatch(r"[+-]?(\d+\.?\d*|\.\d+)", text):
+        return float(text)
+    return None
+
+
 def _parse_float(value: str, default: float = 0.0) -> float:
     text = _clean_cell(value)
     if text.endswith("%"):
@@ -222,6 +273,8 @@ def _row_to_result(row: List[str], index) -> Optional[ScanResult]:
         return None
 
     colo = _clean_cell(cell("colo")) or None
+    jitter = _parse_optional_float(cell("jitter")) if "jitter" in index else None
+    upload = _parse_optional_float(cell("upload")) if "upload" in index else None
     return ScanResult(
         ip=ip,
         sent=_parse_int(cell("sent")),
@@ -230,6 +283,8 @@ def _row_to_result(row: List[str], index) -> Optional[ScanResult]:
         latency_ms=latency,
         download_mbps=_parse_float(cell("download")),
         colo=colo,
+        jitter_ms=jitter,
+        upload_mbps=upload,
     )
 
 
@@ -319,16 +374,74 @@ def parse_results_csv(path) -> ParseReport:
     return parse_csv_text(text)
 
 
-def rank_results(results: List[ScanResult]) -> List[ScanResult]:
-    """Sort results the way a human ranks Cloudflare IPs."""
-    return sorted(results, key=lambda item: (item.loss, item.latency_ms, item.ip))
+def _latency_band(latency_ms):
+    return int(float(latency_ms) // LATENCY_BAND_MS)
+
+
+def _speed_band(mbps):
+    """Higher speed sorts first: the band is negative on purpose."""
+    return -int(float(mbps or 0.0) // SPEED_BAND_MBPS)
+
+
+def _jitter_key(item, jitter_measured):
+    if not jitter_measured:
+        # Nobody was probed. A constant keeps the old latency order intact.
+        return 0.0
+    if item.jitter_ms is None:
+        # Unknown is worse than any real fluctuation, so an address we did not
+        # time cannot pose as the stable one.
+        return 1e9
+    return float(item.jitter_ms)
+
+
+def rank_results(results: List[ScanResult], download=None) -> List[ScanResult]:
+    """Sort results the way a human ranks Cloudflare IPs.
+
+    Loss always comes first: a loss-free address outranks a faster one that
+    dropped packets. With nothing else measured, lower latency wins, exactly
+    as before.
+
+    Jitter reorders only addresses whose latency is in the same
+    :data:`LATENCY_BAND_MS` band, and only when at least one row actually has
+    a jitter sample. Download, when this scan measured it (``download=True``,
+    or any row above 0 MB/s), outranks small latency gaps: speeds within
+    :data:`SPEED_BAND_MBPS` of each other still fall back to latency and
+    jitter. Upload is used the same way when download was not measured.
+    """
+    rows = list(results)
+    if download is None:
+        download = any(float(item.download_mbps or 0.0) > 0.0 for item in rows)
+    upload = any(item.upload_mbps is not None for item in rows)
+    jitter_measured = any(item.jitter_ms is not None for item in rows)
+
+    def key(item):
+        loss = float(item.loss)
+        latency = float(item.latency_ms)
+        jitter = _jitter_key(item, jitter_measured)
+        band = _latency_band(latency)
+        if download:
+            speed = float(item.download_mbps or 0.0)
+            up = item.upload_mbps
+            # Unmeasured upload sorts after a measured one, without beating
+            # the download decision above it.
+            up_key = -(float(up)) if up is not None else 1e9
+            return (loss, _speed_band(speed), band, jitter, latency,
+                    up_key, -speed, item.ip)
+        if upload:
+            speed = float(item.upload_mbps or 0.0)
+            return (loss, _speed_band(speed), band, jitter, latency,
+                    -speed, item.ip)
+        return (loss, band, jitter, latency, item.ip)
+
+    return sorted(rows, key=key)
 
 
 def recommend(results: List[ScanResult], preferred_ip=None) -> Optional[ScanResult]:
     """Pick the IP to recommend.
 
     The verified IP stored in the profile wins when it is present in the scan
-    results; otherwise the fastest loss free candidate is chosen.
+    results; otherwise the best loss-free candidate under :func:`rank_results`
+    is chosen (latency, then jitter and speed when those were measured).
     """
     if not results:
         return None
@@ -337,5 +450,60 @@ def recommend(results: List[ScanResult], preferred_ip=None) -> Optional[ScanResu
             if result.ip == preferred_ip:
                 return result
     loss_free = [item for item in results if item.is_loss_free]
-    pool = loss_free or results
-    return min(pool, key=lambda item: (item.latency_ms, item.loss))
+    pool = loss_free or list(results)
+    return rank_results(pool)[0]
+
+
+def apply_measurements(results, download_by_ip=None, jitter_by_ip=None,
+                       upload_by_ip=None):
+    """Return new rows with any extra measurements copied on by IP.
+
+    A missing IP is left alone. A present IP is updated even when the value
+    is ``0`` or ``None``, because that is a measurement, not "skip".
+    """
+    download_by_ip = download_by_ip or {}
+    jitter_by_ip = jitter_by_ip or {}
+    upload_by_ip = upload_by_ip or {}
+    updated = []
+    for item in results:
+        changes = {}
+        if item.ip in download_by_ip:
+            changes["download_mbps"] = float(download_by_ip[item.ip] or 0.0)
+        if item.ip in jitter_by_ip:
+            value = jitter_by_ip[item.ip]
+            changes["jitter_ms"] = None if value is None else float(value)
+        if item.ip in upload_by_ip:
+            value = upload_by_ip[item.ip]
+            changes["upload_mbps"] = None if value is None else float(value)
+        updated.append(replace(item, **changes) if changes else item)
+    return updated
+
+
+def write_enriched_csv(path, results):
+    """Rewrite a result file so jitter and upload survive "show last results".
+
+    The scanner's own columns stay in front, in the same order, and the two
+    cfscan columns are appended. Empty cells mean "not measured".
+    """
+    header = ["IP 地址", "已发送", "已接收", "丢包率", "平均延迟",
+              "下载速度(MB/s)", "地区码", "抖动(ms)", "上传速度(MB/s)"]
+    body = []
+    for item in results:
+        body.append([
+            item.ip,
+            str(int(item.sent)),
+            str(int(item.received)),
+            f"{float(item.loss):.2f}",
+            f"{float(item.latency_ms):.2f}",
+            f"{float(item.download_mbps or 0.0):.2f}",
+            item.colo if item.colo else "N/A",
+            "" if item.jitter_ms is None else f"{float(item.jitter_ms):.2f}",
+            "" if item.upload_mbps is None else f"{float(item.upload_mbps):.2f}",
+        ])
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(header)
+    writer.writerows(body)
+    text = "\ufeff" + buffer.getvalue()
+    with open(str(path), "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)

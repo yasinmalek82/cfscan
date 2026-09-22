@@ -45,7 +45,7 @@ the folder it is running from, so "is my change live?" is a question the
 output answers:
 
 ```
-cfscan 1.1.0
+cfscan 1.2.0
 dev link: /path/to/cfscan/cfscan (edits are live)
 ```
 
@@ -93,6 +93,10 @@ cfscan --colo any            # ignore the profile's filter, measure everything
 cfscan --update-ranges       # download Cloudflare's current IP range lists
 cfscan --edges               # rank the datacentres from what you measured
 cfscan --no-preflight        # skip the one-address check made before a scan
+cfscan --direct              # ignore proxy variables (cfst and the new probes)
+cfscan --quick --download    # second pass: download a large file through each address
+cfscan --quick --upload      # POST an upload sample through each address
+cfscan --quick --no-jitter   # latency and loss only, no jitter samples
 cfscan --isp mci --note 4g   # label a carrier round with the access type
 cfscan --multi-isp --session FILE   # report a specific stored session
 cfscan --no-color            # plain output
@@ -107,7 +111,7 @@ running whichever comes first.
 
 ```
 ==================================================================
-  cfscan 1.1.0  clean Cloudflare IP finder
+  cfscan 1.2.0  clean Cloudflare IP finder
 ==================================================================
   Profile   node.example.com
   Target    node.example.com   port 443  IPv4  HTTPing/https  only FRA,AMS
@@ -343,8 +347,8 @@ Cloudflare's Universal SSL issues only the zone and `*.zone`:
 | `ws.node.example.com` | **2** | **no** |
 
 The ways out are a hostname one level below the zone, Cloudflare's Advanced
-Certificate Manager / Total TLS, or a custom certificate - which is what the
-sibling `pgcert` project issues. Setting `scheme: http` is **not** one of them:
+Certificate Manager / Total TLS, or a certificate you install on the zone
+yourself. Setting `scheme: http` is **not** one of them:
 it makes the scan produce rows again while the client still cannot connect, so
 cfscan says so rather than letting it look like a fix.
 
@@ -477,6 +481,15 @@ written atomically).
       "results_limit": 20,
       "top_ips": 10,
       "download_test": false,
+      "download_url": "",
+      "download_count": 10,
+      "download_seconds": 10,
+      "upload_test": false,
+      "upload_url": "",
+      "upload_seconds": 8,
+      "jitter_test": true,
+      "jitter_samples": 6,
+      "jitter_count": 0,
       "recommended_ip": "104.16.0.1",
       "verify_attempts": 20,
       "favourites": []
@@ -504,7 +517,16 @@ written atomically).
 | `favourites` | Addresses this profile has proven, newest first. Menu 3 offers them before asking you to type an address |
 | `edge_history` | One summary per scan of which datacentres answered and how fast, labelled with the line it was measured on. Menu 12 ranks the edge locations from it |
 | `verify_top_ips` | `true` (default) re-measures those addresses with 20 attempts each before they are listed; `false` skips that step |
-| `download_test` | `false` adds `-dd` (faster scans) |
+| `download_test` | `false` adds `-dd` (no cfst download test). `true` measures download speed; see below |
+| `download_url` | File URL for a second cfst pass. Empty means "download the profile test URL", which only works when that URL returns HTTP 200 and a large body |
+| `download_count` | How many of the fastest addresses are download-tested (`-dn`, default 10) |
+| `download_seconds` | Seconds cfst spends on each download (`-dt`, default 10) |
+| `upload_test` | `false` (default). cfst cannot upload; cfscan measures this itself |
+| `upload_url` | Where the upload POST goes. Required when `upload_test` is true |
+| `upload_seconds` | How long to keep uploading to each address (default 8) |
+| `jitter_test` | `true` (default). TCP-handshake jitter on the best addresses, in milliseconds |
+| `jitter_samples` | Handshakes per address (default 6, at least 2) |
+| `jitter_count` | How many addresses to sample. `0` means `top_ips` |
 | `recommended_ip` | Your verified IP; highlighted when it appears in a scan, and rewritten whenever a verification passes. Custom Scan clears it automatically when you change the domain or port, because the IP was verified against the old target |
 
 Profiles can also be created and edited from the menu (option 6). The built-in
@@ -527,6 +549,53 @@ cfst -f ~/.local/share/cloudflare-speedtest/ip.txt \
 Use `cfscan --quick --dry-run` (or the `--dry-run` flag with any scan) to print
 the argument list without running anything. Arguments are always passed as a
 list - never as a shell string - so no value you type can become a command.
+
+### Jitter, download and upload
+
+cfst v2.3.5 writes IP, sent, received, loss, average latency, download MB/s
+and colo. It has no jitter column and no upload flag, so those two are
+measured by cfscan after the scan, on the best addresses only. Download keeps
+using cfst.
+
+**Jitter** is on by default (`jitter_test`, or `--no-jitter` to skip a run).
+Each chosen address gets `jitter_samples` TCP handshakes (default 6) on the
+profile port. The number shown is the average gap between consecutive
+round-trips, in milliseconds. Ranking still prefers lower packet loss, then
+lower latency. Jitter only reorders addresses whose latency falls in the same
+20 ms band, so a steady 150 ms beats a swinging 155 ms, and a steady 300 ms
+does not beat a steady 150 ms. A latency-only file (no jitter column) sorts
+exactly as before.
+
+**Download** stays off until you enable it (menu 2 / menu 6, or
+`cfscan --quick --download`). cfst has a single `-url`, used both for the
+latency check and for the download, and it records **0.00 MB/s** unless that
+URL returns HTTP 200 and a body large enough to fill `-dt` seconds (upstream
+asks for a file over 200 MB; a short body that finishes early is also reported
+as 0.00). The profile test URL is that latency check, so enabling download
+without another URL does not produce a useful speed.
+
+Set `download_url` (or pass `--download-url`). cfscan then keeps `-dd` on the
+latency scan and runs a **second** `cfst` pass over the fastest addresses:
+`-url` is the file, `-tp` is that URL's port (not the profile port), `-dn` /
+`-dt` come from `download_count` / `download_seconds`. `--download` with no
+URL saved uses `https://speed.cloudflare.com/__down?bytes=200000000`. When a
+download was measured, ranking prefers higher speed. Speeds in the same 1 MB/s
+band still fall back to latency and jitter, and any loss-free address still
+outranks one that dropped packets.
+
+**Upload** is opt-in (`upload_test`, or `cfscan --quick --upload`) because it
+needs a URL that accepts a POST. The default when you pass `--upload` and the
+profile has no URL is `https://speed.cloudflare.com/__up`. cfscan connects to
+the **candidate address** on the URL's port and sends the POST with that
+URL's hostname as the TLS name and Host header, for `upload_seconds` (default
+8). The result is MB/s. When download was not measured, upload ranks in the
+same 1 MB/s bands. When both were measured, upload only breaks a remaining tie.
+
+`cfscan --direct` applies to these probes as well as to cfst. Proxy variables
+(`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, including `socks5://`) are ignored,
+so a test of the real ISP does not go out through a VPN proxy exported in the
+shell. Without `--direct`, those variables are honoured, which is what cfst
+does.
 
 ### Results
 
@@ -587,9 +656,17 @@ fix `http_status`, or pick another address.
 scanner, keeps whatever partial result file exists and drops you back at the
 menu. Nothing is left running.
 
-**A scan feels slow** - lower `concurrency`, raise it, or keep the download test
-disabled (`download_test: false`, `-dd`). Enabling the download test is much
-slower because every candidate is downloaded from.
+**A scan feels slow** - lower `concurrency`, or leave download and upload off
+(`download_test` / `upload_test` false, which passes `-dd` and skips the
+upload). A download pass transfers a large file through each of the best
+addresses for `download_seconds` each. Jitter is a few TCP handshakes and is
+much cheaper; turn it off with `--no-jitter` if you want the latency scan
+alone.
+
+**Download speed is 0.00** - cfst only records a speed for HTTP 200 with a
+body that lasts the whole download window. The profile test URL is not that
+file. Set `download_url` (menu 2, or `--download-url`) to a Cloudflare-cached
+file and run again.
 
 ## What this depends on, and what you may ship
 
@@ -646,22 +723,13 @@ places if you want it.
 * Colours appear only when the terminal supports them (`NO_COLOR` is honoured);
   every screen stays readable without colour.
 
-## The certificate helper
-
-`pgcert` used to live in this folder and is now its own project, at
-`../pgcert`. It shares no code with cfscan - it imports only the standard
-library, and cfscan never referred to it. The Persian walkthrough that used to
-be `docs/ssl-cert-macos-fa.html` went with it: it is mostly about certificates,
-though it also carries cfscan troubleshooting, so it was moved whole rather
-than split in two.
-
 ## Development
 
 ```sh
 python3 -m unittest discover -s tests -t . -v
 ```
 
-560 tests, on Python 3.9 and newer.
+589 tests, on Python 3.9 and newer.
 
 Run `./dev-link.sh` once and the `cfscan` command reads this folder, so every
 edit is live on the next run (see **Working on the code: the live link**

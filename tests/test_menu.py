@@ -509,7 +509,9 @@ class ManageProfilesTests(unittest.TestCase):
             "1500",             # max latency
             "10%",              # max packet loss
             "5",                # results
+            "y",                # jitter (default on)
             "n",                # download test
+            "n",                # upload test
             "new-scan.csv",     # output filename
         ]
         fixture = make_fixture(answers=answers, dry_run=True)
@@ -543,7 +545,9 @@ class CustomScanTests(unittest.TestCase):
         "1500",             # max latency
         "10%",              # max packet loss
         "5",                # best addresses to show and verify
+        "y",                # jitter (default on)
         "n",                # download test
+        "n",                # upload test
         "office-scan.csv",  # output filename
         "y",                # save profile
     ]
@@ -609,7 +613,9 @@ class CustomScanTests(unittest.TestCase):
             "abc",
             "25%",
             "20",
-            "n",
+            "y",                # jitter
+            "n",                # download
+            "n",                # upload
             "out.csv",
             "n",
         ]
@@ -634,7 +640,9 @@ class CustomScanTests(unittest.TestCase):
             "1000",
             "25%",
             "20",
-            "n",
+            "y",                # jitter
+            "n",                # download
+            "n",                # upload
             "out.csv",
             "n",
         ]
@@ -818,7 +826,9 @@ class HttpingSchemeTests(unittest.TestCase):
         "1000",                 # max latency
         "25%",                  # max packet loss
         "20",                   # results to display
+        "y",                    # jitter
         "n",                    # download test
+        "n",                    # upload test
         "http-scan.csv",        # output filename
         "y",                    # save the profile
     ]
@@ -1021,7 +1031,9 @@ class NewProfileTests(unittest.TestCase):
             "1000",           # max latency
             "25%",            # max packet loss
             "20",             # results
+            "y",              # jitter
             "n",              # download test
+            "n",              # upload test
             "",               # output filename: keep the shown default
         ]
         return rows + list(tail)
@@ -1080,7 +1092,7 @@ class NewProfileTests(unittest.TestCase):
 
     def test_editing_the_same_profile_keeps_its_filename(self):
         answers = ["", "", "", "4", "1", "1", "400", "", "", "", "", "",
-                   "", "n", "", "n"]
+                   "", "", "n", "n", "", "n"]
         fixture = make_fixture(answers=answers, dry_run=True)
         self.addCleanup(fixture.close)
         fixture.config["profiles"]["office"] = dict(fixture.profile())

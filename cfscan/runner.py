@@ -18,6 +18,7 @@ import shlex
 import socket
 import subprocess
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -34,11 +35,14 @@ __all__ = [
     "Progress",
     "ScanError",
     "ScanOutcome",
+    "build_download_argv",
     "build_probe_argv",
     "build_scan_argv",
     "build_url",
     "build_verify_argv",
     "build_verify_many_argv",
+    "download_flags",
+    "download_target_problem",
     "certificate_depth_hint",
     "check_cfst",
     "colo_problem",
@@ -302,8 +306,7 @@ def build_scan_argv(cfst_path, profile, output_path, single_ip=None, attempts=No
         if colo:
             argv += ["-cfcolo", colo]
 
-    if not profile.get("download_test"):
-        argv += ["-dd"]
+    argv += download_flags(profile)
 
     argv += ["-t", str(int(attempts if attempts is not None else profile["attempts"]))]
     argv += ["-n", str(int(profile["concurrency"]))]
@@ -382,6 +385,101 @@ def build_probe_argv(cfst_path, profile, ip, output_path, attempts=2,
     """
     return _build_verify_argv(cfst_path, profile, ["-ip", str(ip)], output_path,
                               attempts, latency_cap_ms, 1)
+
+
+def _bounded_int(value, default, low, high):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = int(default)
+    if number < low:
+        return low
+    if number > high:
+        return high
+    return number
+
+
+def download_flags(profile):
+    """Download-related flags for the latency scan.
+
+    ``-dd`` skips cfst's download test. Omitting it only helps when the same
+    ``-url`` returns HTTP 200 and a large body. A separate ``download_url``
+    cannot share that flag: cfst has one URL, used for both the latency check
+    and the download. That file is measured by :func:`build_download_argv`,
+    and the latency scan keeps ``-dd`` so it still talks to the profile URL.
+    """
+    if not profile.get("download_test"):
+        return ["-dd"]
+    if str(profile.get("download_url") or "").strip():
+        return ["-dd"]
+    count = _bounded_int(profile.get("download_count"), 10, 1, 50)
+    seconds = _bounded_int(profile.get("download_seconds"), 10, 1, 60)
+    return ["-dn", str(count), "-dt", str(seconds)]
+
+
+def download_target_problem(profile):
+    """Why enabling download on this profile will report 0.00 MB/s, if it will.
+
+    cfst (v2.3.5) writes a download speed only when ``-url`` answers HTTP 200
+    and the body lasts for the download window. The usual profile URL is a
+    status check (often HTTP 400, path ``/``), so turning the test on without
+    a ``download_url`` produces a column of zeros. ``None`` means the setup
+    can actually transfer a body, or download is off.
+    """
+    if not profile.get("download_test"):
+        return None
+    if str(profile.get("download_url") or "").strip():
+        return None
+    try:
+        status = int(profile.get("http_status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    path = str(profile.get("url_path") or "/")
+    if status == 200 and path not in ("", "/"):
+        return None
+    return (
+        "The download test is using the profile test URL. cfst only records a "
+        "speed when that URL returns HTTP 200 and a large body, and this URL "
+        "is a latency check, so the column will stay 0.00. Set download_url to "
+        "a Cloudflare-cached file (for example "
+        "https://speed.cloudflare.com/__down?bytes=200000000). cfscan then "
+        "measures that file through each address in a second scanner pass, "
+        "because cfst has only one -url."
+    )
+
+
+def build_download_argv(cfst_path, profile, candidate_file, output_path):
+    """Scanner arguments that download ``download_url`` through known addresses.
+
+    ``-tp`` is the URL's port, not the profile's service port: cfst dials
+    ``address:tp`` and sends the URL's hostname as the TLS name. A file on
+    port 443 is reached on 443 even when the profile scans port 2087. There
+    is no ``-httping`` and no ``-dd``; the latency filter is deliberately
+    wide so the speed, not a second status check, decides.
+    """
+    url = str(profile.get("download_url") or "").strip()
+    if not url:
+        raise ScanError("A download URL is required for the download pass.")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ScanError(f"The download URL is not usable: {url}")
+    port = parts.port or (80 if parts.scheme == "http" else 443)
+    count = _bounded_int(profile.get("download_count"), 10, 1, 50)
+    seconds = _bounded_int(profile.get("download_seconds"), 10, 1, 60)
+    return [
+        str(cfst_path),
+        "-f", str(candidate_file),
+        "-tp", str(int(port)),
+        "-url", url,
+        "-dn", str(count),
+        "-dt", str(seconds),
+        "-t", "4",
+        "-n", "20",
+        "-tl", "10000",
+        "-tlr", "1",
+        "-p", str(count),
+        "-o", str(output_path),
+    ]
 
 
 def format_argv_for_display(argv):
