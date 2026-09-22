@@ -331,6 +331,9 @@ class Fixture:
             preflight=preflight,
             assume_yes=assume_yes,
             pool_size=pool_size,
+            # Jitter and upload open sockets. The suite never does that; the
+            # tests that care inject connect/clock instead.
+            probes=False,
         )
 
     @property

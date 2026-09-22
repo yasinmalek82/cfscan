@@ -196,13 +196,36 @@ def list_sessions(results_dir, domain=None):
     if not directory.is_dir():
         return []
     found = [item for item in directory.rglob("*.json") if item.is_file()]
-    return sorted(found, key=lambda item: item.stat().st_mtime_ns)
+    return sorted(found, key=lambda item: (
+        item.stat().st_mtime_ns, _session_sequence(item.name)))
 
 
 def latest_session(results_dir, domain=None):
     """The newest session file, or None."""
     found = list_sessions(results_dir, domain)
     return found[-1] if found else None
+
+
+def _session_sequence(filename):
+    """``slug-2.json`` sorts after ``slug.json`` when the mtimes are equal.
+
+    Session names end in ``YYYYMMDD-HHMMSS``. That clock fragment is not the
+    collision counter ``_free_path`` appends.
+    """
+    stem = filename[:-5] if str(filename).lower().endswith(".json") else str(filename)
+    parts = stem.split("-")
+    if (len(parts) >= 2
+            and len(parts[-1]) == 6 and parts[-1].isdigit()
+            and len(parts[-2]) == 8 and parts[-2].isdigit()):
+        return 1
+    if (len(parts) >= 3
+            and parts[-1].isdigit()
+            and len(parts[-2]) == 6 and parts[-2].isdigit()
+            and len(parts[-3]) == 8 and parts[-3].isdigit()):
+        return int(parts[-1])
+    if len(parts) >= 2 and parts[-1].isdigit():
+        return int(parts[-1])
+    return 1
 
 
 def _free_path(directory, slug):

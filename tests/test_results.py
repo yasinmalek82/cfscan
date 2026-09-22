@@ -11,6 +11,7 @@ from unittest import mock
 from cfscan.profiles import Paths, load_config
 from cfscan.results import (
     ResultStore,
+    _sequence_of,
     latest_result_path,
     new_result_path,
     open_in_finder,
@@ -61,6 +62,15 @@ class NewResultPathTests(unittest.TestCase):
 
     def test_timestamp_label_format(self):
         self.assertEqual(timestamp_label(datetime(2026, 9, 15, 16, 35, 1)), "20260915-163501")
+
+    def test_same_second_suffix_sorts_after_the_first_file(self):
+        # The clock fragment is six digits. It must not outrank the -2 file
+        # written when two results land in the same second.
+        first = "cfscan-label-20260922-165549.csv"
+        second = "cfscan-label-20260922-165549-2.csv"
+        self.assertLess(_sequence_of(first), _sequence_of(second))
+        self.assertEqual(_sequence_of(first), 1)
+        self.assertEqual(_sequence_of(second), 2)
 
 
 class ResultStoreTests(unittest.TestCase):

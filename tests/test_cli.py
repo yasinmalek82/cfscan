@@ -70,6 +70,35 @@ class VersionAndHelpTests(unittest.TestCase):
 
 
 class QuickScanCliTests(unittest.TestCase):
+    def test_download_flag_plans_a_second_pass_and_keeps_latency_on_dd(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        code = run(fixture, ["--quick", "--dry-run", "--download"])
+        self.assertEqual(code, 0)
+        text = fixture.text
+        self.assertIn("-dd", text)
+        self.assertIn("https://speed.cloudflare.com/__down?bytes=200000000", text)
+        self.assertIn("-dn", text)
+        self.assertIn("-dt", text)
+        self.assertEqual(fixture.spawn.calls, [])
+
+    def test_no_jitter_is_a_one_run_switch(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        code = run(fixture, ["--quick", "--dry-run", "--no-jitter"])
+        self.assertEqual(code, 0)
+        self.assertIn("Jitter: off", fixture.text)
+        # The saved profile is not rewritten by a one-run flag.
+        self.assertTrue(fixture.reload()["profiles"][
+            fixture.config["active_profile"]]["jitter_test"])
+
+    def test_download_and_no_download_together_are_refused(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        code = run(fixture, ["--download", "--no-download"])
+        self.assertEqual(code, 2)
+        self.assertIn("only one", fixture.text.lower())
+
     def test_quick_dry_run_prints_default_argv(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)

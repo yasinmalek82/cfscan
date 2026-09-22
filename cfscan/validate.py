@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import urllib.parse
 
 __all__ = [
     "ValidationError",
@@ -30,6 +31,7 @@ __all__ = [
     "validate_output_filename",
     "validate_port",
     "validate_profile_name",
+    "validate_speed_url",
     "validate_url_scheme",
 ]
 
@@ -206,6 +208,34 @@ def validate_url_scheme(value):
     text = value.strip().lower()
     if text not in ("http", "https"):
         raise ValidationError(f"Invalid scheme: {value!r} is not 'http' or 'https'.")
+    return text
+
+
+def validate_speed_url(value, allow_profile=False):
+    """An http(s) URL used as a download or upload target.
+
+    ``allow_profile=True`` accepts the word ``profile`` (and a blank value is
+    not passed here) as "use the profile test URL", returned as ``""``.
+    """
+    assert_no_secrets(value)
+    if not isinstance(value, str):
+        raise ValidationError("Invalid URL: expected text.")
+    text = value.strip()
+    if allow_profile and text.lower() in ("profile", "same"):
+        return ""
+    if not text:
+        raise ValidationError("Invalid URL: the value is empty.")
+    parts = urllib.parse.urlsplit(text)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValidationError(
+            "Invalid URL: enter an http or https URL"
+            + (" (or 'profile' to use the test URL)." if allow_profile else ".")
+        )
+    if parts.username or parts.password:
+        raise ValidationError(
+            "Invalid URL: credentials do not belong in a speed-test URL. "
+            "cfscan never stores secrets."
+        )
     return text
 
 

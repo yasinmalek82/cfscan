@@ -13,7 +13,10 @@ from cfscan.profiles import default_profile
 from cfscan.runner import (
     CfstNotFoundError,
     Progress,
+    build_download_argv,
     build_scan_argv,
+    download_flags,
+    download_target_problem,
     build_verify_argv,
     check_cfst,
     extract_status_rejection,
@@ -96,6 +99,44 @@ class BuildScanArgvTests(unittest.TestCase):
         profile["download_test"] = True
         argv = build_scan_argv(CFST, profile, "/tmp/out.csv")
         self.assertNotIn("-dd", argv)
+        self.assertEqual(argv[argv.index("-dn") + 1], "10")
+        self.assertEqual(argv[argv.index("-dt") + 1], "10")
+
+    def test_a_separate_download_url_keeps_the_latency_scan_on_dd(self):
+        profile = spec_profile()
+        profile["download_test"] = True
+        profile["download_url"] = "https://speed.cloudflare.com/__down?bytes=200000000"
+        argv = build_scan_argv(CFST, profile, "/tmp/out.csv")
+        self.assertIn("-dd", argv)
+        self.assertNotIn("-dn", argv)
+        self.assertEqual(
+            argv[argv.index("-url") + 1], "https://node.example.test:2087/")
+
+    def test_download_pass_uses_the_file_url_and_its_port(self):
+        profile = spec_profile()
+        profile["download_url"] = "https://speed.cloudflare.com/__down?bytes=200000000"
+        profile["download_count"] = 4
+        profile["download_seconds"] = 8
+        argv = build_download_argv(CFST, profile, "/tmp/ips.txt", "/tmp/down.csv")
+        self.assertNotIn("-dd", argv)
+        self.assertNotIn("-httping", argv)
+        self.assertEqual(argv[argv.index("-tp") + 1], "443")
+        self.assertEqual(argv[argv.index("-dn") + 1], "4")
+        self.assertEqual(argv[argv.index("-dt") + 1], "8")
+        self.assertEqual(
+            argv[argv.index("-url") + 1],
+            "https://speed.cloudflare.com/__down?bytes=200000000",
+        )
+        self.assertTrue(all(isinstance(item, str) for item in argv))
+
+    def test_download_on_a_status_probe_is_explained(self):
+        profile = spec_profile()
+        profile["download_test"] = True
+        problem = download_target_problem(profile)
+        self.assertIn("0.00", problem)
+        profile["download_url"] = "https://speed.cloudflare.com/__down?bytes=200000000"
+        self.assertIsNone(download_target_problem(profile))
+        self.assertEqual(download_flags(spec_profile()), ["-dd"])
 
     def test_download_test_disabled_adds_the_dd_flag(self):
         argv = build_scan_argv(CFST, spec_profile(), "/tmp/out.csv")

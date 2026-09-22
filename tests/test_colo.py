@@ -112,7 +112,9 @@ class CustomScanColoTests(unittest.TestCase):
         "2",                    # region filter: keep only the ones I name
         "fra, ams",             # ... these
         "4", "200", "1000", "25%", "10",
+        "y",                    # jitter
         "n",                    # download test
+        "n",                    # upload test
         "filtered.csv",         # output filename
         "y",                    # save the profile
     ]

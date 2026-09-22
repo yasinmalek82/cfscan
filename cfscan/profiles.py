@@ -127,7 +127,23 @@ def default_profile(cfst_path=None):
         # number the user actually sees; "results_limit" only reaches the
         # scanner's own console output, which cfscan hides.
         "top_ips": 10,
+        # cfst's download test. Off by default: it is slow, and it only
+        # produces a real number when download_url (or the test URL) returns
+        # HTTP 200 and a large body. See runner.download_flags.
         "download_test": False,
+        "download_url": "",
+        "download_count": 10,
+        "download_seconds": 10,
+        # Upload is not a cfst feature. Off until a URL is set.
+        "upload_test": False,
+        "upload_url": "",
+        "upload_seconds": 8,
+        # Jitter is cheap (a handful of TCP handshakes to the best addresses)
+        # and is the usual reason two equal latencies are not equal in use.
+        "jitter_test": True,
+        "jitter_samples": 6,
+        # 0 means "use top_ips".
+        "jitter_count": 0,
         "recommended_ip": DEFAULT_RECOMMENDED_IP,
         "verify_attempts": 20,
         # Addresses this profile has proven, newest first (see menu 3).
@@ -247,7 +263,41 @@ def _merge_profile(stored):
         merged["favourites"] = []
     if not isinstance(merged.get("edge_history"), list):
         merged["edge_history"] = []
+    merged["download_test"] = _as_bool(merged.get("download_test"), False)
+    merged["upload_test"] = _as_bool(merged.get("upload_test"), False)
+    merged["jitter_test"] = _as_bool(merged.get("jitter_test"), True)
+    for key in ("download_url", "upload_url"):
+        if not isinstance(merged.get(key), str):
+            merged[key] = ""
+    for key, default, low, high in (
+            ("download_count", 10, 1, 50),
+            ("download_seconds", 10, 1, 60),
+            ("upload_seconds", 8, 1, 60),
+            ("jitter_samples", 6, 2, 30),
+            ("jitter_count", 0, 0, 50),
+    ):
+        try:
+            number = int(merged.get(key, default))
+        except (TypeError, ValueError):
+            number = default
+        merged[key] = max(low, min(number, high))
     return merged
+
+
+def _as_bool(value, default):
+    """A JSON boolean, or the words users type when editing the file by hand."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+        return default
+    if value is None:
+        return default
+    return bool(value)
 
 
 def _backup_corrupt(path):

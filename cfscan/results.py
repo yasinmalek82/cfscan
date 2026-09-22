@@ -41,12 +41,25 @@ def timestamp_label(when=None):
 
 
 def _sequence_of(filename):
-    """Sort helper: ``x-2.csv`` comes after ``x.csv``."""
-    stem = filename[:-4] if filename.lower().endswith(".csv") else filename
-    if "-" in stem:
-        tail = stem.rsplit("-", 1)[1]
-        if tail.isdigit():
-            return int(tail)
+    """Sort helper: ``name-2.csv`` comes after ``name.csv`` when mtimes tie.
+
+    Result names end in ``YYYYMMDD-HHMMSS``. That clock fragment is not a
+    collision index. Only the extra ``-2``, ``-3``, ... added when that name
+    was already taken counts, so a same-second file sorts after the first one.
+    """
+    stem = filename[:-4] if str(filename).lower().endswith(".csv") else str(filename)
+    parts = stem.split("-")
+    if (len(parts) >= 2
+            and len(parts[-1]) == 6 and parts[-1].isdigit()
+            and len(parts[-2]) == 8 and parts[-2].isdigit()):
+        return 1
+    if (len(parts) >= 3
+            and parts[-1].isdigit()
+            and len(parts[-2]) == 6 and parts[-2].isdigit()
+            and len(parts[-3]) == 8 and parts[-3].isdigit()):
+        return int(parts[-1])
+    if len(parts) >= 2 and parts[-1].isdigit():
+        return int(parts[-1])
     return 1
 
 

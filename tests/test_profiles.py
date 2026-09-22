@@ -57,6 +57,10 @@ class DefaultProfileTests(unittest.TestCase):
         self.assertEqual(profile["max_latency_ms"], 1000)
         self.assertEqual(profile["results_limit"], 20)
         self.assertFalse(profile["download_test"])
+        self.assertEqual(profile["download_url"], "")
+        self.assertFalse(profile["upload_test"])
+        self.assertTrue(profile["jitter_test"])
+        self.assertEqual(profile["jitter_samples"], 6)
         self.assertIsNone(profile["recommended_ip"])
         self.assertEqual(profile["verify_attempts"], 20)
 

@@ -9,10 +9,12 @@ from pathlib import Path
 from cfscan.parser import (
     CsvError,
     ParseReport,
+    ScanResult,
     parse_csv_text,
     parse_results_csv,
     rank_results,
     recommend,
+    write_enriched_csv,
 )
 
 from tests.support import CSV_HEADER
@@ -180,6 +182,68 @@ class RankAndRecommendTests(unittest.TestCase):
 
     def test_recommend_returns_none_for_empty_results(self):
         self.assertIsNone(recommend([], preferred_ip="104.16.0.1"))
+
+    def test_latency_only_order_is_unchanged_when_nothing_else_was_measured(self):
+        results = [
+            ScanResult("1.1.1.9", 4, 4, 0.0, 119.0),
+            ScanResult("1.1.1.2", 4, 4, 0.0, 100.0),
+            ScanResult("1.1.1.5", 4, 3, 0.25, 50.0),
+        ]
+        self.assertEqual([item.ip for item in rank_results(results)],
+                         ["1.1.1.2", "1.1.1.9", "1.1.1.5"])
+
+    def test_jitter_reorders_only_inside_a_latency_band(self):
+        steady = ScanResult("1.1.1.2", 4, 4, 0.0, 110.0, jitter_ms=1.0)
+        jumpy = ScanResult("1.1.1.9", 4, 4, 0.0, 100.0, jitter_ms=25.0)
+        slow = ScanResult("1.1.1.5", 4, 4, 0.0, 180.0, jitter_ms=0.2)
+        ranked = rank_results([jumpy, slow, steady])
+        # 100 ms and 110 ms share a band, so the steadier one wins.
+        # 180 ms is a different band and stays last despite perfect jitter.
+        self.assertEqual([item.ip for item in ranked],
+                         ["1.1.1.2", "1.1.1.9", "1.1.1.5"])
+        self.assertEqual(recommend([jumpy, slow, steady]).ip, "1.1.1.2")
+
+    def test_download_speed_outranks_a_small_latency_gap(self):
+        quick = ScanResult("1.1.1.2", 4, 4, 0.0, 100.0, download_mbps=2.0)
+        fat = ScanResult("1.1.1.9", 4, 4, 0.0, 180.0, download_mbps=20.0)
+        lossy = ScanResult("1.1.1.5", 4, 3, 0.25, 40.0, download_mbps=80.0)
+        ranked = rank_results([quick, lossy, fat], download=True)
+        self.assertEqual([item.ip for item in ranked],
+                         ["1.1.1.9", "1.1.1.2", "1.1.1.5"])
+
+    def test_close_download_speeds_fall_back_to_latency_and_jitter(self):
+        jumpy = ScanResult("1.1.1.2", 4, 4, 0.0, 100.0, download_mbps=10.2,
+                           jitter_ms=20.0)
+        steady = ScanResult("1.1.1.9", 4, 4, 0.0, 108.0, download_mbps=10.8,
+                            jitter_ms=1.0)
+        ranked = rank_results([jumpy, steady], download=True)
+        self.assertEqual([item.ip for item in ranked], ["1.1.1.9", "1.1.1.2"])
+
+    def test_upload_is_used_when_download_was_not_measured(self):
+        slow = ScanResult("1.1.1.2", 4, 4, 0.0, 90.0, upload_mbps=1.0)
+        fast = ScanResult("1.1.1.9", 4, 4, 0.0, 140.0, upload_mbps=12.0)
+        self.assertEqual([item.ip for item in rank_results([slow, fast])],
+                         ["1.1.1.9", "1.1.1.2"])
+
+    def test_enriched_csv_round_trip_keeps_jitter_and_upload(self):
+        original = [
+            ScanResult("104.16.0.1", 4, 4, 0.0, 140.0, download_mbps=8.5,
+                       colo="FRA", jitter_ms=3.25, upload_mbps=1.5),
+            ScanResult("104.16.0.2", 4, 4, 0.0, 150.0, colo="FRA"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out.csv"
+            write_enriched_csv(path, original)
+            report = parse_results_csv(path)
+        self.assertEqual(len(report.results), 2)
+        first = report.results[0]
+        self.assertAlmostEqual(first.jitter_ms, 3.25)
+        self.assertAlmostEqual(first.upload_mbps, 1.5)
+        self.assertAlmostEqual(first.download_mbps, 8.5)
+        self.assertEqual(first.colo, "FRA")
+        second = report.results[1]
+        self.assertIsNone(second.jitter_ms)
+        self.assertIsNone(second.upload_mbps)
 
 
 if __name__ == "__main__":

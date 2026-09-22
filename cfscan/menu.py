@@ -25,7 +25,20 @@ from . import pool as pool_module
 from . import ranges as ranges_module
 from . import results as results_module
 from . import vantages as vantages_module
-from .parser import CsvError, rank_results, parse_results_csv, recommend
+from .measure import (
+    DEFAULT_DOWNLOAD_URL,
+    DEFAULT_UPLOAD_URL,
+    measure_jitter_ms,
+    measure_upload_mbps,
+)
+from .parser import (
+    CsvError,
+    apply_measurements,
+    parse_results_csv,
+    rank_results,
+    recommend,
+    write_enriched_csv,
+)
 from .profiles import (
     DEFAULT_PROFILE_KEY,
     UnknownProfile,
@@ -48,8 +61,10 @@ from .runner import (
     PROBE_ADDRESSES,
     CfstNotFoundError,
     ScanError,
+    build_download_argv,
     build_probe_argv,
     build_scan_argv,
+    download_target_problem,
     build_verify_argv,
     build_verify_many_argv,
     check_cfst,
@@ -72,6 +87,7 @@ from .validate import (
     validate_output_filename,
     validate_port,
     validate_profile_name,
+    validate_speed_url,
 )
 
 __all__ = [
@@ -199,6 +215,13 @@ class Session:
     #: for their own reasons - a verified address, a scan's observations - and
     #: a one-run experiment must not ride along into the stored configuration.
     colo_override: object = None
+    #: One-run measurement switches (``--download``, ``--jitter``, ``--upload``
+    #: and their URLs). Applied on top of the profile for the scan only.
+    measurement_override: object = None
+    #: Real runs open jitter/upload sockets. A test that injects the scanner
+    #: leaves this off so the suite never touches the network; ``main`` turns
+    #: it on when it is starting the real ``cfst``.
+    probes: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -233,9 +256,20 @@ def _scan_profile(session, profile):
     profile and the override never does.
     """
     override = getattr(session, "colo_override", None)
-    if override is None:
+    measurements = dict(getattr(session, "measurement_override", None) or {})
+    if override is None and not measurements:
         return profile
-    return dict(profile, colo=override)
+    scanned = dict(profile)
+    if override is not None:
+        scanned["colo"] = override
+    download_fill = measurements.pop("download_url_if_empty", None)
+    upload_fill = measurements.pop("upload_url_if_empty", None)
+    scanned.update(measurements)
+    if download_fill and not str(scanned.get("download_url") or "").strip():
+        scanned["download_url"] = download_fill
+    if upload_fill and not str(scanned.get("upload_url") or "").strip():
+        scanned["upload_url"] = upload_fill
+    return scanned
 
 
 def _render_profile(console, name, profile):
@@ -260,8 +294,20 @@ def _render_profile(console, name, profile):
     console.key_value("Max latency", f"{profile.get('max_latency_ms')} ms")
     console.key_value("Max packet loss", f"{float(profile.get('max_loss', 0)) * 100:g}%")
     console.key_value("Addresses offered", profile.get("top_ips") or 10)
-    console.key_value("Download test",
-                      "enabled" if profile.get("download_test") else "disabled")
+    console.key_value("Jitter",
+                      "enabled" if profile.get("jitter_test", True) else "disabled")
+    if profile.get("download_test"):
+        download_url = str(profile.get("download_url") or "").strip()
+        console.key_value("Download test",
+                          download_url or "enabled (profile test URL)")
+    else:
+        console.key_value("Download test", "disabled")
+    if profile.get("upload_test"):
+        console.key_value("Upload test",
+                          str(profile.get("upload_url") or "").strip()
+                          or "enabled (no URL)")
+    else:
+        console.key_value("Upload test", "disabled")
     if profile.get("recommended_ip"):
         console.key_value("Recommended IP", profile.get("recommended_ip"))
     saved = favourites_module.entries_for(profile)
@@ -502,32 +548,86 @@ def _finish_flow(session):
     console.blank()
 
 
-def _render_results_table(console, results, limit=None, recommended_ip=None):
+def _visible_metrics(results, profile=None):
+    """Which extra columns this table should show.
+
+    A latency-only scan stays the seven-column table it always was. Download
+    appears when the test was switched on (even if every speed is 0.00, which
+    is itself the result) or when a saved file already has a non-zero speed.
+    Jitter and upload appear only once a number exists, so an old CSV does
+    not grow empty columns.
+    """
+    profile = profile or {}
+    download = bool(profile.get("download_test")) or any(
+        float(item.download_mbps or 0.0) > 0.0 for item in results)
+    upload = any(item.upload_mbps is not None for item in results)
+    jitter = any(item.jitter_ms is not None for item in results)
+    return download, upload, jitter
+
+
+def _render_results_table(console, results, limit=None, recommended_ip=None,
+                          profile=None):
     shown = list(results)
     if limit is not None and limit > 0:
         shown = shown[:limit]
+    show_download, show_upload, show_jitter = _visible_metrics(shown, profile)
+    headers = ["#", "IP address", "Sent", "Received", "Loss", "Latency"]
+    aligns = ["r", "l", "r", "r", "r", "r"]
+    if show_jitter:
+        headers.append("Jitter")
+        aligns.append("r")
+    if show_download:
+        headers.append("Download")
+        aligns.append("r")
+    if show_upload:
+        headers.append("Upload")
+        aligns.append("r")
+    headers.append("Colo")
+    aligns.append("l")
     rows = []
     highlight = set()
     for position, item in enumerate(shown):
-        rows.append([
+        row = [
             str(position + 1),
             item.ip,
             str(item.sent),
             str(item.received),
             item.loss_text(),
             item.latency_text(),
-            item.colo_text(),
-        ])
+        ]
+        if show_jitter:
+            row.append(item.jitter_text())
+        if show_download:
+            row.append(item.download_text())
+        if show_upload:
+            row.append(item.upload_text())
+        row.append(item.colo_text())
+        rows.append(row)
         if recommended_ip is not None and item.ip == recommended_ip:
             highlight.add(position)
     console.table(
-        ["#", "IP address", "Sent", "Received", "Loss", "Latency", "Colo"],
+        headers,
         rows,
-        aligns=["r", "l", "r", "r", "r", "r", "l"],
+        aligns=aligns,
         highlight_rows=highlight,
         marker_col=1,
         legend="* = recommended IP" if highlight else None,
     )
+
+
+def _metric_phrase(item, profile=None):
+    """Jitter, download and upload, when there is something to say."""
+    if item is None:
+        return ""
+    profile = profile or {}
+    parts = []
+    if item.jitter_ms is not None:
+        parts.append(f"jitter {item.jitter_text()}")
+    if profile.get("download_test") or float(item.download_mbps or 0.0) > 0.0:
+        parts.append(f"down {item.download_mbps:.2f} MB/s")
+    if item.upload_mbps is not None:
+        parts.append(f"up {item.upload_mbps:.2f} MB/s")
+    return ", ".join(parts)
 
 
 def show_client_guide(console, profile, ip):
@@ -603,9 +703,11 @@ def show_top_ips(console, profile, results, limit=None, recommended_ip=None,
         if verified is not None:
             prefix = console.style(f"{status:<4}", *style) + " "
         marker = "  *" if item.ip == recommended_ip else ""
+        extra = _metric_phrase(measured, profile)
         console.line(
             f"{position:>3}. {prefix}{item.ip:<15} {latency:>10} "
             f"{loss:>4}  {colo:<3}  Port {port}  SNI/Host {domain}{marker}"
+            f"{('  ' + extra) if extra else ''}"
         )
     console.blank()
     if verified is not None:
@@ -631,7 +733,8 @@ def show_top_ips(console, profile, results, limit=None, recommended_ip=None,
         console.bullet(
             "Each line above is complete: put its IP in the Address (server) field "
             f"of your client, keep port {port}, and set SNI and Host to {domain}. "
-            "The columns are the measured latency, packet loss and Cloudflare colo."
+            "The columns are the measured latency, packet loss and Cloudflare colo"
+            " (plus jitter, download and upload when those were measured)."
         )
     if verified is not None:
         console.bullet(
@@ -762,7 +865,7 @@ def _finish_scan_results(session, config, profile, results, top_n, recommended,
 
     console.blank()
     console.heading(f"Results ({len(results)} reachable address(es))")
-    _render_results_table(console, shown, recommended_ip=marked_ip)
+    _render_results_table(console, shown, recommended_ip=marked_ip, profile=profile)
     if len(results) > top_n:
         console.line(f"The best {top_n} of {len(results)} are shown; menu 4 "
                      "lists every address in the saved file.")
@@ -770,15 +873,19 @@ def _finish_scan_results(session, config, profile, results, top_n, recommended,
     console.blank()
     if verified is not None and passed:
         best = passed[0]
+        extra = _metric_phrase(best, profile)
         console.ok(f"Best verified address: {best.ip} - {best.latency_text()}, "
-                   f"0% loss, colo {best.colo_text()}.")
+                   f"0% loss, colo {best.colo_text()}"
+                   f"{(', ' + extra) if extra else ''}.")
     elif verified is not None:
         console.warn("None of the tested addresses passed the strict check right "
                      "now; the numbers in the list below come from the scan.")
     elif recommended is not None:
+        extra = _metric_phrase(recommended, profile)
         console.ok(
             f"Recommended IP: {recommended.ip} - {recommended.latency_text()}, "
-            f"{recommended.loss_text()} packet loss, colo {recommended.colo_text()}."
+            f"{recommended.loss_text()} packet loss, colo {recommended.colo_text()}"
+            f"{(', ' + extra) if extra else ''}."
         )
 
     show_top_ips(console, profile, shown, recommended_ip=marked_ip,
@@ -1048,7 +1155,7 @@ def _report_missing_certificate(console, profile):
         "Ways out: use a hostname one level below the zone (a.example.com "
         "rather than a.b.example.com), buy Cloudflare's Advanced Certificate "
         "Manager / Total TLS for the deeper wildcard, or upload a custom "
-        "certificate - which is what the pgcert project issues with acme.sh."
+        "certificate that covers this hostname on the zone."
     )
     console.bullet(
         "Setting scheme=http would make this scan produce results again, but it "
@@ -1222,6 +1329,212 @@ def _active_for_log(config):
         return {}
 
 
+def _probe_limit(profile):
+    """How many of the best addresses jitter and upload should touch."""
+    try:
+        raw = int(profile.get("jitter_count") or 0)
+    except (TypeError, ValueError):
+        raw = 0
+    if raw <= 0:
+        try:
+            raw = int(profile.get("top_ips") or 10)
+        except (TypeError, ValueError):
+            raw = 10
+    return max(1, min(raw, 50))
+
+
+def _print_measurement_plan(console, profile, direct=False, cfst_path="cfst"):
+    """What a dry run will measure besides the latency scan."""
+    if profile.get("jitter_test", True):
+        samples = int(profile.get("jitter_samples") or 6)
+        console.line(
+            f"Jitter: {samples} TCP samples on the best addresses, "
+            f"port {profile.get('port')}"
+            + (" (proxy variables ignored)." if direct else ".")
+        )
+    else:
+        console.line("Jitter: off for this run.")
+    url = str(profile.get("download_url") or "").strip()
+    if profile.get("download_test") and url:
+        preview = build_download_argv(
+            cfst_path, profile, "<best-addresses.txt>", "<download.csv>")
+        console.blank()
+        console.line(
+            "Download pass (a second cfst run: -url cannot be both the "
+            "latency check and a large file):"
+        )
+        console.line("  " + format_argv_for_display(preview))
+    elif profile.get("download_test"):
+        console.line("Download: cfst download test on the profile URL "
+                     "(-dn/-dt, no -dd).")
+    if profile.get("upload_test"):
+        upload = str(profile.get("upload_url") or "").strip() or "(no URL set)"
+        console.line(
+            f"Upload: {upload} through each candidate address"
+            + (" (proxy variables ignored)." if direct else ".")
+        )
+
+
+def _download_pass(session, config, profile, results):
+    """Run cfst's download test against ``download_url`` and merge speeds.
+
+    Returns ``(results, changed)``. A failure leaves the latency rows as they
+    were: a missing speed is more honest than a traceback.
+    """
+    console = session.console
+    url = str(profile.get("download_url") or "").strip()
+    if not url or not results:
+        return results, False
+    count = max(1, min(int(profile.get("download_count") or 10), len(results), 50))
+    chosen = [item.ip for item in rank_results(results, download=False)[:count]]
+    seconds = int(profile.get("download_seconds") or 10)
+    console.blank()
+    console.line(
+        f"Download test: {url} through {len(chosen)} address(es) "
+        f"({seconds}s each). cfst has a single -url, so this is a separate "
+        "pass from the latency scan."
+    )
+    cfst = _cfst_path(config)
+    store = ResultStore(session.paths)
+    csv_path = store.new_csv("download")
+    log_path = store.log_for(csv_path)
+    list_path = None
+    try:
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", delete=False,
+            prefix="cfscan-download-", suffix=".txt",
+        )
+        try:
+            handle.write("\n".join(chosen) + "\n")
+        finally:
+            handle.close()
+        list_path = handle.name
+        argv = build_download_argv(cfst, profile, list_path, csv_path)
+        try:
+            outcome = _execute_scan(session, argv, log_path, label="Download")
+        except (CfstNotFoundError, ScanError) as error:
+            console.warn(f"The download pass did not run: {error}")
+            return results, False
+        if outcome.interrupted:
+            console.warn("The download pass was stopped. Latency results are kept.")
+            return results, False
+        speeds = {ip: 0.0 for ip in chosen}
+        try:
+            report = parse_results_csv(csv_path)
+        except CsvError as error:
+            console.warn(f"The download pass wrote nothing usable: {error}")
+            return apply_measurements(results, download_by_ip=speeds), True
+        for item in report.results:
+            if item.ip in speeds:
+                speeds[item.ip] = item.download_mbps
+        if not report.results:
+            console.warn(
+                "The download pass measured no address. cfst records a speed "
+                "only when the URL returns HTTP 200 and a body that lasts for "
+                "the download time; anything else stays 0.00."
+            )
+        return apply_measurements(results, download_by_ip=speeds), True
+    finally:
+        if list_path:
+            try:
+                os.unlink(list_path)
+            except OSError:
+                pass
+
+
+def _jitter_pass(session, profile, results, direct):
+    console = session.console
+    chosen = rank_results(results, download=False)[:_probe_limit(profile)]
+    samples = max(2, min(int(profile.get("jitter_samples") or 6), 30))
+    port = int(profile["port"])
+    console.blank()
+    console.line(
+        f"Measuring jitter on {len(chosen)} address(es) "
+        f"({samples} TCP samples each, port {port})."
+    )
+    if direct:
+        console.line("These probes ignore proxy variables, the same as --direct.")
+    found = {}
+    for item in chosen:
+        found[item.ip] = measure_jitter_ms(
+            item.ip, port, samples=samples, direct=direct)
+    return apply_measurements(results, jitter_by_ip=found)
+
+
+def _upload_pass(session, profile, results, direct):
+    console = session.console
+    url = str(profile.get("upload_url") or "").strip()
+    if not url:
+        console.warn("Upload is enabled but no upload URL is set, so it was skipped.")
+        return results
+    chosen = rank_results(results, download=False)[:_probe_limit(profile)]
+    seconds = max(1, min(int(profile.get("upload_seconds") or 8), 60))
+    console.blank()
+    console.line(
+        f"Measuring upload on {len(chosen)} address(es) via {url} "
+        f"({seconds}s each)."
+    )
+    if direct:
+        console.line("These probes ignore proxy variables, the same as --direct.")
+    found = {}
+    for item in chosen:
+        found[item.ip] = measure_upload_mbps(
+            item.ip, url, seconds=seconds, direct=direct)
+    return apply_measurements(results, upload_by_ip=found)
+
+
+def _augment_results(session, config, profile, results, csv_path):
+    """Download pass, jitter and upload, then the ranked list.
+
+    The download pass is another cfst run, so it follows the injected scanner
+    the tests already replace. Jitter and upload open sockets and run only
+    when ``session.probes`` is on, which a normal ``cfscan`` process sets and
+    the test suite does not.
+    """
+    results = list(results)
+    changed = False
+    if profile.get("download_test") and str(profile.get("download_url") or "").strip():
+        results, did = _download_pass(session, config, profile, results)
+        changed = changed or did
+    if getattr(session, "probes", False) and not getattr(session, "dry_run", False):
+        direct = bool(getattr(session, "direct", False))
+        if profile.get("jitter_test", True):
+            results = _jitter_pass(session, profile, results, direct)
+            changed = True
+        if profile.get("upload_test"):
+            results = _upload_pass(session, profile, results, direct)
+            changed = True
+    if changed and csv_path:
+        try:
+            write_enriched_csv(csv_path, results)
+        except OSError as error:
+            session.console.warn(
+                "The extra measurements could not be written into the result "
+                f"file: {error}"
+            )
+    return rank_results(results, download=bool(profile.get("download_test")))
+
+
+def _note_measurements(console, profile):
+    """One line each, before the scan, so a slow test is not a surprise."""
+    problem = download_target_problem(profile)
+    if problem:
+        console.warn(problem)
+    url = str(profile.get("download_url") or "").strip()
+    if profile.get("download_test") and url:
+        console.line(
+            "Download speed is a second scanner pass against "
+            f"{url}. cfst's -url cannot be both the latency check and a large file."
+        )
+    if profile.get("upload_test"):
+        upload = str(profile.get("upload_url") or "").strip()
+        if upload:
+            console.line(
+                f"Upload speed is measured by cfscan (not cfst) against {upload}, "
+                "through each candidate address."
+            )
+
+
 # --------------------------------------------------------------------------
 # Flow 1: quick scan
 # --------------------------------------------------------------------------
@@ -1238,6 +1551,7 @@ def quick_scan(session, config, profile_name=None, verify_prompt=True):
     console.blank()
     scanned = _scan_profile(session, profile)
     _render_profile(console, name, scanned)
+    _note_measurements(console, scanned)
 
     cfst = _cfst_path(config)
     store = ResultStore(session.paths)
@@ -1249,6 +1563,8 @@ def quick_scan(session, config, profile_name=None, verify_prompt=True):
 
     if session.dry_run:
         _print_dry_run(console, argv, csv_path, log_path)
+        _print_measurement_plan(console, scanned, direct=getattr(session, "direct", False),
+                                cfst_path=cfst)
         return EXIT_OK
 
     try:
@@ -1290,7 +1606,7 @@ def quick_scan(session, config, profile_name=None, verify_prompt=True):
     for warning in report.warnings:
         console.warn(warning)
 
-    results = rank_results(report.results)
+    results = _augment_results(session, config, scanned, report.results, csv_path)
     if not results:
         _explain_empty(console, outcome, profile, session)
         remember_result(session, "FAIL", [
@@ -1336,6 +1652,84 @@ def quick_scan(session, config, profile_name=None, verify_prompt=True):
 # --------------------------------------------------------------------------
 # Flow 2: custom scan
 # --------------------------------------------------------------------------
+
+def _ask_measurements(console, base):
+    """Jitter, download and upload. Download and upload stay opt-in.
+
+    Jitter defaults on: it is a few TCP handshakes against the addresses the
+    scan already kept. Download and upload need a URL that actually carries a
+    body, so they stay off until asked.
+    """
+    jitter_test = console.ask_yes_no(
+        "Measure jitter (how much the ping fluctuates)?",
+        default=bool(base.get("jitter_test", True)),
+    )
+    download_test = console.ask_yes_no(
+        "Enable the download speed test (slower)?",
+        default=bool(base.get("download_test")),
+    )
+    download_url = str(base.get("download_url") or "")
+    try:
+        download_count = int(base.get("download_count") or 10)
+    except (TypeError, ValueError):
+        download_count = 10
+    try:
+        download_seconds = int(base.get("download_seconds") or 10)
+    except (TypeError, ValueError):
+        download_seconds = 10
+    if download_test:
+        console.line(
+            "cfst records a download speed only for an HTTP 200 response with "
+            "a large body. The profile test URL is usually a short status "
+            "check, so the default below is a separate file. Type 'profile' "
+            "to download the test URL instead."
+        )
+        download_url = console.ask(
+            "Download URL",
+            default=download_url or DEFAULT_DOWNLOAD_URL,
+            validate=lambda value: validate_speed_url(value, allow_profile=True),
+        )
+        download_count = console.ask_int(
+            "How many of the fastest addresses to download-test",
+            default=download_count, minimum=1, maximum=50,
+            field="download count",
+        )
+        download_seconds = console.ask_int(
+            "Seconds to download from each address",
+            default=download_seconds, minimum=1, maximum=60,
+            field="download seconds",
+        )
+    upload_test = console.ask_yes_no(
+        "Enable the upload speed test (slower, needs a URL)?",
+        default=bool(base.get("upload_test")),
+    )
+    upload_url = str(base.get("upload_url") or "")
+    try:
+        upload_seconds = int(base.get("upload_seconds") or 8)
+    except (TypeError, ValueError):
+        upload_seconds = 8
+    if upload_test:
+        upload_url = console.ask(
+            "Upload URL",
+            default=upload_url or DEFAULT_UPLOAD_URL,
+            validate=validate_speed_url,
+        )
+        upload_seconds = console.ask_int(
+            "Seconds to upload to each address",
+            default=upload_seconds, minimum=1, maximum=60,
+            field="upload seconds",
+        )
+    return {
+        "jitter_test": jitter_test,
+        "download_test": download_test,
+        "download_url": download_url,
+        "download_count": download_count,
+        "download_seconds": download_seconds,
+        "upload_test": upload_test,
+        "upload_url": upload_url,
+        "upload_seconds": upload_seconds,
+    }
+
 
 def _ask_region_filter(console, current):
     """Ask which datacentres to keep, with "none of them" always on screen.
@@ -1507,10 +1901,7 @@ def custom_scan(session, config, profile_name=None, force_save=False,
     top_ips = console.ask_int("How many of the best addresses to show and verify",
                               default=base.get("top_ips") or 10, minimum=1,
                               maximum=50, field="addresses offered")
-    download_test = console.ask_yes_no(
-        "Enable the download speed test (slower)?",
-        default=bool(base.get("download_test")),
-    )
+    measurements = _ask_measurements(console, base)
     # Editing the profile in front of you keeps its established file name; a new
     # profile gets one named after itself, instead of inheriting the file name
     # of the profile it was copied from.
@@ -1538,9 +1929,9 @@ def custom_scan(session, config, profile_name=None, force_save=False,
         "max_loss": max_loss,
         "colo": colo,
         "top_ips": top_ips,
-        "download_test": download_test,
         "output_filename": filename,
     })
+    profile.update(measurements)
     set_ip_version(profile, ip_version)
 
     # A verified IP only means something for the domain and port it was tested
@@ -1574,6 +1965,7 @@ def custom_scan(session, config, profile_name=None, force_save=False,
     console.blank()
     console.heading("Summary")
     _render_profile(console, new_name, scanned)
+    _note_measurements(console, scanned)
 
     if not scan:
         console.blank()
@@ -1591,6 +1983,9 @@ def custom_scan(session, config, profile_name=None, force_save=False,
 
     if session.dry_run:
         _print_dry_run(console, argv, csv_path, log_path)
+        _print_measurement_plan(console, scanned,
+                                direct=getattr(session, "direct", False),
+                                cfst_path=cfst)
         return EXIT_OK
 
     try:
@@ -1632,7 +2027,7 @@ def custom_scan(session, config, profile_name=None, force_save=False,
     for warning in report.warnings:
         console.warn(warning)
 
-    results = rank_results(report.results)
+    results = _augment_results(session, config, scanned, report.results, csv_path)
     if not results:
         _explain_empty(console, outcome, profile, session)
         remember_result(session, "FAIL", [
@@ -1991,6 +2386,10 @@ def show_last_results(session, config, path=None):
     for warning in report.warnings:
         console.warn(warning)
 
+    try:
+        _shown_name, shown_profile = get_active(config)
+    except UnknownProfile:
+        shown_profile = {}
     results = rank_results(report.results)
     if not results:
         console.line("There is nothing to display in this file.")
@@ -2002,7 +2401,8 @@ def show_last_results(session, config, path=None):
     # The IP that was recommended when this file was written is highlighted, so
     # the file matches what the scan told the user at the time.
     preferred = (config.get("last_result") or {}).get("recommended_ip")
-    _render_results_table(console, results, recommended_ip=preferred)
+    _render_results_table(console, results, recommended_ip=preferred,
+                          profile=shown_profile)
     console.blank()
     console.line(f"{len(results)} address(es) in this file.")
     if preferred:
@@ -2589,8 +2989,19 @@ def help_screen(session, config):
     console.bullet("Filters decide what counts as a good address: maximum average "
                    "latency and maximum packet loss. Everything else is dropped "
                    "before the ranking is built.")
-    console.bullet("The download speed test is optional and much slower, so it is "
-                   "off by default.")
+    console.bullet("Jitter (how much the ping fluctuates) is measured on the best "
+                   "addresses after the scan and is on by default. Two addresses "
+                   "with the same latency are ranked by the steadier one.")
+    console.bullet("The download speed test is optional. cfst only records a "
+                   "speed for an HTTP 200 body large enough to fill the download "
+                   "window, and it has a single -url, so a separate download URL "
+                   "is measured in a second pass. It is off until you set that.")
+    console.bullet("Upload is not a cfst feature. When you enable it, cfscan "
+                   "POSTs to an upload URL through each candidate address. It "
+                   "is off until a URL is set.")
+    console.bullet("cfscan --direct applies to those probes as well as to cfst: "
+                   "proxy variables in the shell are ignored, so the numbers "
+                   "describe this machine's own connection.")
 
     console.blank()
     console.line(console.style("Picking the datacentre (region filter)", "bold"))
@@ -2713,6 +3124,9 @@ def help_screen(session, config):
     console.line(console.style("Command line", "bold"))
     console.bullet("cfscan                     open this menu")
     console.bullet("cfscan --quick --yes       run the active profile right away")
+    console.bullet("cfscan --quick --download  also measure download (needs a URL)")
+    console.bullet("cfscan --quick --upload    also measure upload (needs a URL)")
+    console.bullet("cfscan --quick --no-jitter skip the jitter samples")
     console.bullet("cfscan --verify 104.16.0.1  strict 20-attempt check")
     console.bullet("cfscan --quick --dry-run   print the argument list only")
     console.bullet("cfscan --profile NAME      use another saved profile")
@@ -2888,7 +3302,8 @@ def _measure_carrier(session, config, profile, name, pool_file, proved=()):
     log_path = store.log_for(csv_path)
     top_n = max(int(getattr(session, "top_ips", DEFAULT_TOP_PER_ROUND)
                     or DEFAULT_TOP_PER_ROUND), DEFAULT_TOP_PER_ROUND)
-    argv = build_scan_argv(cfst, _scan_profile(session, profile), csv_path,
+    scanned = _scan_profile(session, profile)
+    argv = build_scan_argv(cfst, scanned, csv_path,
                            results_limit=_requested_results(profile, top_n),
                            candidate_file=str(pool_file))
     if session.dry_run:
@@ -2905,7 +3320,11 @@ def _measure_carrier(session, config, profile, name, pool_file, proved=()):
     except CsvError as exc:
         console.error(str(exc))
         parsed = None
-    results = rank_results(parsed.results) if parsed is not None else []
+    if parsed is not None and parsed.results:
+        results = _augment_results(session, config, scanned, parsed.results,
+                                   csv_path)
+    else:
+        results = []
     for warning in (parsed.warnings if parsed is not None else []):
         console.warn(warning)
     if not results:
