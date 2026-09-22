@@ -45,7 +45,7 @@ the folder it is running from, so "is my change live?" is a question the
 output answers:
 
 ```
-cfscan 1.2.0
+cfscan 1.4.0
 dev link: /path/to/cfscan/cfscan (edits are live)
 ```
 
@@ -111,7 +111,7 @@ running whichever comes first.
 
 ```
 ==================================================================
-  cfscan 1.2.0  clean Cloudflare IP finder
+  cfscan 1.4.0  clean Cloudflare IP finder
 ==================================================================
   Profile   node.example.com
   Target    node.example.com   port 443  IPv4  HTTPing/https  only FRA,AMS
@@ -569,27 +569,36 @@ exactly as before.
 **Download** stays off until you enable it (menu 2 / menu 6, or
 `cfscan --quick --download`). cfst has a single `-url`, used both for the
 latency check and for the download, and it records **0.00 MB/s** unless that
-URL returns HTTP 200 and a body large enough to fill `-dt` seconds (upstream
-asks for a file over 200 MB; a short body that finishes early is also reported
-as 0.00). The profile test URL is that latency check, so enabling download
-without another URL does not produce a useful speed.
+URL returns HTTP 200 and a body large enough to fill `-dt` seconds. A short
+body that finishes early is reported as 0.00. So is HTTP 403: on
+`speed.cloudflare.com`, `bytes=100000000` and `bytes=200000000` are rejected,
+and cfst writes 0.00 for that rejection. The profile test URL is a latency
+check, so enabling download without another URL does not produce a useful
+speed.
 
 Set `download_url` (or pass `--download-url`). cfscan then keeps `-dd` on the
 latency scan and runs a **second** `cfst` pass over the fastest addresses:
 `-url` is the file, `-tp` is that URL's port (not the profile port), `-dn` /
-`-dt` come from `download_count` / `download_seconds`. `--download` with no
-URL saved uses `https://speed.cloudflare.com/__down?bytes=200000000`. When a
+`-dt` come from `download_count` / `download_seconds`, and `-debug` is on so
+the log contains the HTTP status. `--download` with no URL saved uses
+`https://speed.cloudflare.com/__down?bytes=50000000` (50 MB), which returns
+HTTP 200 on that host. When every speed is 0.00 and the log shows
+`HTTP 状态码: 403` (or the English `HTTP status code: 403`), cfscan prints
+that Cloudflare rejected the URL and points at a smaller file. When a
 download was measured, ranking prefers higher speed. Speeds in the same 1 MB/s
-band still fall back to latency and jitter, and any loss-free address still
-outranks one that dropped packets.
+band still fall back to
+latency and jitter, and any loss-free address still outranks one that dropped
+packets.
 
 **Upload** is opt-in (`upload_test`, or `cfscan --quick --upload`) because it
 needs a URL that accepts a POST. The default when you pass `--upload` and the
-profile has no URL is `https://speed.cloudflare.com/__up`. cfscan connects to
-the **candidate address** on the URL's port and sends the POST with that
-URL's hostname as the TLS name and Host header, for `upload_seconds` (default
-8). The result is MB/s. When download was not measured, upload ranks in the
-same 1 MB/s bands. When both were measured, upload only breaks a remaining tie.
+profile has no URL is `https://speed.cloudflare.com/__up`. cfscan opens **one**
+connection to the **candidate address** on the URL's port (TLS when the URL is
+https, with that URL's hostname as SNI and Host) and POSTs about 1 MiB at a
+time with HTTP/1.1 keep-alive for `upload_seconds` (default 8). The
+result is MB/s and should sit in the same range as a curl POST of `__up`
+through that address. When download was not measured, upload ranks in the same
+1 MB/s bands. When both were measured, upload only breaks a remaining tie.
 
 `cfscan --direct` applies to these probes as well as to cfst. Proxy variables
 (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, including `socks5://`) are ignored,
@@ -664,9 +673,13 @@ much cheaper; turn it off with `--no-jitter` if you want the latency scan
 alone.
 
 **Download speed is 0.00** - cfst only records a speed for HTTP 200 with a
-body that lasts the whole download window. The profile test URL is not that
-file. Set `download_url` (menu 2, or `--download-url`) to a Cloudflare-cached
-file and run again.
+body that lasts the whole download window. HTTP 403, which
+`speed.cloudflare.com` returns for an oversized `bytes=` (100 MB and 200 MB),
+is stored as 0.00 as well. When the download log shows that 403, cfscan says
+the URL was rejected and suggests the 50 MB default,
+`https://speed.cloudflare.com/__down?bytes=50000000`. The profile test URL is
+not a speed-test file. Set `download_url` (menu 2, or `--download-url`) and
+run again.
 
 ## What this depends on, and what you may ship
 

@@ -19,6 +19,7 @@ from cfscan.runner import (
     download_target_problem,
     build_verify_argv,
     check_cfst,
+    explain_zero_download,
     extract_status_rejection,
     format_argv_for_display,
     proxy_variables_present,
@@ -127,7 +128,31 @@ class BuildScanArgvTests(unittest.TestCase):
             argv[argv.index("-url") + 1],
             "https://speed.cloudflare.com/__down?bytes=200000000",
         )
+        self.assertIn("-debug", argv)
         self.assertTrue(all(isinstance(item, str) for item in argv))
+
+    def test_a_403_download_log_explains_the_zeros(self):
+        url = "https://speed.cloudflare.com/__down?bytes=200000000"
+        chinese = (
+            "[调试] IP: 104.19.113.70, 下载测速终止，HTTP 状态码: 403, "
+            f"测速地址: {url}\n"
+        )
+        warning = explain_zero_download(chinese, {"104.19.113.70": 0.0}, url)
+        self.assertIn("HTTP 403", warning)
+        self.assertIn("bytes=", warning)
+        self.assertIn("https://speed.cloudflare.com/__down?bytes=50000000", warning)
+        english = "[debug] download test stopped, HTTP status code: 403\n"
+        self.assertIn("HTTP 403", explain_zero_download(
+            english, {"104.19.113.70": 0.0}))
+        self.assertIsNone(explain_zero_download(
+            "HTTP 状态码: 200\n", {"104.19.113.70": 0.0}))
+        self.assertIsNone(explain_zero_download(
+            "指定的 HTTP 状态码 400\n", {"104.19.113.70": 0.0}))
+        self.assertIsNone(explain_zero_download(chinese, {"104.19.113.70": 3.5}, url))
+        fullwidth = "HTTP 状态码：403"
+        self.assertIn("smaller bytes=", explain_zero_download(
+            fullwidth, {"104.19.113.70": 0.0},
+            "https://speed.cloudflare.com/__down?bytes=50000000"))
 
     def test_download_on_a_status_probe_is_explained(self):
         profile = spec_profile()
