@@ -127,13 +127,16 @@ Measurements:
   download_test in the profile) runs a second cfst pass against --download-url
   or the profile's download_url, dialing each candidate address on that URL's
   port. With no URL saved, --download uses
-  https://speed.cloudflare.com/__down?bytes=200000000 . -dn and -dt follow
+  https://speed.cloudflare.com/__down?bytes=50000000 (50 MB). A larger
+  bytes= value on that host, including 100 MB and 200 MB, is often HTTP 403,
+  which cfst also records as 0.00; the download pass runs with -debug and
+  cfscan says so when the log shows that 403. -dn and -dt follow
   download_count and download_seconds (default 10 and 10).
   Upload is not a cfst feature. --upload POSTs to --upload-url (default
   https://speed.cloudflare.com/__up when none is saved) through each candidate
-  address. --upload-count is how many of the best addresses are tested
-  (0 means top_ips, the same rule as jitter_count) and does not change
-  download_count. Upload stays off until you ask for it.
+  address, on one keep-alive connection. --upload-count is how many of the
+  best addresses are tested (0 means top_ips, the same rule as jitter_count)
+  and does not change download_count. Upload stays off until you ask for it.
   Before a scan, one Cloudflare address is measured with the profile's own test
   URL. When that fails, cfscan says why - a scheme the port does not speak, a
   hostname Cloudflare does not serve, an origin that is down - instead of

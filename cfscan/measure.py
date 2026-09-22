@@ -23,6 +23,7 @@ import time
 import urllib.parse
 
 __all__ = [
+    "DEFAULT_DOWNLOAD_BYTES",
     "DEFAULT_DOWNLOAD_URL",
     "DEFAULT_UPLOAD_URL",
     "measure_jitter_ms",
@@ -31,17 +32,24 @@ __all__ = [
     "successive_jitter_ms",
 ]
 
-#: A Cloudflare-cached body large enough for cfst's download test. cfst only
-#: records a speed for HTTP 200, and a short body finishes early and shows up
-#: as 0.00 MB/s. The profile's own test URL is usually that short body, so the
-#: download pass uses this unless the profile names another file.
-DEFAULT_DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=200000000"
+#: Bytes cfst should fetch from Cloudflare's speed endpoint. 100 MB and 200 MB
+#: on this host are answered with HTTP 403, and cfst then records 0.00 MB/s.
+#: 50 MB returns HTTP 200 from the same anycast addresses.
+DEFAULT_DOWNLOAD_BYTES = 50_000_000
+DEFAULT_DOWNLOAD_URL = (
+    f"https://speed.cloudflare.com/__down?bytes={DEFAULT_DOWNLOAD_BYTES}"
+)
 
 #: Cloudflare's upload endpoint. The POST is sent through the candidate address
 #: (SNI and Host stay this hostname) so the number describes that address.
 DEFAULT_UPLOAD_URL = "https://speed.cloudflare.com/__up"
 
-_UPLOAD_CHUNK = bytes(range(256)) * 256  # 64 KiB, not a long run of zeros
+# One POST is 1 MiB, repeated on a single keep-alive connection. A fresh
+# TCP+TLS handshake for every 64 KiB POST is bound by round-trip time
+# (about 0.15 MB/s at 130 ms) and does not describe the path.
+_UPLOAD_POST_BYTES = 1024 * 1024
+_UPLOAD_PATTERN = bytes(range(256)) * 256  # 64 KiB, not a long run of zeros
+_UPLOAD_BODY = _UPLOAD_PATTERN * (_UPLOAD_POST_BYTES // len(_UPLOAD_PATTERN))
 _MAX_UPLOAD_POSTS = 100000
 
 
@@ -94,6 +102,11 @@ def measure_upload_mbps(ip, url, seconds=8, timeout=10, direct=False,
     The URL's hostname is the HTTP Host and the TLS name; the socket still
     goes to ``ip``, on the URL's port. That is what makes the number belong
     to one Cloudflare address instead of to whichever edge DNS returns.
+
+    One TLS session is kept open and reused (HTTP/1.1 keep-alive). Each POST
+    is about 1 MiB. The socket is opened again only when the server closes it
+    or the write fails. ``direct`` and proxy variables are unchanged from
+    :func:`open_tcp`.
     """
     connect = connect or open_tcp
     clock = clock or time.perf_counter
@@ -115,26 +128,33 @@ def measure_upload_mbps(ip, url, seconds=8, timeout=10, direct=False,
     total = 0
     attempts = 0
     started = clock()
-    while attempts < _MAX_UPLOAD_POSTS:
-        if attempts and (clock() - started) >= seconds:
-            break
-        sock = None
-        try:
-            sock = connect(ip, port, timeout, direct=direct, environ=environ)
-            if parts.scheme == "https":
-                sock = _wrap_tls(sock, parts.hostname, timeout)
-            _post_body(sock, path, host_header, _UPLOAD_CHUNK)
-        except OSError:
-            if total <= 0:
-                return None
-            break
-        else:
-            total += len(_UPLOAD_CHUNK)
+    sock = None
+    try:
+        while attempts < _MAX_UPLOAD_POSTS:
+            if attempts and (clock() - started) >= seconds:
+                break
+            try:
+                if sock is None:
+                    sock = connect(
+                        ip, port, timeout, direct=direct, environ=environ)
+                    if parts.scheme == "https":
+                        sock = _wrap_tls(sock, parts.hostname, timeout)
+                reusable = _post_body(sock, path, host_header, _UPLOAD_BODY)
+            except OSError:
+                _close(sock)
+                sock = None
+                if total <= 0:
+                    return None
+                break
+            total += len(_UPLOAD_BODY)
             attempts += 1
-        finally:
-            _close(sock)
-        if (clock() - started) >= seconds:
-            break
+            if not reusable:
+                _close(sock)
+                sock = None
+            if (clock() - started) >= seconds:
+                break
+    finally:
+        _close(sock)
     elapsed = clock() - started
     if total <= 0 or elapsed <= 0:
         return None
@@ -185,23 +205,129 @@ def _wrap_tls(sock, server_hostname, timeout):
 
 
 def _post_body(sock, path, host, payload):
+    """POST ``payload`` and drain the response. Return whether to reuse ``sock``.
+
+    ``Connection: keep-alive`` asks the server to leave the TLS session up.
+    The body is read in full so the next POST on this socket is not mixed
+    with the previous response. HTTP 400 and above is a failed send.
+    """
     header = (
         f"POST {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"User-Agent: cfscan\r\n"
         f"Content-Type: application/octet-stream\r\n"
         f"Content-Length: {len(payload)}\r\n"
-        f"Connection: close\r\n"
+        f"Connection: keep-alive\r\n"
         f"\r\n"
     ).encode("ascii")
     sock.sendall(header)
     sock.sendall(payload)
-    peek = _read_some(sock, 512)
-    if not peek:
-        return
-    status = _http_status(peek)
-    if status is not None and status >= 400:
+    status, reusable = _read_http_response(sock)
+    if status is None:
+        raise OSError("the upload endpoint closed before answering")
+    if status >= 400:
         raise OSError(f"upload rejected with HTTP {status}")
+    return reusable
+
+
+def _read_http_response(sock):
+    """One HTTP response. Returns ``(status, reusable)``."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > 65536 and b"\r\n\r\n" not in data:
+            raise OSError("the upload response headers were too large")
+    if b"\r\n\r\n" not in data:
+        return None, False
+    head, rest = data.split(b"\r\n\r\n", 1)
+    status_line = head.split(b"\r\n", 1)[0]
+    headers = _header_map(head)
+    reusable = _connection_reusable(status_line, headers)
+    try:
+        if not _consume_body(sock, headers, rest):
+            reusable = False
+    except OSError:
+        reusable = False
+    return _http_status(status_line), reusable
+
+
+def _header_map(head):
+    headers = {}
+    for line in head.split(b"\r\n")[1:]:
+        if b":" not in line:
+            continue
+        name, value = line.split(b":", 1)
+        headers[name.strip().lower()] = value.strip().lower()
+    return headers
+
+
+def _connection_reusable(status_line, headers):
+    connection = headers.get(b"connection", b"")
+    if b"close" in connection:
+        return False
+    if status_line.startswith(b"HTTP/1.1") or status_line.startswith(b"HTTP/2"):
+        return True
+    return b"keep-alive" in connection
+
+
+def _consume_body(sock, headers, already):
+    """Drain the body so a later POST on this socket reads its own response.
+
+    Unknown length cannot be drained without reading the next message, so the
+    caller opens a new connection. Returns True when this response is finished.
+    """
+    if b"chunked" in headers.get(b"transfer-encoding", b""):
+        return _consume_chunked(sock, already)
+    raw_length = headers.get(b"content-length")
+    if raw_length is None:
+        return False
+    try:
+        length = int(raw_length.split(b",", 1)[0].strip())
+    except ValueError:
+        return False
+    if length < 0 or len(already) > length:
+        return False
+    pending = length - len(already)
+    if pending:
+        _recv_exact(sock, pending)
+    return True
+
+
+def _consume_chunked(sock, buf):
+    while True:
+        while b"\r\n" not in buf:
+            buf = _pull(sock, buf, len(buf) + 1)
+        line, buf = buf.split(b"\r\n", 1)
+        token = line.split(b";", 1)[0].strip()
+        try:
+            size = int(token, 16)
+        except ValueError:
+            return False
+        if size < 0 or size > 8 * 1024 * 1024:
+            return False
+        if size == 0:
+            blob = buf
+            while b"\r\n\r\n" not in blob and not blob.startswith(b"\r\n"):
+                if len(blob) > 65536:
+                    return False
+                blob = _pull(sock, blob, len(blob) + 1)
+            return True
+        buf = _pull(sock, buf, size + 2)
+        if buf[size:size + 2] != b"\r\n":
+            return False
+        buf = buf[size + 2:]
+
+
+def _pull(sock, buf, size):
+    while len(buf) < size:
+        chunk = sock.recv(max(4096, size - len(buf)))
+        if not chunk:
+            raise OSError("the connection closed early")
+        buf += chunk
+    return buf
 
 
 def _http_status(peek):
@@ -213,13 +339,6 @@ def _http_status(peek):
         return int(parts[1])
     except ValueError:
         return None
-
-
-def _read_some(sock, limit):
-    try:
-        return sock.recv(limit)
-    except OSError:
-        return b""
 
 
 def _recv_exact(sock, count):

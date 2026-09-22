@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .measure import DEFAULT_DOWNLOAD_URL
 from .profiles import ip_file_for
 from .results import ensure_dir
 
@@ -43,6 +44,7 @@ __all__ = [
     "build_verify_many_argv",
     "download_flags",
     "download_target_problem",
+    "explain_zero_download",
     "certificate_depth_hint",
     "check_cfst",
     "colo_problem",
@@ -442,7 +444,7 @@ def download_target_problem(profile):
         "speed when that URL returns HTTP 200 and a large body, and this URL "
         "is a latency check, so the column will stay 0.00. Set download_url to "
         "a Cloudflare-cached file (for example "
-        "https://speed.cloudflare.com/__down?bytes=200000000). cfscan then "
+        f"{DEFAULT_DOWNLOAD_URL}). cfscan then "
         "measures that file through each address in a second scanner pass, "
         "because cfst has only one -url."
     )
@@ -452,10 +454,12 @@ def build_download_argv(cfst_path, profile, candidate_file, output_path):
     """Scanner arguments that download ``download_url`` through known addresses.
 
     ``-tp`` is the URL's port, not the profile's service port: cfst dials
-    ``address:tp`` and sends the URL's hostname as the TLS name. A file on
+    ``address:tp`` and sends the URL's hostname as the TLS name.     A file on
     port 443 is reached on 443 even when the profile scans port 2087. There
     is no ``-httping`` and no ``-dd``; the latency filter is deliberately
-    wide so the speed, not a second status check, decides.
+    wide so the speed, not a second status check, decides. ``-debug`` stays
+    on so an HTTP 403 (Cloudflare rejecting an oversized ``bytes=``) is in
+    the log instead of only a column of 0.00.
     """
     url = str(profile.get("download_url") or "").strip()
     if not url:
@@ -479,6 +483,7 @@ def build_download_argv(cfst_path, profile, candidate_file, output_path):
         "-tlr", "1",
         "-p", str(count),
         "-o", str(output_path),
+        "-debug",
     ]
 
 
@@ -658,6 +663,51 @@ def translate_log(text):
 _OBSERVED_STATUS_RE = re.compile(r"HTTP 状态码\s*[:：]\s*(\d{3})")
 _EXPECTED_STATUS_RE = re.compile(r"指定的 HTTP 状态码\s*[:：]?\s*(\d{3})")
 _REJECTED_IP_RE = re.compile(r"IP\s*[:：]\s*([0-9A-Fa-f:.]+)")
+
+
+_DOWNLOAD_STATUS_RE = re.compile(
+    r"HTTP\s*(?:状态码|status(?:\s+code)?)\s*[:：]\s*(\d{3})",
+    re.IGNORECASE,
+)
+
+
+def download_status_codes(text):
+    """HTTP status codes from a cfst debug log, raw or translated.
+
+    The scanner prints ``HTTP 状态码: 403``. :func:`translate_log` turns that
+    into ``HTTP status code: 403``. Both forms are accepted. A code with no
+    colon (the profile's expected status) is left out.
+    """
+    if not text:
+        return []
+    return [int(match.group(1)) for match in _DOWNLOAD_STATUS_RE.finditer(text)]
+
+
+def explain_zero_download(log_text, speeds, url=""):
+    """Warning when every download speed is zero because Cloudflare returned 403.
+
+    ``speeds`` maps each measured address to MB/s. A positive speed means the
+    pass did transfer a body, so a stray 403 in the log is not the result.
+    Returns ``None`` when the log does not show HTTP 403.
+    """
+    if any(float(value or 0.0) > 0.0 for value in (speeds or {}).values()):
+        return None
+    if 403 not in download_status_codes(log_text):
+        return None
+    current = str(url or "").strip()
+    target = f" {current}" if current else " the download URL"
+    if current and current != DEFAULT_DOWNLOAD_URL:
+        remedy = f"Use a smaller file, for example {DEFAULT_DOWNLOAD_URL}."
+    else:
+        remedy = (
+            "Try a smaller bytes= value than "
+            f"{DEFAULT_DOWNLOAD_URL}."
+        )
+    return (
+        f"Cloudflare rejected{target} with HTTP 403, often because bytes= "
+        "is too large. The 0.00 MB/s column is that rejection. "
+        f"{remedy}"
+    )
 
 
 def extract_status_rejection(text):

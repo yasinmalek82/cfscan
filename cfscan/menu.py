@@ -66,6 +66,7 @@ from .runner import (
     build_probe_argv,
     build_scan_argv,
     download_target_problem,
+    explain_zero_download,
     build_verify_argv,
     build_verify_many_argv,
     check_cfst,
@@ -1500,13 +1501,20 @@ def _download_pass(session, config, profile, results):
         try:
             report = parse_results_csv(csv_path)
         except CsvError as error:
-            console.warn(f"The download pass wrote nothing usable: {error}")
+            warning = explain_zero_download(outcome.log_text, speeds, url)
+            if warning:
+                console.warn(warning)
+            else:
+                console.warn(f"The download pass wrote nothing usable: {error}")
             return apply_measurements(
                 results, download_by_ip=speeds, clear_other_downloads=True), True
         for item in report.results:
             if item.ip in speeds:
                 speeds[item.ip] = item.download_mbps
-        if not report.results:
+        warning = explain_zero_download(outcome.log_text, speeds, url)
+        if warning:
+            console.warn(warning)
+        elif not report.results:
             console.warn(
                 "The download pass measured no address. cfst records a speed "
                 "only when the URL returns HTTP 200 and a body that lasts for "

@@ -7,7 +7,7 @@ its own configuration and results files.
 
 import os as _os
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __all__ = ["__version__", "source_note", "running_from_dev_link"]
 
 

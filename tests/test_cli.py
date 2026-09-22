@@ -77,7 +77,7 @@ class QuickScanCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         text = fixture.text
         self.assertIn("-dd", text)
-        self.assertIn("https://speed.cloudflare.com/__down?bytes=200000000", text)
+        self.assertIn("https://speed.cloudflare.com/__down?bytes=50000000", text)
         self.assertIn("-dn", text)
         self.assertIn("-dt", text)
         self.assertEqual(fixture.spawn.calls, [])

@@ -13,6 +13,8 @@ import unittest
 from unittest import mock
 
 from cfscan.measure import (
+    DEFAULT_DOWNLOAD_BYTES,
+    DEFAULT_DOWNLOAD_URL,
     measure_jitter_ms,
     measure_upload_mbps,
     open_tcp,
@@ -24,6 +26,7 @@ from cfscan.menu import (
     _verified_speed_summary,
     quick_scan,
 )
+from cfscan.runner import explain_zero_download
 from cfscan.parser import ScanResult
 from cfscan.ui import Console
 
@@ -97,6 +100,77 @@ class JitterMathTests(unittest.TestCase):
             "104.16.0.1", 443, samples=4, connect=connect))
 
 
+class DownloadDefaultTests(unittest.TestCase):
+    def test_default_download_url_is_fifty_megabytes(self):
+        self.assertEqual(DEFAULT_DOWNLOAD_BYTES, 50_000_000)
+        self.assertEqual(
+            DEFAULT_DOWNLOAD_URL,
+            "https://speed.cloudflare.com/__down?bytes=50000000",
+        )
+
+
+class _RepeatingSocket:
+    """Answers each finished POST with the next scripted response."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.sent = b""
+        self._buf = b""
+        self._need = None
+        self._head = b""
+
+    def sendall(self, data):
+        self.sent += data
+        if self._need is None:
+            self._head += data
+            if b"\r\n\r\n" not in self._head:
+                return
+            head, extra = self._head.split(b"\r\n\r\n", 1)
+            self._head = b""
+            length = 0
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    length = int(line.split(b":", 1)[1].strip())
+            self._need = length - len(extra)
+            if self._need <= 0:
+                self._queue()
+                self._need = None
+            return
+        self._need -= len(data)
+        if self._need <= 0:
+            self._queue()
+            self._need = None
+
+    def _queue(self):
+        if self.responses:
+            self._buf += self.responses.pop(0)
+
+    def recv(self, count):
+        if not self._buf:
+            return b""
+        chunk = self._buf[:count]
+        self._buf = self._buf[count:]
+        return chunk
+
+    def settimeout(self, _timeout):
+        return None
+
+    def close(self):
+        return None
+
+
+def _clock(schedule):
+    values = iter(schedule)
+
+    def clock():
+        return next(values)
+
+    return clock
+
+
+_UPLOAD_OK = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+
+
 class UploadTests(unittest.TestCase):
     def test_upload_posts_to_the_url_through_the_candidate_address(self):
         seen = {}
@@ -140,6 +214,87 @@ class UploadTests(unittest.TestCase):
         self.assertIsNone(measure_upload_mbps(
             "104.16.0.1", "http://example.test/up", seconds=1,
             connect=connect, clock=clock))
+
+    def test_upload_reuses_one_connection_for_one_megabyte_posts(self):
+        sock = _RepeatingSocket([_UPLOAD_OK, _UPLOAD_OK])
+        seen = []
+        wrapped = []
+
+        def connect(ip, port, timeout, direct=False, environ=None):
+            seen.append((ip, port, direct))
+            return sock
+
+        def wrap(raw, server_hostname, timeout):
+            wrapped.append((raw, server_hostname, timeout))
+            return raw
+
+        # started, after post 1, before post 2, after post 2, elapsed
+        with mock.patch("cfscan.measure._wrap_tls", side_effect=wrap):
+            mbps = measure_upload_mbps(
+                "104.16.0.1", "https://speed.cloudflare.com/__up",
+                seconds=1, direct=True, connect=connect,
+                clock=_clock([0.0, 0.4, 0.5, 1.0, 1.0]))
+        self.assertAlmostEqual(mbps, 2.0)
+        self.assertEqual(seen, [("104.16.0.1", 443, True)])
+        self.assertEqual(wrapped, [(sock, "speed.cloudflare.com", 10)])
+        self.assertEqual(sock.sent.count(b"POST /__up HTTP/1.1"), 2)
+        self.assertEqual(sock.sent.count(b"Content-Length: 1048576"), 2)
+        self.assertIn(b"Connection: keep-alive", sock.sent)
+        self.assertIn(b"Host: speed.cloudflare.com", sock.sent)
+        self.assertNotIn(b"Connection: close", sock.sent)
+
+    def test_upload_opens_again_when_the_server_closes(self):
+        closed = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        sockets = []
+
+        def connect(ip, port, timeout, direct=False, environ=None):
+            sock = _RepeatingSocket([closed])
+            sockets.append(sock)
+            return sock
+
+        mbps = measure_upload_mbps(
+            "104.16.0.1", "http://speed.cloudflare.com/__up",
+            seconds=1, direct=False, connect=connect,
+            clock=_clock([0.0, 0.4, 0.5, 1.0, 1.0]))
+        self.assertAlmostEqual(mbps, 2.0)
+        self.assertEqual(len(sockets), 2)
+        posted = sum(sock.sent.count(b"POST /__up HTTP/1.1") for sock in sockets)
+        self.assertEqual(posted, 2)
+
+    def test_a_later_rejection_keeps_the_bytes_already_accepted(self):
+        sock = _RepeatingSocket([
+            _UPLOAD_OK,
+            b"HTTP/1.1 500 No\r\nContent-Length: 0\r\n\r\n",
+        ])
+
+        def connect(ip, port, timeout, direct=False, environ=None):
+            return sock
+
+        mbps = measure_upload_mbps(
+            "104.16.0.1", "http://speed.cloudflare.com/__up",
+            seconds=8, connect=connect,
+            clock=_clock([0.0, 0.2, 0.3, 1.0]))
+        self.assertAlmostEqual(mbps, 1.0)
+
+    def test_chunked_keep_alive_still_reuses_the_socket(self):
+        chunked = (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n0\r\n\r\n"
+        )
+        sock = _RepeatingSocket([chunked, chunked])
+        calls = []
+
+        def connect(ip, port, timeout, direct=False, environ=None):
+            calls.append(ip)
+            return sock
+
+        mbps = measure_upload_mbps(
+            "104.16.0.1", "http://speed.cloudflare.com/__up",
+            seconds=1, connect=connect,
+            clock=_clock([0.0, 0.4, 0.5, 1.0, 1.0]))
+        self.assertAlmostEqual(mbps, 2.0)
+        self.assertEqual(calls, ["104.16.0.1"])
+        self.assertEqual(sock.sent.count(b"POST /__up HTTP/1.1"), 2)
 
 
 class ProxySocketTests(unittest.TestCase):
@@ -339,6 +494,38 @@ class ScanIntegrationTests(unittest.TestCase):
         self.assertIn("Download", text)
         self.assertIn("20.00 MB/s", text)
         self.assertLess(text.index("104.21.0.2"), text.index("104.21.0.1"))
+        self.assertIn("-debug", second)
+        self.assertNotIn("HTTP 403", text)
+
+    def test_download_pass_warns_when_the_log_shows_http_403(self):
+        latency = _csv([("104.21.0.1", 100.0, 0.0)])
+        downloaded = _csv([("104.21.0.1", 100.0, 0.0)])
+        log = (
+            "[调试] IP: 104.21.0.1, 下载测速终止，HTTP 状态码: 403, "
+            "测速地址: https://speed.cloudflare.com/__down?bytes=200000000\n"
+        )
+        spawn = ScriptedSpawn(
+            log_sequence=[LOG_SUCCESS, log],
+            csv_sequence=[latency, downloaded],
+        )
+        fixture = Fixture(answers=["y", "n"], spawn=spawn)
+        self.addCleanup(fixture.close)
+        fixture.session.verify_top_ips = False
+        profile = fixture.profile()
+        profile["download_test"] = True
+        profile["download_url"] = "https://speed.cloudflare.com/__down?bytes=200000000"
+        code = quick_scan(fixture.session, fixture.config)
+        self.assertEqual(code, 0)
+        self.assertIn("-debug", spawn.calls[1])
+        text = fixture.text
+        self.assertIn("HTTP 403", text)
+        self.assertIn("0.00 MB/s", text)
+        self.assertIn(DEFAULT_DOWNLOAD_URL, text)
+        self.assertIsNotNone(explain_zero_download(
+            "HTTP status code: 403\n", {"104.21.0.1": 0.0},
+            profile["download_url"]))
+        self.assertIsNone(explain_zero_download(
+            log, {"104.21.0.1": 12.0}, profile["download_url"]))
 
     def test_upload_column_uses_the_injected_probe(self):
         csv_text = _csv([("104.21.0.1", 100.0, 0.0)])
