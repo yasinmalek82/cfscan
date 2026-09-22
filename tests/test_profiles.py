@@ -59,6 +59,8 @@ class DefaultProfileTests(unittest.TestCase):
         self.assertFalse(profile["download_test"])
         self.assertEqual(profile["download_url"], "")
         self.assertFalse(profile["upload_test"])
+        self.assertEqual(profile["upload_count"], 0)
+        self.assertEqual(profile["download_count"], 10)
         self.assertTrue(profile["jitter_test"])
         self.assertEqual(profile["jitter_samples"], 6)
         self.assertIsNone(profile["recommended_ip"])
@@ -119,6 +121,21 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual(profile["domain"], "example.com")
         self.assertEqual(profile["port"], 443)
         self.assertEqual(profile["attempts"], 4)
+        self.assertEqual(profile["upload_count"], 0)
+
+    def test_upload_count_is_clamped_like_jitter_count(self):
+        write_config(
+            self.paths,
+            {"active_profile": "custom",
+             "profiles": {"custom": {"domain": "example.com",
+                                     "upload_count": 80,
+                                     "jitter_count": -3,
+                                     "download_count": 4}}},
+        )
+        profile = load_config(self.paths)["profiles"]["custom"]
+        self.assertEqual(profile["upload_count"], 50)
+        self.assertEqual(profile["jitter_count"], 0)
+        self.assertEqual(profile["download_count"], 4)
 
     def test_corrupt_config_is_backed_up_and_replaced(self):
         path = write_config(self.paths, {})

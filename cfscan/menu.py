@@ -34,6 +34,7 @@ from .measure import (
 from .parser import (
     CsvError,
     apply_measurements,
+    merge_verified_result,
     parse_results_csv,
     rank_results,
     recommend,
@@ -303,9 +304,14 @@ def _render_profile(console, name, profile):
     else:
         console.key_value("Download test", "disabled")
     if profile.get("upload_test"):
-        console.key_value("Upload test",
-                          str(profile.get("upload_url") or "").strip()
-                          or "enabled (no URL)")
+        upload_url = str(profile.get("upload_url") or "").strip() or "enabled (no URL)"
+        try:
+            upload_count = int(profile.get("upload_count") or 0)
+        except (TypeError, ValueError):
+            upload_count = 0
+        scope = (f"{upload_count} addresses" if upload_count > 0
+                 else "as many as are offered")
+        console.key_value("Upload test", f"{upload_url} ({scope})")
     else:
         console.key_value("Upload test", "disabled")
     if profile.get("recommended_ip"):
@@ -552,15 +558,18 @@ def _visible_metrics(results, profile=None):
     """Which extra columns this table should show.
 
     A latency-only scan stays the seven-column table it always was. Download
-    appears when the test was switched on (even if every speed is 0.00, which
-    is itself the result) or when a saved file already has a non-zero speed.
-    Jitter and upload appear only once a number exists, so an old CSV does
-    not grow empty columns.
+    and upload stay visible for the whole list when the run asked for them,
+    so a row that was not sampled shows — instead of the column disappearing.
+    Jitter is on in every default profile; its column appears once any row
+    has a sample, and then every row keeps it. An old CSV with no such column
+    does not grow an empty one.
     """
     profile = profile or {}
     download = bool(profile.get("download_test")) or any(
-        float(item.download_mbps or 0.0) > 0.0 for item in results)
-    upload = any(item.upload_mbps is not None for item in results)
+        item.download_mbps is not None and float(item.download_mbps) > 0.0
+        for item in results)
+    upload = bool(profile.get("upload_test")) or any(
+        item.upload_mbps is not None for item in results)
     jitter = any(item.jitter_ms is not None for item in results)
     return download, upload, jitter
 
@@ -615,18 +624,25 @@ def _render_results_table(console, results, limit=None, recommended_ip=None,
     )
 
 
-def _metric_phrase(item, profile=None):
-    """Jitter, download and upload, when there is something to say."""
+def _metric_phrase(item, profile=None, cohort=None):
+    """Jitter, download and upload, when this row actually has a number.
+
+    ``cohort`` is the list on screen. A column that list is showing still
+    contributes only when this row was measured; an unmeasured row is "—" in
+    the table rather than a fake zero in the sentence.
+    """
     if item is None:
         return ""
     profile = profile or {}
+    rows = list(cohort) if cohort is not None else [item]
+    show_download, show_upload, show_jitter = _visible_metrics(rows, profile)
     parts = []
-    if item.jitter_ms is not None:
+    if show_jitter and item.jitter_ms is not None:
         parts.append(f"jitter {item.jitter_text()}")
-    if profile.get("download_test") or float(item.download_mbps or 0.0) > 0.0:
-        parts.append(f"down {item.download_mbps:.2f} MB/s")
-    if item.upload_mbps is not None:
-        parts.append(f"up {item.upload_mbps:.2f} MB/s")
+    if show_download and item.download_mbps is not None:
+        parts.append(f"down {float(item.download_mbps):.2f} MB/s")
+    if show_upload and item.upload_mbps is not None:
+        parts.append(f"up {float(item.upload_mbps):.2f} MB/s")
     return ", ".join(parts)
 
 
@@ -685,25 +701,24 @@ def show_top_ips(console, profile, results, limit=None, recommended_ip=None,
     console.heading(f"Top {len(shown)} IPs you can use")
     for position, item in enumerate(shown, start=1):
         status = ""
-        measured = item
         if verified is not None:
-            row = verified.get(item.ip)
-            status = _verify_verdict(row, attempts)
-            if row is not None:
-                measured = row
+            # The verdict comes from the strict check. The numbers for jitter,
+            # download and upload stay on ``item``: the check's own row is a
+            # latency measurement and would wipe those columns.
+            status = _verify_verdict(verified.get(item.ip), attempts)
         if status == "DEAD":
-            latency, loss, colo = "-", "-", "-"
+            latency, loss, colo = "—", "—", "—"
         else:
-            latency = measured.latency_text()
-            loss = measured.loss_text()
-            colo = measured.colo_text()
+            latency = item.latency_text()
+            loss = item.loss_text()
+            colo = item.colo_text()
         style = {"PASS": ("green", "bold"), "FAIL": ("red", "bold"),
                  "DEAD": ("red", "bold")}.get(status)
         prefix = ""
         if verified is not None:
             prefix = console.style(f"{status:<4}", *style) + " "
         marker = "  *" if item.ip == recommended_ip else ""
-        extra = _metric_phrase(measured, profile)
+        extra = _metric_phrase(item, profile, cohort=shown)
         console.line(
             f"{position:>3}. {prefix}{item.ip:<15} {latency:>10} "
             f"{loss:>4}  {colo:<3}  Port {port}  SNI/Host {domain}{marker}"
@@ -745,9 +760,11 @@ def show_top_ips(console, profile, results, limit=None, recommended_ip=None,
         )
     else:
         console.bullet(
-            f"The first line is the fastest one. Menu 3 verifies any of them with "
-            f"{attempts} attempts and 0% packet loss required, so verify the "
-            "address you actually use."
+            "The first line is the winner: lowest packet loss, then the best "
+            "mix of download, upload and jitter when those were measured "
+            "(lowest latency when they were not). Menu 3 verifies any of them "
+            f"with {attempts} attempts and 0% packet loss required, so verify "
+            "the address you actually use."
         )
     return shown
 
@@ -846,6 +863,9 @@ def _finish_scan_results(session, config, profile, results, top_n, recommended,
     address presented as the recommendation.
     """
     console = session.console
+    # One-run flags (--download, --upload) live on the scan copy. The profile
+    # object itself is what gets saved, so a one-run experiment is not stored.
+    display = _scan_profile(session, profile)
     attempts = int(profile.get("verify_attempts") or session.verify_attempts or 20)
     shown = list(results)[:top_n]
 
@@ -853,60 +873,107 @@ def _finish_scan_results(session, config, profile, results, top_n, recommended,
     if _auto_verify_enabled(session, profile):
         verified = verify_top_candidates(session, config, profile, results, top_n)
 
-    passed = [item for item in shown
-              if verified is not None
-              and _verify_verdict(verified.get(item.ip), attempts) == "PASS"]
+    if verified is not None:
+        shown = [merge_verified_result(item, verified.get(item.ip), attempts)
+                 for item in shown]
+    download_on = bool(display.get("download_test")) or any(
+        float(item.download_mbps or 0.0) > 0.0 for item in shown)
+    shown = rank_results(shown, download=download_on)
+    if verified is not None:
+        passed = [item for item in shown
+                  if _verify_verdict(verified.get(item.ip), attempts) == "PASS"]
+        passed_ips = {item.ip for item in passed}
+        shown = passed + [item for item in shown if item.ip not in passed_ips]
+    else:
+        passed = []
+
+    show_download, show_upload, show_jitter = _visible_metrics(shown, display)
+    metrics_on = show_download or show_upload or show_jitter
     if passed:
         marked_ip = passed[0].ip
+    elif metrics_on and shown:
+        # The score picked this row. A previously saved address stays in the
+        # profile until a strict check passes, but it does not outrank the
+        # measurement on screen.
+        marked_ip = shown[0].ip
     elif recommended is not None:
         marked_ip = recommended.ip
     else:
         marked_ip = None
+    focus = next((item for item in shown if item.ip == marked_ip), None)
+    if focus is None and recommended is not None and recommended.ip == marked_ip:
+        focus = recommended
 
     console.blank()
-    console.heading(f"Results ({len(results)} reachable address(es))")
-    _render_results_table(console, shown, recommended_ip=marked_ip, profile=profile)
+    if metrics_on:
+        console.heading(f"Comparison ({len(shown)} of {len(results)} reachable)")
+        console.line(
+            "Ordered by packet loss, then download, upload and jitter together "
+            "with latency. The first row is the winner. — means that metric "
+            "was not measured on that row."
+        )
+    else:
+        console.heading(f"Results ({len(results)} reachable address(es))")
+    _render_results_table(console, shown, recommended_ip=marked_ip, profile=display)
     if len(results) > top_n:
         console.line(f"The best {top_n} of {len(results)} are shown; menu 4 "
                      "lists every address in the saved file.")
 
+    def _describe(item, label):
+        extra = _metric_phrase(item, display, cohort=shown)
+        text = (f"{label}: {item.ip} - {item.latency_text()}, "
+                f"{item.loss_text()} packet loss, colo {item.colo_text()}")
+        if extra:
+            text += f", {extra}"
+        return text
+
     console.blank()
     if verified is not None and passed:
         best = passed[0]
-        extra = _metric_phrase(best, profile)
+        extra = _metric_phrase(best, display, cohort=shown)
         console.ok(f"Best verified address: {best.ip} - {best.latency_text()}, "
                    f"0% loss, colo {best.colo_text()}"
                    f"{(', ' + extra) if extra else ''}.")
     elif verified is not None:
-        console.warn("None of the tested addresses passed the strict check right "
-                     "now; the numbers in the list below come from the scan.")
+        note = ("None of the tested addresses passed the strict check right now.")
+        if metrics_on:
+            note += (" Download, upload and jitter in the list are still the "
+                     "scan's measurements.")
+        console.warn(note)
+    elif focus is not None and metrics_on:
+        console.ok(_describe(focus, "Winner") + ".")
     elif recommended is not None:
-        extra = _metric_phrase(recommended, profile)
+        extra = _metric_phrase(recommended, display, cohort=shown)
         console.ok(
             f"Recommended IP: {recommended.ip} - {recommended.latency_text()}, "
             f"{recommended.loss_text()} packet loss, colo {recommended.colo_text()}"
             f"{(', ' + extra) if extra else ''}."
         )
 
-    show_top_ips(console, profile, shown, recommended_ip=marked_ip,
+    show_top_ips(console, display, shown, recommended_ip=marked_ip,
                  verified=verified)
 
     lines = []
     if verified is None:
-        if recommended is not None:
+        if focus is not None and metrics_on:
+            lines.append(_describe(focus, "Winner"))
+        elif recommended is not None:
             lines.append(f"Recommended IP: {recommended.ip} - "
                          f"{recommended.latency_text()}, "
                          f"{recommended.loss_text()} packet loss, colo "
                          f"{recommended.colo_text()}")
-        verdict = ("PASS" if recommended is not None and recommended.is_loss_free
+        verdict_row = focus if metrics_on and focus is not None else recommended
+        verdict = ("PASS" if verdict_row is not None and verdict_row.is_loss_free
                    else "WARN")
     else:
         lines.append(f"{len(passed)} of {len(shown)} addresses passed the "
                      f"{attempts}-attempt check (0% loss required)")
         if passed:
             best = passed[0]
+            extra = _metric_phrase(best, display, cohort=shown)
             lines.append(f"Fastest verified: {best.ip} - {best.latency_text()}, "
-                         f"colo {best.colo_text()}")
+                         f"colo {best.colo_text()}"
+                         f"{(', ' + extra) if extra else ''}")
         else:
             lines.append("No address passed - re-run the scan, or verify one "
                          "address from menu 3")
@@ -1329,10 +1396,14 @@ def _active_for_log(config):
         return {}
 
 
-def _probe_limit(profile):
-    """How many of the best addresses jitter and upload should touch."""
+def _count_limit(profile, key):
+    """How many of the best addresses one probe should touch.
+
+    ``0`` or a missing value means ``top_ips``, the same rule as
+    ``jitter_count``. The result is clamped to 1..50.
+    """
     try:
-        raw = int(profile.get("jitter_count") or 0)
+        raw = int(profile.get(key) or 0)
     except (TypeError, ValueError):
         raw = 0
     if raw <= 0:
@@ -1343,12 +1414,18 @@ def _probe_limit(profile):
     return max(1, min(raw, 50))
 
 
+def _probe_limit(profile):
+    """How many of the best addresses the jitter probe should touch."""
+    return _count_limit(profile, "jitter_count")
+
+
 def _print_measurement_plan(console, profile, direct=False, cfst_path="cfst"):
     """What a dry run will measure besides the latency scan."""
     if profile.get("jitter_test", True):
         samples = int(profile.get("jitter_samples") or 6)
         console.line(
-            f"Jitter: {samples} TCP samples on the best addresses, "
+            f"Jitter: {samples} TCP samples on the best "
+            f"{_count_limit(profile, 'jitter_count')} address(es), "
             f"port {profile.get('port')}"
             + (" (proxy variables ignored)." if direct else ".")
         )
@@ -1370,7 +1447,8 @@ def _print_measurement_plan(console, profile, direct=False, cfst_path="cfst"):
     if profile.get("upload_test"):
         upload = str(profile.get("upload_url") or "").strip() or "(no URL set)"
         console.line(
-            f"Upload: {upload} through each candidate address"
+            f"Upload: {upload} through the best "
+            f"{_count_limit(profile, 'upload_count')} address(es)"
             + (" (proxy variables ignored)." if direct else ".")
         )
 
@@ -1423,7 +1501,8 @@ def _download_pass(session, config, profile, results):
             report = parse_results_csv(csv_path)
         except CsvError as error:
             console.warn(f"The download pass wrote nothing usable: {error}")
-            return apply_measurements(results, download_by_ip=speeds), True
+            return apply_measurements(
+                results, download_by_ip=speeds, clear_other_downloads=True), True
         for item in report.results:
             if item.ip in speeds:
                 speeds[item.ip] = item.download_mbps
@@ -1433,7 +1512,8 @@ def _download_pass(session, config, profile, results):
                 "only when the URL returns HTTP 200 and a body that lasts for "
                 "the download time; anything else stays 0.00."
             )
-        return apply_measurements(results, download_by_ip=speeds), True
+        return apply_measurements(
+            results, download_by_ip=speeds, clear_other_downloads=True), True
     finally:
         if list_path:
             try:
@@ -1467,7 +1547,7 @@ def _upload_pass(session, profile, results, direct):
     if not url:
         console.warn("Upload is enabled but no upload URL is set, so it was skipped.")
         return results
-    chosen = rank_results(results, download=False)[:_probe_limit(profile)]
+    chosen = rank_results(results, download=False)[:_count_limit(profile, "upload_count")]
     seconds = max(1, min(int(profile.get("upload_seconds") or 8), 60))
     console.blank()
     console.line(
@@ -1708,11 +1788,21 @@ def _ask_measurements(console, base):
         upload_seconds = int(base.get("upload_seconds") or 8)
     except (TypeError, ValueError):
         upload_seconds = 8
+    try:
+        upload_count = int(base.get("upload_count") or 0)
+    except (TypeError, ValueError):
+        upload_count = 0
     if upload_test:
         upload_url = console.ask(
             "Upload URL",
             default=upload_url or DEFAULT_UPLOAD_URL,
             validate=validate_speed_url,
+        )
+        upload_count = console.ask_int(
+            "How many of the fastest addresses to upload-test "
+            "(0 = the number offered)",
+            default=upload_count, minimum=0, maximum=50,
+            field="upload count",
         )
         upload_seconds = console.ask_int(
             "Seconds to upload to each address",
@@ -1728,6 +1818,7 @@ def _ask_measurements(console, base):
         "upload_test": upload_test,
         "upload_url": upload_url,
         "upload_seconds": upload_seconds,
+        "upload_count": upload_count,
     }
 
 
@@ -2406,7 +2497,10 @@ def show_last_results(session, config, path=None):
     console.blank()
     console.line(f"{len(results)} address(es) in this file.")
     if preferred:
-        console.ok(f"Recommended IP: {preferred} - marked with * in the table.")
+        match = next((item for item in results if item.ip == preferred), None)
+        extra = _metric_phrase(match, shown_profile, cohort=results) if match else ""
+        console.ok(f"Recommended IP: {preferred} - marked with * in the table."
+                   + (f" {extra}." if extra else ""))
     remember_result(session, "INFO", [
         f"{len(results)} address(es) in {target.name}",
         f"Recommended IP: {preferred}" if preferred else "No recommended IP stored",
@@ -3286,6 +3380,52 @@ def _explain_empty_round(console, outcome, profile):
         console.bullet(f"Raw scanner log: {outcome.log_path}")
 
 
+def _print_speed_comparison(console, profile, results):
+    """The ranked comparison list, when this round measured speed or jitter.
+
+    Latency-only rounds keep the short verified-address line and do not grow
+    an empty table. The first row is the winner under :func:`rank_results`.
+    """
+    rows = list(results)
+    if not rows:
+        return None
+    show_download, show_upload, show_jitter = _visible_metrics(rows, profile)
+    if not (show_download or show_upload or show_jitter):
+        return None
+    download_on = bool(profile.get("download_test")) or show_download
+    ranked = rank_results(rows, download=download_on)
+    winner = ranked[0]
+    console.blank()
+    console.heading(f"Comparison ({len(ranked)} address(es))")
+    console.line(
+        "Ordered by packet loss, then download, upload and jitter together "
+        "with latency. The first row is the winner. — means that metric was "
+        "not measured on that row."
+    )
+    _render_results_table(console, ranked, recommended_ip=winner.ip, profile=profile)
+    extra = _metric_phrase(winner, profile, cohort=ranked)
+    console.blank()
+    console.ok(
+        f"Winner: {winner.ip} - {winner.latency_text()}, "
+        f"{winner.loss_text()} packet loss, colo {winner.colo_text()}"
+        + (f", {extra}." if extra else ".")
+    )
+    return winner
+
+
+def _verified_speed_summary(passing, carrier, comparison, profile):
+    """The short per-carrier line, with speed numbers when this round has them."""
+    best = min(passing, key=lambda row: row.get("rtt_ms") or float("inf"))
+    match = next((item for item in comparison if item.ip == best.get("ip")), None)
+    extra = ""
+    if match is not None:
+        phrase = _metric_phrase(match, profile, cohort=comparison)
+        if phrase:
+            extra = f", {phrase}"
+    return (f"{len(passing)} address(es) verified on {carrier} - fastest "
+            f"{best['ip']} ({(best.get('rtt_ms') or 0):.0f} ms){extra}.")
+
+
 def _measure_carrier(session, config, profile, name, pool_file, proved=()):
     """Scan the shared candidate list once and verify this round's set.
 
@@ -3355,8 +3495,16 @@ def _measure_carrier(session, config, profile, name, pool_file, proved=()):
                   "loss": item.loss, "rtt_ms": item.latency_ms,
                   "colo": item.colo}
                  for item in results[:SCAN_ROWS_KEPT]]
+    top = list(results)[:top_n]
+    if verified:
+        # Keep jitter, download and upload from the scan. The check only
+        # replaces loss, latency and colo.
+        top = [merge_verified_result(item, verified.get(item.ip), attempts)
+               for item in top]
+    _print_speed_comparison(console, scanned, top)
     return {"verified": rows, "scan": scan_rows, "csv": str(csv_path),
-            "log": str(log_path), "scanned": len(results), "dry_run": False}
+            "log": str(log_path), "scanned": len(results), "dry_run": False,
+            "comparison": top}
 
 
 def _metric_cell(entry):
@@ -3587,10 +3735,9 @@ def multi_isp_flow(session, config, profile_name=None, isps=None, pool_path=None
         passing = [row for row in added["verified"]
                    if str(row.get("verdict")) == vantages_module.PASS]
         if passing:
-            best = min(passing, key=lambda row: row.get("rtt_ms") or float("inf"))
-            console.ok(f"{len(passing)} address(es) verified on {carrier} - "
-                       f"fastest {best['ip']} "
-                       f"({(best.get('rtt_ms') or 0):.0f} ms).")
+            console.ok(_verified_speed_summary(
+                passing, carrier, measured.get("comparison") or [],
+                _scan_profile(session, profile)))
             index += 1
             continue
 
@@ -3712,9 +3859,9 @@ def multi_isp_round(session, config, profile_name=None, isp=None, pool_path=None
                if str(row.get("verdict")) == vantages_module.PASS]
     console.blank()
     if passing:
-        best = min(passing, key=lambda row: row.get("rtt_ms") or float("inf"))
-        console.ok(f"{len(passing)} address(es) verified on {verdict} - fastest "
-                   f"{best['ip']} ({(best.get('rtt_ms') or 0):.0f} ms).")
+        console.ok(_verified_speed_summary(
+            passing, verdict, measured.get("comparison") or [],
+            _scan_profile(session, profile)))
     else:
         console.warn(f"No address was verified on {verdict}.")
     console.line(f"Session: {path} ({len(vantages_module.isp_names(record))} "

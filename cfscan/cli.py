@@ -116,8 +116,11 @@ Notes:
 Measurements:
   Jitter is on by default. After a scan, the best addresses get a few TCP
   handshakes and the mean gap between those samples is shown in milliseconds.
-  Ranking keeps loss-free, lower-latency order; jitter only reorders addresses
-  whose latency is within 20 ms of each other.
+  With nothing but latency measured, ranking stays loss-free first, then lower
+  latency. When jitter, download or upload was measured, loss-free still beats
+  lossy, and the rest is one score (higher wins): 10 points per MB/s of
+  download, 10 per MB/s of upload, minus 0.1 per ms of jitter and 0.05 per ms
+  of latency. The comparison list is that order; the first row is the winner.
   Download uses cfst. It is off by default because cfst has a single -url,
   shared by the latency check and the download, and it records 0.00 MB/s
   unless that URL returns HTTP 200 with a large body. --download (or
@@ -125,11 +128,12 @@ Measurements:
   or the profile's download_url, dialing each candidate address on that URL's
   port. With no URL saved, --download uses
   https://speed.cloudflare.com/__down?bytes=200000000 . -dn and -dt follow
-  download_count and download_seconds (default 10 and 10). When download ran,
-  ranking prefers higher speed, then latency and jitter inside a 1 MB/s band.
+  download_count and download_seconds (default 10 and 10).
   Upload is not a cfst feature. --upload POSTs to --upload-url (default
   https://speed.cloudflare.com/__up when none is saved) through each candidate
-  address. It stays off until you ask for it.
+  address. --upload-count is how many of the best addresses are tested
+  (0 means top_ips, the same rule as jitter_count) and does not change
+  download_count. Upload stays off until you ask for it.
   Before a scan, one Cloudflare address is measured with the profile's own test
   URL. When that fails, cfscan says why - a scheme the port does not speak, a
   hostname Cloudflare does not serve, an origin that is down - instead of
@@ -177,6 +181,19 @@ COMMAND_FLAGS = (
 
 class UsageError(Exception):
     """Raised instead of argparse's own exit-on-error behaviour."""
+
+
+def _upload_count_value(value):
+    """argparse type for ``--upload-count``: 0 means top_ips, max 50."""
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"'{value}' is not a whole number")
+    if number < 0 or number > 50:
+        raise argparse.ArgumentTypeError(
+            "upload count must be from 0 to 50 (0 means the same as top_ips)"
+        )
+    return number
 
 
 def pool_size_value(value):
@@ -257,6 +274,10 @@ def build_parser():
                         help="do not measure upload speed for this run")
     parser.add_argument("--upload-url", metavar="URL", default=None,
                         help="POST target for the upload test (implies --upload)")
+    parser.add_argument("--upload-count", metavar="N", type=_upload_count_value,
+                        default=None,
+                        help="how many best addresses to upload-test "
+                             "(0 = top_ips; implies --upload)")
     parser.add_argument("--jitter", action="store_true",
                         help="measure jitter for this run (the default)")
     parser.add_argument("--no-jitter", action="store_true",
@@ -304,6 +325,8 @@ def _measurement_override(args):
         raise UsageError("Use only one of --download and --no-download.")
     if args.upload and args.no_upload:
         raise UsageError("Use only one of --upload and --no-upload.")
+    if args.no_upload and args.upload_count is not None:
+        raise UsageError("Use only one of --upload-count and --no-upload.")
     if args.jitter and args.no_jitter:
         raise UsageError("Use only one of --jitter and --no-jitter.")
     override = {}
@@ -321,8 +344,11 @@ def _measurement_override(args):
         override["upload_test"] = True
     if args.upload_url:
         override["upload_url"] = validate_speed_url(args.upload_url)
-    elif args.upload:
+    elif args.upload or args.upload_count is not None:
         override["upload_url_if_empty"] = DEFAULT_UPLOAD_URL
+    if args.upload_count is not None:
+        override["upload_test"] = True
+        override["upload_count"] = args.upload_count
     if args.jitter:
         override["jitter_test"] = True
     if args.no_jitter:
