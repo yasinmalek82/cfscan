@@ -45,7 +45,7 @@ the folder it is running from, so "is my change live?" is a question the
 output answers:
 
 ```
-cfscan 1.2.0
+cfscan 1.3.0
 dev link: /path/to/cfscan/cfscan (edits are live)
 ```
 
@@ -111,7 +111,7 @@ running whichever comes first.
 
 ```
 ==================================================================
-  cfscan 1.2.0  clean Cloudflare IP finder
+  cfscan 1.3.0  clean Cloudflare IP finder
 ==================================================================
   Profile   node.example.com
   Target    node.example.com   port 443  IPv4  HTTPing/https  only FRA,AMS
@@ -487,6 +487,7 @@ written atomically).
       "upload_test": false,
       "upload_url": "",
       "upload_seconds": 8,
+      "upload_count": 0,
       "jitter_test": true,
       "jitter_samples": 6,
       "jitter_count": 0,
@@ -524,6 +525,7 @@ written atomically).
 | `upload_test` | `false` (default). cfst cannot upload; cfscan measures this itself |
 | `upload_url` | Where the upload POST goes. Required when `upload_test` is true |
 | `upload_seconds` | How long to keep uploading to each address (default 8) |
+| `upload_count` | How many of the fastest addresses are upload-tested. `0` (default) means `top_ips`, the same rule as `jitter_count`. Independent of `download_count` |
 | `jitter_test` | `true` (default). TCP-handshake jitter on the best addresses, in milliseconds |
 | `jitter_samples` | Handshakes per address (default 6, at least 2) |
 | `jitter_count` | How many addresses to sample. `0` means `top_ips` |
@@ -559,12 +561,9 @@ using cfst.
 
 **Jitter** is on by default (`jitter_test`, or `--no-jitter` to skip a run).
 Each chosen address gets `jitter_samples` TCP handshakes (default 6) on the
-profile port. The number shown is the average gap between consecutive
-round-trips, in milliseconds. Ranking still prefers lower packet loss, then
-lower latency. Jitter only reorders addresses whose latency falls in the same
-20 ms band, so a steady 150 ms beats a swinging 155 ms, and a steady 300 ms
-does not beat a steady 150 ms. A latency-only file (no jitter column) sorts
-exactly as before.
+profile port. `jitter_count` is how many addresses are sampled (`0` means
+`top_ips`). The number shown is the average gap between consecutive
+round-trips, in milliseconds.
 
 **Download** stays off until you enable it (menu 2 / menu 6, or
 `cfscan --quick --download`). cfst has a single `-url`, used both for the
@@ -578,18 +577,33 @@ Set `download_url` (or pass `--download-url`). cfscan then keeps `-dd` on the
 latency scan and runs a **second** `cfst` pass over the fastest addresses:
 `-url` is the file, `-tp` is that URL's port (not the profile port), `-dn` /
 `-dt` come from `download_count` / `download_seconds`. `--download` with no
-URL saved uses `https://speed.cloudflare.com/__down?bytes=200000000`. When a
-download was measured, ranking prefers higher speed. Speeds in the same 1 MB/s
-band still fall back to latency and jitter, and any loss-free address still
-outranks one that dropped packets.
+URL saved uses `https://speed.cloudflare.com/__down?bytes=200000000`.
 
 **Upload** is opt-in (`upload_test`, or `cfscan --quick --upload`) because it
 needs a URL that accepts a POST. The default when you pass `--upload` and the
 profile has no URL is `https://speed.cloudflare.com/__up`. cfscan connects to
 the **candidate address** on the URL's port and sends the POST with that
 URL's hostname as the TLS name and Host header, for `upload_seconds` (default
-8). The result is MB/s. When download was not measured, upload ranks in the
-same 1 MB/s bands. When both were measured, upload only breaks a remaining tie.
+8). `upload_count` is how many of the fastest addresses are tested (`0` means
+`top_ips`). It does not change `download_count`. `--upload-count N` sets it
+for one run. The result is MB/s.
+
+**Ranking.** Lower packet loss always wins: a loss-free address beats every
+address that dropped packets. When none of jitter, download or upload was
+measured, the rest of the order is lower latency, the same as before. When
+any of them was measured, the comparison list (and the winner, which is the
+first row) uses one score, higher better:
+
+`10 × download MB/s + 10 × upload MB/s − 0.1 × jitter ms − 0.05 × latency ms`
+
+An address that was not included in a pass gets no credit for that speed, and
+a missing jitter sample counts as slightly worse than the worst sample, so it
+cannot look perfectly stable. 1 MB/s of either speed is worth 100 ms of jitter
+or 200 ms of latency, and upload weighs the same as download. The closing
+table keeps a column for each metric the run asked for; a row that was not
+sampled shows —. The winner line includes download, upload and jitter when
+those numbers exist. A strict re-check after the scan updates loss and
+latency only; it does not throw away the speed measurements.
 
 `cfscan --direct` applies to these probes as well as to cfst. Proxy variables
 (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, including `socks5://`) are ignored,

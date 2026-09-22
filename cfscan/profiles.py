@@ -138,6 +138,10 @@ def default_profile(cfst_path=None):
         "upload_test": False,
         "upload_url": "",
         "upload_seconds": 8,
+        # 0 means "use top_ips", the same rule as jitter_count. A positive
+        # value is how many of the best addresses get the upload probe, and
+        # it is independent of download_count and jitter_count.
+        "upload_count": 0,
         # Jitter is cheap (a handful of TCP handshakes to the best addresses)
         # and is the usual reason two equal latencies are not equal in use.
         "jitter_test": True,
@@ -273,6 +277,7 @@ def _merge_profile(stored):
             ("download_count", 10, 1, 50),
             ("download_seconds", 10, 1, 60),
             ("upload_seconds", 8, 1, 60),
+            ("upload_count", 0, 0, 50),
             ("jitter_samples", 6, 2, 30),
             ("jitter_count", 0, 0, 50),
     ):
