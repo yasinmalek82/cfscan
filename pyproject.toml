@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cfscan"
-version = "1.4.0"
+version = "1.4.1"
 description = "A friendly interactive wrapper around XIU2/CloudflareSpeedTest (cfst)"
 readme = "README.md"
 requires-python = ">=3.9"

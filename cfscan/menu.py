@@ -274,7 +274,21 @@ def _scan_profile(session, profile):
     return scanned
 
 
-def _render_profile(console, name, profile):
+def _region_filter_label(profile, *, this_run=False):
+    """How the region filter should read for the profile a scan will use.
+
+    ``this_run`` marks a one-run override (``cfscan --colo``, or the same choice
+    inside the multi-carrier wizard). An empty override is "any datacentre", and
+    the label says it applies to this run so it is not mistaken for the saved
+    profile.
+    """
+    codes = str(profile.get("colo") or "").strip()
+    if this_run:
+        return f"{codes} (this run)" if codes else "any datacentre (this run)"
+    return codes or "any datacentre"
+
+
+def _render_profile(console, name, profile, *, colo_this_run=False):
     console.key_value("Profile", name)
     console.key_value("Domain", profile.get("domain"))
     console.key_value("Port", profile.get("port"))
@@ -287,8 +301,8 @@ def _render_profile(console, name, profile):
         console.key_value("Protocol", "TCPing (plain TCP connect)")
     console.key_value("Expected status", profile.get("http_status")
                       if mode == "httping" else "-")
-    console.key_value("Region filter", str(profile.get("colo") or "")
-                      or "any datacentre")
+    console.key_value("Region filter",
+                      _region_filter_label(profile, this_run=colo_this_run))
     console.key_value("IP version", f"IPv{profile.get('ip_version', 4)}")
     console.key_value("IP range file", ip_file_for(profile))
     console.key_value("Attempts", profile.get("attempts"))
@@ -1638,7 +1652,9 @@ def quick_scan(session, config, profile_name=None, verify_prompt=True):
     console.line("The active profile is used. Press Ctrl+C at any time to stop.")
     console.blank()
     scanned = _scan_profile(session, profile)
-    _render_profile(console, name, scanned)
+    _render_profile(console, name, scanned,
+                    colo_this_run=getattr(session, "colo_override", None)
+                    is not None)
     _note_measurements(console, scanned)
 
     cfst = _cfst_path(config)
@@ -2063,7 +2079,9 @@ def custom_scan(session, config, profile_name=None, force_save=False,
 
     console.blank()
     console.heading("Summary")
-    _render_profile(console, new_name, scanned)
+    _render_profile(console, new_name, scanned,
+                    colo_this_run=getattr(session, "colo_override", None)
+                    is not None)
     _note_measurements(console, scanned)
 
     if not scan:
@@ -3145,8 +3163,9 @@ def help_screen(session, config):
                    "one scan now and then keeps it honest.")
     console.bullet("Turning it off is always one choice away: menu 2 and menu 12 "
                    "both offer \"measure every datacentre\", menu 6 edits it "
-                   "without running a scan, and 'cfscan --colo any' ignores the "
-                   "saved filter for a single run.")
+                   "without running a scan, menu 10 asks before a multi-carrier "
+                   "sitting, and 'cfscan --colo any' ignores the saved filter "
+                   "for a single run (including 'cfscan --colo any --isp NAME').")
 
     console.blank()
     console.line(console.style("Scanning through a tunnel", "bold"))
@@ -3667,6 +3686,63 @@ def _save_multi_report(results_dir, record, data):
     return path
 
 
+def _ask_round_region(session, console, profile):
+    """Ask whether this sitting keeps the saved region filter.
+
+    The shared candidate list is a sample of the IP ranges and is not filtered.
+    ``-cfcolo`` is added later, on every measurement, from the effective profile.
+    Choosing any datacentre is the same one-run override as ``cfscan --colo any``:
+    ``session.colo_override`` becomes ``""`` and the saved profile is left alone.
+
+    A choice already made for this process (``--colo``) is kept. With no saved
+    filter there is nothing to turn off. Returns True when this call set the
+    override.
+    """
+    if getattr(session, "colo_override", None) is not None:
+        return False
+    saved = str(profile.get("colo") or "").strip()
+    if not saved:
+        return False
+    console.blank()
+    console.line(
+        "These rounds inherit that region filter. The shared candidate list is "
+        "not filtered; only the measurement pass keeps the datacentres named "
+        f"above ({saved}). Measuring any datacentre applies to this sitting "
+        "only. The saved profile stays as it is. From the command line the "
+        "same choice is: cfscan --colo any"
+    )
+    answer = console.ask_choice(
+        "Region filter for these rounds",
+        [("1", f"Keep {saved}"),
+         ("2", "Measure any datacentre (this run only)")],
+        default="1",
+    )
+    if answer != "2":
+        return False
+    # validate_colo("any") is "" — the same value ``--colo any`` stores.
+    session.colo_override = validate_colo("any")
+    console.info("Region filter for this run: any datacentre "
+                 "(the saved profile is unchanged).")
+    return True
+
+
+def _remind_inherited_colo(console, session, profile):
+    """One line when a scripted round will keep the profile's region filter.
+
+    The wizard asks. ``--isp`` does not, so a saved filter would otherwise
+    narrow every round with no sign that ``--colo any`` turns it off.
+    """
+    if getattr(session, "colo_override", None) is not None:
+        return
+    codes = str(profile.get("colo") or "").strip()
+    if not codes:
+        return
+    console.info(
+        f"Region filter {codes} is active for this round. "
+        "cfscan --colo any clears it for this run."
+    )
+
+
 def multi_isp_flow(session, config, profile_name=None, isps=None, pool_path=None,
                    note=None):
     """Measure one candidate list on several carriers in one sitting.
@@ -3674,7 +3750,8 @@ def multi_isp_flow(session, config, profile_name=None, isps=None, pool_path=None
     Asks how many carriers first, then runs one round per carrier, waiting
     between rounds so the connection can be switched. Every round is stored as
     soon as it finishes, so the report is available even when the wizard is
-    stopped half way.
+    stopped half way. When the profile names datacentres, the wizard asks
+    whether to keep that filter or measure any datacentre for this sitting.
     """
     console = session.console
     name, profile = _profile_pair(config, profile_name)
@@ -3685,7 +3762,14 @@ def multi_isp_flow(session, config, profile_name=None, isps=None, pool_path=None
     console.line("One round per carrier. Every round measures the same candidate "
                  "list, so the carriers can be compared address by address.")
     console.blank()
-    _render_profile(console, name, profile)
+    _render_profile(
+        console, name, _scan_profile(session, profile),
+        colo_this_run=getattr(session, "colo_override", None) is not None,
+    )
+    if _ask_round_region(session, console, profile):
+        console.blank()
+        _render_profile(console, name, _scan_profile(session, profile),
+                        colo_this_run=True)
 
     carriers = _carrier_list(console, isps=isps)
     pool_file, sha, count, seed = _prepare_pool(session, profile, console,
@@ -3828,6 +3912,7 @@ def multi_isp_round(session, config, profile_name=None, isp=None, pool_path=None
     console.heading(f"Carrier round - {verdict}")
     if _refuse_placeholder(session, name, profile):
         return EXIT_USAGE
+    _remind_inherited_colo(console, session, profile)
     record, repeated = _reusable_session(session, profile, verdict)
     if record is None:
         pool_file, sha, count, seed = _prepare_pool(session, profile, console,
