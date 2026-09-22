@@ -82,6 +82,24 @@ class QuickScanCliTests(unittest.TestCase):
         self.assertIn("-dt", text)
         self.assertEqual(fixture.spawn.calls, [])
 
+    def test_upload_count_is_a_one_run_plan_and_is_not_saved(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        code = run(fixture, ["--quick", "--dry-run", "--upload-count", "3"])
+        self.assertEqual(code, 0)
+        self.assertIn("best 3 address", fixture.text)
+        self.assertIn("https://speed.cloudflare.com/__up", fixture.text)
+        saved = fixture.reload()["profiles"][fixture.config["active_profile"]]
+        self.assertFalse(saved["upload_test"])
+        self.assertEqual(saved["upload_count"], 0)
+
+    def test_upload_count_and_no_upload_together_are_refused(self):
+        fixture = Fixture()
+        self.addCleanup(fixture.close)
+        code = run(fixture, ["--upload-count", "2", "--no-upload"])
+        self.assertEqual(code, 2)
+        self.assertIn("only one", fixture.text.lower())
+
     def test_no_jitter_is_a_one_run_switch(self):
         fixture = Fixture()
         self.addCleanup(fixture.close)

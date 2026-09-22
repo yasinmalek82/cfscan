@@ -6,6 +6,7 @@ the scan tests replace both the scanner and the probe functions.
 
 from __future__ import annotations
 
+import io
 import socket
 import threading
 import unittest
@@ -19,9 +20,15 @@ from cfscan.measure import (
     open_tcp,
     successive_jitter_ms,
 )
+from cfscan.menu import (
+    _print_speed_comparison,
+    _render_results_table,
+    _verified_speed_summary,
+    quick_scan,
+)
 from cfscan.runner import explain_zero_download
-from cfscan.menu import quick_scan
 from cfscan.parser import ScanResult
+from cfscan.ui import Console
 
 from tests.support import LOG_SUCCESS, Fixture, ScriptedSpawn
 
@@ -575,6 +582,135 @@ class TableTests(unittest.TestCase):
         self.assertIn("2.50 ms", text)
         self.assertIn("0.00 MB/s", text)
         self.assertIn("1.25 MB/s", text)
+
+    def test_a_requested_column_stays_when_a_row_was_not_sampled(self):
+        stream = io.StringIO()
+        console = Console(out=stream, color=False)
+        rows = [
+            ScanResult("104.21.0.1", 4, 4, 0.0, 100.0, download_mbps=8.0,
+                       jitter_ms=1.0, upload_mbps=2.0),
+            ScanResult("104.21.0.2", 4, 4, 0.0, 110.0, download_mbps=None,
+                       jitter_ms=None, upload_mbps=None),
+        ]
+        _render_results_table(
+            console, rows,
+            profile={"download_test": True, "upload_test": True},
+        )
+        text = stream.getvalue()
+        for header in ("Jitter", "Download", "Upload"):
+            self.assertEqual(text.count(header), 1)
+        self.assertIn("—", text)
+        self.assertIn("8.00 MB/s", text)
+        self.assertIn("2.00 MB/s", text)
+
+
+class FinishPathTests(unittest.TestCase):
+    def test_verify_keeps_speed_numbers_and_the_score_picks_the_winner(self):
+        scan = _csv([("104.21.0.1", 100.0, 0.0), ("104.21.0.2", 130.0, 0.0)])
+        checked = (
+            "\ufeffIP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码\r\n"
+            "104.21.0.1,20,20,0.00,102.00,0.00,FRA\r\n"
+            "104.21.0.2,20,20,0.00,128.00,0.00,FRA\r\n"
+        )
+        spawn = ScriptedSpawn(log_text=LOG_SUCCESS, csv_sequence=[scan, checked])
+        fixture = Fixture(answers=["y"], spawn=spawn)
+        self.addCleanup(fixture.close)
+        fixture.session.probes = True
+        fixture.session.verify_top_ips = True
+        profile = fixture.profile()
+        profile["upload_test"] = True
+        profile["upload_url"] = "https://speed.cloudflare.com/__up"
+        profile["jitter_test"] = True
+
+        def fake_jitter(ip, port, samples=6, timeout=1.5, direct=False,
+                        environ=None, connect=None, clock=None):
+            return 40.0 if ip.endswith(".1") else 1.0
+
+        def fake_upload(ip, url, seconds=8, timeout=10, direct=False,
+                        environ=None, connect=None, clock=None):
+            return 1.0 if ip.endswith(".1") else 12.0
+
+        with mock.patch("cfscan.menu.measure_jitter_ms", side_effect=fake_jitter), \
+                mock.patch("cfscan.menu.measure_upload_mbps", side_effect=fake_upload):
+            self.assertEqual(quick_scan(fixture.session, fixture.config), 0)
+        text = fixture.text
+        self.assertIn("Comparison", text)
+        for header in ("Jitter", "Upload"):
+            self.assertIn(header, text)
+        self.assertIn("Best verified address: 104.21.0.2", text)
+        self.assertIn("12.00 MB/s", text)
+        self.assertIn("1.00 ms", text)
+        passed = [line for line in text.splitlines()
+                  if "PASS" in line and "104.21.0.2" in line]
+        self.assertTrue(passed)
+        self.assertTrue(any("12.00" in line and "1.00 ms" in line for line in passed))
+        self.assertLess(text.index("104.21.0.2"), text.index("104.21.0.1"))
+        remembered = " ".join(fixture.session.last_result["lines"])
+        self.assertIn("104.21.0.2", remembered)
+        self.assertIn("12.00", remembered)
+
+    def test_upload_count_does_not_follow_jitter_count(self):
+        scan = _csv([
+            ("104.21.0.1", 100.0, 0.0),
+            ("104.21.0.2", 110.0, 0.0),
+            ("104.21.0.3", 120.0, 0.0),
+        ])
+        spawn = ScriptedSpawn(log_text=LOG_SUCCESS, csv_text=scan)
+        fixture = Fixture(answers=["y", "n"], spawn=spawn)
+        self.addCleanup(fixture.close)
+        fixture.session.probes = True
+        fixture.session.verify_top_ips = False
+        profile = fixture.profile()
+        profile["jitter_test"] = True
+        profile["jitter_count"] = 1
+        profile["upload_test"] = True
+        profile["upload_url"] = "https://speed.cloudflare.com/__up"
+        profile["upload_count"] = 2
+        jitter_ips = []
+        upload_ips = []
+
+        def fake_jitter(ip, port, samples=6, timeout=1.5, direct=False,
+                        environ=None, connect=None, clock=None):
+            jitter_ips.append(ip)
+            return 1.0
+
+        def fake_upload(ip, url, seconds=8, timeout=10, direct=False,
+                        environ=None, connect=None, clock=None):
+            upload_ips.append(ip)
+            return 2.0
+
+        with mock.patch("cfscan.menu.measure_jitter_ms", side_effect=fake_jitter), \
+                mock.patch("cfscan.menu.measure_upload_mbps", side_effect=fake_upload):
+            self.assertEqual(quick_scan(fixture.session, fixture.config), 0)
+        self.assertEqual(jitter_ips, ["104.21.0.1"])
+        self.assertEqual(upload_ips, ["104.21.0.1", "104.21.0.2"])
+        self.assertIn("Upload", fixture.text)
+        self.assertIn("—", fixture.text)
+
+    def test_a_carrier_comparison_lists_speed_and_names_the_winner(self):
+        stream = io.StringIO()
+        console = Console(out=stream, color=False)
+        rows = [
+            ScanResult("104.21.0.1", 4, 4, 0.0, 90.0, jitter_ms=30.0,
+                       upload_mbps=1.0),
+            ScanResult("104.21.0.2", 4, 4, 0.0, 140.0, jitter_ms=1.0,
+                       upload_mbps=12.0),
+        ]
+        profile = {"upload_test": True, "jitter_test": True}
+        winner = _print_speed_comparison(console, profile, rows)
+        text = stream.getvalue()
+        self.assertEqual(winner.ip, "104.21.0.2")
+        self.assertIn("Comparison", text)
+        self.assertIn("Winner: 104.21.0.2", text)
+        self.assertIn("12.00 MB/s", text)
+        self.assertIn("1.00 ms", text)
+        self.assertLess(text.index("104.21.0.2"), text.index("104.21.0.1"))
+        summary = _verified_speed_summary(
+            [{"ip": "104.21.0.2", "rtt_ms": 140.0, "verdict": "PASS"}],
+            "mci", rows, profile)
+        self.assertIn("fastest 104.21.0.2", summary)
+        self.assertIn("12.00 MB/s", summary)
+        self.assertIn("1.00 ms", summary)
 
 
 if __name__ == "__main__":
