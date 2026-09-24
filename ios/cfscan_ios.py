@@ -1583,6 +1583,12 @@ def _fetch(url, timeout):
         return resp.read(8192)
 
 
+def parse_asn(value):
+    """``197207`` from ``197207``, ``"197207"`` or ``"AS197207"``; else None."""
+    match = re.search(r"\d+", str(value or ""))
+    return int(match.group()) if match else None
+
+
 def detect_connection(timeout=6.0):
     """How Cloudflare sees this phone.
 
@@ -1595,8 +1601,7 @@ def detect_connection(timeout=6.0):
         colo = meta.get("colo")
         if isinstance(colo, dict):
             colo = colo.get("iata") or ""
-        asn = meta.get("asn")
-        return {"ok": True, "asn": int(asn) if str(asn).isdigit() else None,
+        return {"ok": True, "asn": parse_asn(meta.get("asn")),
                 "org": str(meta.get("asOrganization") or ""),
                 "country": str(meta.get("country") or ""), "ip": str(meta.get("clientIp") or ""),
                 "colo": str(colo or ""), "error": ""}
@@ -2296,8 +2301,8 @@ def connection_text(info, network=None):
     if info["country"] and info["country"] != "IR":
         return "VPN روشن است (%s) — خاموشش کنید و بزنید" % info["country"], "bad"
     name = network["name"] if network else (info["org"] or "اینترنت ناشناخته")
-    asn = " · AS%d" % info["asn"] if info.get("asn") else ""
-    return "✓ %s%s · %s" % (name, asn, info["colo"]), "ok"
+    asn = " · AS%d" % info["asn"] if info.get("asn") else " (انتخاب دستی)"
+    return "✓ %s%s · %s — برای تغییر بزنید" % (name, asn, info["colo"]), "ok"
 
 
 if ui is not None:
@@ -2480,7 +2485,7 @@ if ui is not None:
             self.net_btn = ui.Button()
             self.net_btn.corner_radius = 14
             self.net_btn.font = ("<System-Bold>", 13)
-            self.net_btn.action = lambda s: run_bg(self.app.detect, True)
+            self.net_btn.action = lambda s: run_bg(self.app.network_menu)
             self.scan_btn = make_button("اسکن", self.tapped_scan, primary=True, size=18)
             self.scan_btn.corner_radius = 16
             self.force_btn = make_link("اسکن کامل، حتی اگر سالم است", self.tapped_force)
@@ -2938,6 +2943,8 @@ if ui is not None:
             self.main.set_connection(None)
             info = detect_connection()
             self.connection = info
+            log("detect: ok=%s asn=%s org=%s country=%s colo=%s" % (
+                info["ok"], info.get("asn"), info.get("org"), info.get("country"), info.get("colo")))
             network = None
             if info["ok"] and (not info["country"] or info["country"] == "IR"):
                 network = self.resolve_network(info, ask)
@@ -2946,25 +2953,41 @@ if ui is not None:
             return network
 
         def resolve_network(self, info, ask=True):
-            store = self.store
+            """The network for this connection: by its ASN, else asked.
+
+            Never guesses: without an ASN (Cloudflare did not say) the user
+            picks, instead of silently reusing the last network.
+            """
             asn = info.get("asn")
-            if not asn:
-                return store.current_network  # no ASN from Cloudflare: the manual choice
-            known = store.network_for_asn(asn)
+            known = self.store.network_for_asn(asn) if asn else None
             if known:
-                store.set_network(known["id"])
+                self.store.set_network(known["id"])
                 return known
             if not ask:
                 return None
-            name, group = KNOWN_ASNS.get(asn, (info.get("org") or "AS%d" % asn, "home"))
+            return self.choose_network(info)
+
+        def choose_network(self, info, title=None):
+            """Ask which network this is; the ASN (if known) moves to it for good."""
+            store = self.store
+            info = info or {}
+            asn = info.get("asn")
+            if asn:
+                name, group = KNOWN_ASNS.get(asn, (info.get("org") or "AS%d" % asn, "home"))
+                header = "AS%d %s" % (asn, info.get("org") or "")
+            else:
+                name, group = "اینترنت جدید", "home"
+                header = "تشخیص خودکار نشد"
             items = ["%s (%s)" % (n["name"], GROUP_NAMES[n["group"]]) for n in store.networks]
             items.append("+ اینترنت جدید: %s" % name)
-            index = pick("این اینترنت کدام است؟ AS%d %s" % (asn, info.get("org") or ""), items)
+            index = pick(title or "الان روی کدام اینترنت هستید؟ %s" % header, items)
             if index is None:
                 return None
             if index < len(store.networks):
                 nid = store.networks[index]["id"]
-                store.save_network(nid, store.network(nid)["name"], store.network(nid)["group"], asn)
+                if asn:
+                    net = store.network(nid)
+                    store.save_network(nid, net["name"], net["group"], asn)
             else:
                 name = console.input_alert("نام اینترنت", "", name, "ادامه").strip() or name
                 g = pick("%s موبایل است یا خانگی؟" % name,
@@ -2974,6 +2997,29 @@ if ui is not None:
                 nid = store.save_network(None, name, GROUPS[g], asn)
             store.set_network(nid)
             return store.network(nid)
+
+        def network_menu(self):
+            """The badge: detect again, or say which network this is."""
+            store = self.store
+            items = ["تشخیص دوباره"] + ["الان روی «%s» هستم" % n["name"] for n in store.networks]
+            index = pick("اینترنت", items)
+            if index is None:
+                return
+            if index == 0:
+                self.detect(True)
+                return
+            info = self.connection or {}
+            nid = store.networks[index - 1]["id"]
+            asn = info.get("asn")
+            if asn:
+                wrong = store.network_for_asn(asn)
+                net = store.network(nid)
+                store.save_network(nid, net["name"], net["group"], asn)
+                if wrong and wrong["id"] != nid:
+                    console.hud_alert("AS%d از «%s» به «%s» منتقل شد" % (asn, wrong["name"], net["name"]))
+            store.set_network(nid)
+            self.main.set_connection(info if info.get("ok") else None, store.network(nid))
+            self.main.refresh()
 
         def scan_flow(self, mode, every):
             store = self.store

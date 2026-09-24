@@ -964,6 +964,10 @@ class DetectTests(unittest.TestCase):
                                                   b'"colo": {"iata": "GYD"}}'})
             info = app.detect_connection()
             self.assertEqual((info["asn"], info["country"], info["colo"]), (44244, "IR", "GYD"))
+            app._fetch = self.fetch({app.META_URL: b'{"asn": "AS197207", "country": "IR"}'})
+            self.assertEqual(app.detect_connection()["asn"], 197207)
+            self.assertEqual((app.parse_asn(44244), app.parse_asn("AS44244"), app.parse_asn(None)),
+                             (44244, 44244, None))
             app._fetch = self.fetch({app.META_URL: socket.timeout(),
                                      app.TRACE_URL: b"ip=5.6.7.8\nloc=DE\ncolo=FRA\n"})
             info = app.detect_connection()
