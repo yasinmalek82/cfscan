@@ -1,0 +1,449 @@
+"""The iPhone app's engine (ios/cfscan_ios.py) without Pythonista.
+
+The probes run against a real TLS server on 127.0.0.1 with a throwaway
+certificate; the scan tests replace the probes and the Cloudflare API with
+scripted fakes. Nothing here contacts a public network.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import random
+import shutil
+import socket
+import ssl
+import subprocess
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+_PATH = Path(__file__).resolve().parent.parent / "ios" / "cfscan_ios.py"
+_spec = importlib.util.spec_from_file_location("cfscan_ios", _PATH)
+app = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(app)
+
+
+class MemorySecrets:
+    def __init__(self, token="tok"):
+        self.token = token
+
+    def get(self):
+        return self.token
+
+    def set(self, token):
+        self.token = token
+
+
+def make_store(tmp, token="tok", **settings):
+    store = app.Store(os.path.join(tmp, "data.json"), secrets=MemorySecrets(token))
+    base = {"sni": "cdn.example.test", "path": "/ws", "auto_apply": True,
+            "verify_attempts": 3, "verify_top": 3, "stop_after": 0, "timeout": 0.5}
+    base.update(settings)
+    store.update_settings(base)
+    store.edit_profile("mci", "MCI", "mci.example.test")
+    return store
+
+
+# ------------------------------------------------------------------ storage
+
+class StoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_defaults_fill_a_missing_file(self):
+        store = app.Store(os.path.join(self.tmp, "none.json"), secrets=MemorySecrets())
+        self.assertEqual(store.settings["port"], 443)
+        self.assertEqual([p["id"] for p in store.profiles], ["mci", "mtn", "home"])
+
+    def test_settings_round_trip_and_bad_values_change_nothing(self):
+        store = make_store(self.tmp, workers="16", colos="fra, ams")
+        again = app.Store(store.path, secrets=MemorySecrets())
+        self.assertEqual(again.settings["workers"], 16)
+        self.assertEqual(again.settings["path"], "/ws")
+        with self.assertRaises(ValueError):
+            again.update_settings({"workers": "8", "port": "70000"})
+        self.assertEqual(again.settings["workers"], 16)
+
+    def test_stored_garbage_is_ignored(self):
+        data = app.normalise_data({"settings": {"port": "x", "ttl": 5, "sni": "A.B."},
+                                   "profiles": [{"id": "a", "record": "X.Test."}, {"id": "a"}]})
+        self.assertEqual(data["settings"]["port"], 443)
+        self.assertEqual(data["settings"]["ttl"], 60)  # below the limit: default kept
+        self.assertEqual(data["profiles"], [{"id": "a", "name": "a", "record": "x.test"}])
+
+    def test_the_token_is_never_written_to_the_data_file(self):
+        store = make_store(self.tmp, token="secret-token-123")
+        store.save()
+        self.assertNotIn("secret-token-123", Path(store.path).read_text(encoding="utf-8"))
+        self.assertNotIn("secret-token-123", store.export_json())
+
+    def test_export_import_keeps_settings_and_carriers(self):
+        store = make_store(self.tmp)
+        text = store.export_json()
+        other = app.Store(os.path.join(self.tmp, "other.json"), secrets=MemorySecrets())
+        other.import_json(text)
+        self.assertEqual(other.profile("mci")["record"], "mci.example.test")
+        with self.assertRaises(ValueError):
+            other.import_json('{"hello": 1}')
+
+    def test_previous_ips_come_from_the_last_change(self):
+        store = make_store(self.tmp)
+        store.add_history("mci", "apply", ["1.1.1.1"], ["2.2.2.2"])
+        store.add_history("mci", "check", ["2.2.2.2"], ["2.2.2.2"])
+        self.assertEqual(store.previous_ips("mci"), ["1.1.1.1"])
+
+
+# ------------------------------------------------------------------ pure helpers
+
+class HelperTests(unittest.TestCase):
+    def test_plan_sync_rewrites_before_it_deletes(self):
+        existing = [{"id": "r1", "content": "1.1.1.1"}, {"id": "r2", "content": "2.2.2.2"},
+                    {"id": "r3", "content": "3.3.3.3"}]
+        self.assertEqual(app.plan_sync(existing, ["2.2.2.2", "9.9.9.9"]),
+                         [("update", "r1", "9.9.9.9"), ("delete", "r3", "3.3.3.3")])
+        self.assertEqual(app.plan_sync([], ["9.9.9.9"]), [("create", None, "9.9.9.9")])
+        self.assertEqual(app.plan_sync(existing[:1], ["1.1.1.1"]), [])
+        dup = [{"id": "a", "content": "1.1.1.1"}, {"id": "b", "content": "1.1.1.1"}]
+        self.assertEqual(app.plan_sync(dup, ["1.1.1.1", "5.5.5.5"]), [("update", "b", "5.5.5.5")])
+
+    def test_candidates_start_with_known_good_and_skip_recent_failures(self):
+        now = 1000000.0
+        state = {"good": {"104.16.5.10": {"ts": now - 10}, "104.17.9.9": {"ts": now - 5}},
+                 "bad": {"104.16.5.11": now - 60, "104.16.5.12": now - 99999}}
+        out = app.build_candidates(state, 60, 4, app.CF_RANGES_V4, rng=random.Random(3),
+                                   now=now, bad_ttl_s=3600, exclude=["104.17.9.9"])
+        self.assertEqual(out[0], "104.16.5.10")
+        self.assertNotIn("104.17.9.9", out)
+        self.assertNotIn("104.16.5.11", out)
+        self.assertEqual(len(out), 60)
+        self.assertEqual(len(set(out)), 60)
+        neighbours = [ip for ip in out[1:9]]
+        self.assertTrue(all(ip.startswith("104.16.5.") for ip in neighbours))
+        for ip in out:
+            last = int(ip.rsplit(".", 1)[1])
+            self.assertNotIn(last, (0, 255))
+
+    def test_ipv6_candidates_stay_ipv6(self):
+        out = app.build_candidates({}, 20, 6, app.CF_RANGES_V6, rng=random.Random(1))
+        self.assertEqual(len(out), 20)
+        self.assertTrue(all(":" in ip for ip in out))
+
+    def test_trace_and_status_parsing(self):
+        raw = b"HTTP/1.1 200 OK\r\nServer: cloudflare\r\n\r\nfl=1\nip=5.6.7.8\ncolo=GYD\nloc=IR\n"
+        self.assertEqual(app.parse_status(raw), 200)
+        info = app.parse_trace(raw)
+        self.assertEqual((info["colo"], info["loc"], info["ip"]), ("GYD", "IR", "5.6.7.8"))
+        self.assertIsNone(app.parse_status(b"garbage"))
+
+    def test_measure_summarises_attempts(self):
+        answers = iter([
+            {"ok": True, "tcp": 100.0, "total": 300.0, "colo": "FRA", "error": ""},
+            {"ok": False, "tcp": None, "total": None, "colo": "", "error": "timeout"},
+            {"ok": True, "tcp": 120.0, "total": 320.0, "colo": "FRA", "error": ""},
+            {"ok": True, "tcp": 110.0, "total": 310.0, "colo": "FRA", "error": ""},
+        ])
+        m = app.measure("1.2.3.4", None, None, 4, 1, True, pause=0,
+                        probe_ws=lambda *a: next(answers))
+        self.assertEqual((m["ok"], m["attempts"], m["loss"]), (3, 4, 25.0))
+        self.assertEqual(m["ping"], 110.0)
+        self.assertAlmostEqual(m["jitter"], 15.0)
+        self.assertEqual(m["colo"], "FRA")
+        self.assertFalse(app.is_healthy(m, 0, 800))
+        self.assertTrue(app.is_healthy(m, 30, 800))
+        self.assertLess(app.score({"total": 100, "jitter": 1, "loss": 0}),
+                        app.score({"total": 90, "jitter": 1, "loss": 10}))
+
+    def test_ago_and_colos(self):
+        self.assertEqual(app.ago(0), "هرگز")
+        self.assertEqual(app.ago(100, now=130), "همین الان")
+        self.assertEqual(app.ago(0.5, now=7200.5), "2 ساعت پیش")
+        self.assertEqual(app.parse_colos(" fra, AMS  muc"), {"FRA", "AMS", "MUC"})
+
+
+# ------------------------------------------------------------------ real sockets
+
+class _TLSServer:
+    """Answers /cdn-cgi/trace with 200 and the WebSocket path with 101."""
+
+    def __init__(self, certfile, keyfile, ws_path="/ws"):
+        self.ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        self.ctx.load_cert_chain(certfile, keyfile)
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.port = self.sock.getsockname()[1]
+        self.ws_path = ws_path
+        self.hosts = []
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            tls = self.ctx.wrap_socket(conn, server_side=True)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+            head = data.decode("latin-1")
+            path = head.split(" ", 2)[1]
+            for line in head.split("\r\n"):
+                if line.lower().startswith("host:"):
+                    self.hosts.append(line.split(":", 1)[1].strip())
+            if path == "/cdn-cgi/trace":
+                body = b"fl=1\nip=5.6.7.8\ncolo=TST\nloc=IR\n"
+                tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
+            elif path == self.ws_path and "upgrade: websocket" in head.lower():
+                tls.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+            else:
+                tls.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            tls.close()
+        except (OSError, ssl.SSLError):
+            pass
+
+    def close(self):
+        self.sock.close()
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl is needed for a test certificate")
+class ProbeSocketTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.cert = os.path.join(cls.tmp, "cert.pem")
+        cls.key = os.path.join(cls.tmp, "key.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", cls.key, "-out", cls.cert, "-days", "1",
+                        "-subj", "/CN=cdn.example.test",
+                        "-addext", "subjectAltName=DNS:cdn.example.test"],
+                       check=True, capture_output=True)
+        cls.server = _TLSServer(cls.cert, cls.key)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.close()
+        shutil.rmtree(cls.tmp)
+
+    def client_ctx(self):
+        ctx = ssl.create_default_context(cafile=self.cert)
+        ctx.set_alpn_protocols(["http/1.1"])
+        return ctx
+
+    def target(self, path="/ws", sni="cdn.example.test"):
+        return app.Target(sni, path, self.server.port, True)
+
+    def test_trace_probe_reads_the_datacentre_with_our_sni(self):
+        r = app.trace_probe("127.0.0.1", self.target(), self.client_ctx(), 3)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["colo"], r["loc"], r["client"]), ("TST", "IR", "5.6.7.8"))
+        self.assertLessEqual(r["tcp"], r["total"])
+        self.assertIn("cdn.example.test", self.server.hosts)
+
+    def test_ws_probe_wants_101_on_the_config_path(self):
+        self.assertTrue(app.ws_probe("127.0.0.1", self.target(), self.client_ctx(), 3)["ok"])
+        wrong = app.ws_probe("127.0.0.1", self.target("/other"), self.client_ctx(), 3)
+        self.assertFalse(wrong["ok"])
+        self.assertEqual(wrong["error"], "HTTP 404")
+
+    def test_a_certificate_for_another_name_is_a_tls_failure(self):
+        r = app.trace_probe("127.0.0.1", self.target(sni="other.example.test"),
+                            self.client_ctx(), 3)
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"].startswith("TLS"), r["error"])
+
+    def test_a_closed_port_fails_fast(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        r = app.trace_probe("127.0.0.1", app.Target("cdn.example.test", "", port),
+                            self.client_ctx(), 2)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "refused")
+
+
+# ------------------------------------------------------------------ the scan
+
+class FakeAPI:
+    """A Cloudflare stand-in keeping DNS records in a shared dict."""
+
+    records = {}
+    unreachable_direct = False
+    calls = []
+
+    def __init__(self, token="", via_ip=None, **kw):
+        self.token = token
+        self.via_ip = via_ip
+
+    def _check(self):
+        FakeAPI.calls.append(self.via_ip)
+        if FakeAPI.unreachable_direct and self.via_ip is None:
+            raise app.NetError("timeout")
+
+    def find_zone(self, record):
+        self._check()
+        return "zone1"
+
+    def list_records(self, zone, name, rtype):
+        self._check()
+        return [{"id": "r%d" % i, "content": ip}
+                for i, ip in enumerate(FakeAPI.records.get((name, rtype), []))]
+
+    def sync_records(self, zone, name, ips, rtype, ttl):
+        self._check()
+        FakeAPI.records[(name, rtype)] = list(ips)
+        return [("sync", None, ip) for ip in ips]
+
+
+def scripted_probe(table, loc="IR"):
+    """A probe answering from ``table``: ip -> (ok, total_ms, colo)."""
+
+    def probe(ip, target, ctx, timeout):
+        ok, total, colo = table.get(ip, (False, None, ""))
+        return {"ip": ip, "ok": ok, "tcp": total / 3 if ok else None,
+                "total": total if ok else None, "status": 200 if ok else None,
+                "colo": colo if ok else "", "loc": loc if ok else "", "client": "",
+                "error": "" if ok else "timeout"}
+
+    return probe
+
+
+class RecordingEvents(app.Events):
+    def __init__(self):
+        self.steps = []
+        self.notes = []
+        self.result = None
+
+    def step(self, index, status, detail=""):
+        self.steps.append((index, status))
+
+    def note(self, text):
+        self.notes.append(text)
+
+    def finished(self, result):
+        self.result = result
+
+
+class ScanJobTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        FakeAPI.records = {("mci.example.test", "A"): ["9.9.9.9"]}
+        FakeAPI.unreachable_direct = False
+        FakeAPI.calls = []
+        self.table = {
+            "9.9.9.9": (False, None, ""),       # the current, now blocked
+            "1.0.0.1": (True, 400.0, "GYD"),
+            "1.0.0.2": (True, 150.0, "FRA"),
+            "1.0.0.3": (True, 250.0, "AMS"),
+            "1.0.0.4": (False, None, ""),
+        }
+
+    def job(self, store, mode="auto", table=None, loc="IR"):
+        probe = scripted_probe(self.table if table is None else table, loc)
+        return app.ScanJob(store, "mci", events=RecordingEvents(), mode=mode,
+                           context_factory=lambda: None, api_factory=FakeAPI,
+                           candidates=["1.0.0.1", "1.0.0.2", "1.0.0.3", "1.0.0.4"],
+                           probe_trace=probe, probe_ws=probe)
+
+    def test_a_broken_record_is_replaced_by_the_best_verified_address(self):
+        store = make_store(self.tmp)
+        job = self.job(store)
+        result = job.run()
+        self.assertEqual(result["kind"], "applied")
+        self.assertEqual(result["chosen"], ["1.0.0.2"])
+        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["1.0.0.2"])
+        st = store.state("mci")
+        self.assertEqual((st["status"], st["current"]), ("ok", ["1.0.0.2"]))
+        self.assertIn("1.0.0.2", st["good"])
+        self.assertIn("1.0.0.4", st["bad"])
+        self.assertIn("9.9.9.9", st["bad"])
+        self.assertEqual(store.previous_ips("mci"), ["9.9.9.9"])
+        self.assertEqual(job.events.steps[-1], (3, "ok"))
+        self.assertIs(job.events.result, result)
+
+    def test_a_healthy_record_is_left_alone(self):
+        store = make_store(self.tmp)
+        FakeAPI.records[("mci.example.test", "A")] = ["1.0.0.3"]
+        result = self.job(store).run()
+        self.assertEqual(result["kind"], "healthy")
+        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["1.0.0.3"])
+        self.assertEqual(result["scanned"], 0)
+
+    def test_force_scans_even_when_healthy_and_can_find_the_same_address(self):
+        store = make_store(self.tmp)
+        FakeAPI.records[("mci.example.test", "A")] = ["1.0.0.2"]
+        job = self.job(store, mode="force")
+        job.fixed_candidates = ["1.0.0.2", "1.0.0.1"]
+        result = job.run()
+        self.assertEqual(result["kind"], "unchanged")
+
+    def test_two_addresses_per_record_and_manual_approval(self):
+        store = make_store(self.tmp, ips_per_record=2, auto_apply=False)
+        job = self.job(store)
+        result = job.run()
+        self.assertEqual(result["kind"], "pending")
+        self.assertEqual(result["chosen"], ["1.0.0.2", "1.0.0.3"])
+        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["9.9.9.9"])
+        self.assertTrue(job.apply(result["chosen"], result))
+        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["1.0.0.2", "1.0.0.3"])
+
+    def test_a_blocked_api_is_reached_through_a_clean_address(self):
+        store = make_store(self.tmp)
+        FakeAPI.unreachable_direct = True
+        result = self.job(store).run()
+        self.assertEqual(result["kind"], "applied")
+        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["1.0.0.2"])
+        self.assertIn("1.0.0.2", FakeAPI.calls)
+
+    def test_colour_filter_keeps_only_the_named_datacentres(self):
+        store = make_store(self.tmp, colos="AMS")
+        result = self.job(store).run()
+        self.assertEqual(result["chosen"], ["1.0.0.3"])
+
+    def test_nothing_answering_gives_a_hint_and_marks_nothing_bad(self):
+        store = make_store(self.tmp)
+        result = self.job(store, table={}).run()
+        self.assertEqual(result["kind"], "nothing")
+        self.assertIn("timeout", result["hint"])
+        self.assertNotIn("1.0.0.4", store.state("mci")["bad"])
+
+    def test_a_foreign_location_warns_about_the_vpn(self):
+        store = make_store(self.tmp)
+        job = self.job(store, loc="DE")
+        result = job.run()
+        self.assertIn("VPN", result["warning"])
+        self.assertTrue(job.events.notes)
+
+    def test_missing_cdn_domain_is_a_clear_error(self):
+        store = make_store(self.tmp, sni="")
+        result = self.job(store).run()
+        self.assertEqual(result["kind"], "error")
+        self.assertIn("CDN", result["message"])
+
+    def test_without_a_token_the_scan_still_finds_addresses(self):
+        store = make_store(self.tmp, token="")
+        result = self.job(store).run()
+        self.assertEqual(result["kind"], "found")
+        self.assertEqual(result["chosen"], ["1.0.0.2"])
+
+    def test_cancel_stops_the_run(self):
+        store = make_store(self.tmp)
+        job = self.job(store)
+        job.cancel()
+        self.assertEqual(job.run()["kind"], "stopped")
+
+
+if __name__ == "__main__":
+    unittest.main()
