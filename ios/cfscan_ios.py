@@ -116,6 +116,7 @@ DEFAULT_SETTINGS = {
     "verify_attempts": 6,
     "max_loss_pct": 0,
     "max_ping_ms": 1500,    # slowest config delay that still counts as healthy
+    "good_ping_ms": 700,    # slower than this (but healthy) still looks for faster; 0 = off
     "min_gain_pct": 20,     # a forced scan replaces working addresses only when this much faster
     "colos": "",            # allowed datacentres, e.g. "FRA,AMS"; empty = any
     "ip_version": 4,
@@ -146,6 +147,7 @@ SETTING_LIMITS = {
     "fresh_hours": (1, 168), "candidates": (20, 5000), "workers": (1, 128),
     "timeout": (0.5, 10.0), "stop_after": (0, 1000), "verify_top": (1, 20),
     "verify_attempts": (2, 30), "max_loss_pct": (0, 50), "max_ping_ms": (50, 5000),
+    "good_ping_ms": (0, 5000),
     "min_gain_pct": (0, 90), "ip_version": (4, 6), "bad_ttl_hours": (0, 168),
 }
 
@@ -1933,6 +1935,13 @@ class ScanJob:
         result.setdefault("server", self.sid)
         result.setdefault("network", self.nid)
         result["elapsed"] = time.time() - started
+        try:
+            cells = self.store.cells_copy(self.sid)
+            result["delays"] = {
+                ip: (cells.get(ip) or {}).get(self.nid, {}).get("delay")
+                for ip in list(result.get("ips") or []) + list(result.get("conflict") or [])}
+        except Exception:  # a summary detail; never lose the result over it
+            result["delays"] = {}
         self.result = result
         self.running = False
         log("job end %s/%s: %s" % (self.sid, self.nid, result.get("kind")))
@@ -1989,13 +1998,19 @@ class ScanJob:
             self._record(ms)
             store.save()
             healthy = all(self._ok(m) for m in ms)
-            self.events.step(0, "ok" if healthy else "fail",
-                             "\n".join(self._measure_text(m) for m in ms))
+            text = "\n".join(self._measure_text(m) for m in ms)
+            slow_ms = self._slow(ms) if healthy else None
+            if slow_ms is not None:
+                result["slow"] = slow_ms
+                text += ("\nسالم ولی کُندتر از تأخیر دلخواه (%.0fms)؛ دنبال IP سریع‌تر می‌گردم"
+                         % float(s["good_ping_ms"]))
+            self.events.step(0, "slow" if slow_ms is not None else ("ok" if healthy else "fail"),
+                             text)
         else:
             self.events.step(0, "skip", "رکورد هنوز IP ندارد")
         if self.cancelled:
             return self._stopped(result)
-        if healthy and self.mode == "auto":
+        if healthy and self.mode == "auto" and "slow" not in result:
             for i in (1, 2, 3):
                 self.events.step(i, "skip")
             now = self.clock()
@@ -2171,6 +2186,14 @@ class ScanJob:
         s = self.store.settings
         return is_healthy(m, s["max_loss_pct"], s["max_ping_ms"])
 
+    def _slow(self, ms):
+        """The worst delay of healthy ``ms`` when it is above the wanted one."""
+        good = float(self.store.settings.get("good_ping_ms") or 0)
+        delays = [m["delay"] for m in ms if m.get("delay") is not None]
+        if good <= 0 or not delays or max(delays) <= good:
+            return None
+        return max(delays)
+
     def _record(self, ms):
         for m in ms:
             self.store.record_result(self.sid, m["ip"], self.nid, self._ok(m), m.get("delay"),
@@ -2309,9 +2332,14 @@ def result_line(result, store=None):
     text = RESULT_TEXT.get(kind, kind or "?")
     if kind in ("error", "apply_failed") and result.get("message"):
         text += " — " + result["message"]
+    if kind == "unchanged" and result.get("slow"):
+        text = "IP سریع‌تری (حداقل ۲۰٪ بهتر) پیدا نشد؛ همان IP فعلی ماند"
     ips = result.get("ips") if kind in GOOD_KINDS else result.get("conflict")
+    delays = result.get("delays") or {}
     if ips:
-        text += "\n" + ", ".join(ips)
+        text += "\n" + ", ".join("%s (%.0fms)" % (ip, delays[ip])
+                                 if isinstance(delays.get(ip), (int, float)) else ip
+                                 for ip in ips)
     if store is not None and result.get("unverified") and kind in GOOD_KINDS:
         names = {n["id"]: n["name"] for n in store.networks}
         text += "\n⚠ روی %s تأیید نشده؛ با همان اینترنت اسکن کنید" % "، ".join(
@@ -2388,7 +2416,7 @@ def apply_theme(name):
     STEP_ICONS.clear()
     STEP_ICONS.update({"wait": ("○", MUTED), "run": ("●", ACCENT), "ok": ("✓", GOOD),
                        "fail": ("✕", BAD), "skip": ("–", MUTED),
-                       "hold": ("❚❚", WARN)})
+                       "hold": ("❚❚", WARN), "slow": ("⚠", WARN)})
 
 
 apply_theme("light")
@@ -2557,6 +2585,14 @@ if ui is not None:
             name = server.get("record_" + group)
             ips = store.record_ips(key) if name else []
             cells = store.cells_copy(sid)
+            good_ms = float(store.settings.get("good_ping_ms") or 0)
+
+            def slow(cell):
+                """Healthy, but slower than the delay the user wants."""
+                return (good_ms > 0 and cell_status(cell, now, window) == "ok"
+                        and isinstance(cell.get("delay"), (int, float))
+                        and cell["delay"] > good_ms)
+
             self.background_color = CARD
             self.corner_radius = 18
             self.border_width = 1.5 if group == "mobile" and name else 1
@@ -2576,7 +2612,7 @@ if ui is not None:
                 chips = []
                 for n in nets:
                     cell = (cells.get(ip) or {}).get(n["id"])
-                    fg, bg = STATE_COLORS[cell_status(cell, now, window)]
+                    fg, bg = STATE_COLORS["warn" if slow(cell) else cell_status(cell, now, window)]
                     chip = make_label("%s %s" % (n["name"], cell_text(cell, now, window)), 12,
                                       bold=True, color=fg, align="center")
                     chip.background_color = bg
@@ -2597,12 +2633,19 @@ if ui is not None:
                 health = record_health(cells, ips, ids, now, window,
                                        network_hints(store, sid, ips, ids, now, window))
                 marks = {"ok": "✓", "fail": "✕ خراب", UNKNOWN: "⚠ تأیید نشده"}
-                lines.append(" · ".join("%s %s" % (n["name"], marks[health[n["id"]]]) for n in nets))
+                slow_nets = {n["id"] for n in nets
+                             if any(slow((cells.get(ip) or {}).get(n["id"])) for ip in ips)}
+                lines.append(" · ".join(
+                    "%s %s" % (n["name"], "✓ کُند" if health[n["id"]] == "ok"
+                               and n["id"] in slow_nets else marks[health[n["id"]]])
+                    for n in nets))
                 values = set(health.values())
                 if "fail" in values:
                     state = ("fail", "خراب")
                 elif UNKNOWN in values or not values:
                     state = ("warn", "تأیید نشده")
+                elif slow_nets:
+                    state = ("warn", "کُند")
                 changed = store.record_changed_at(key)
                 if changed:
                     lines.append("آخرین تغییر: %s" % ago(changed))
@@ -2660,7 +2703,7 @@ if ui is not None:
             self.net_btn.action = lambda s: run_bg(self.app.network_menu)
             self.scan_btn = make_button("اسکن", self.tapped_scan, primary=True, size=18)
             self.scan_btn.corner_radius = 16
-            self.force_btn = make_link("اسکن کامل، حتی اگر سالم است", self.tapped_force)
+            self.force_btn = make_link("دنبال IP سریع‌تر (حتی اگر سالم است)", self.tapped_force)
             self.all_btn = make_link("همهٔ سرورها روی این اینترنت", self.tapped_all)
             self.setup = make_label("", 13, color=BAD, lines=3)
             self.empty_btn = make_button("افزودن سرور (لینک vless کانفیگ CDN)",
@@ -2870,10 +2913,13 @@ if ui is not None:
             self.stop_btn = make_button("توقف", self.tapped_stop, color=BAD)
             self.apply_btn = make_button("اعمال روی DNS", self.tapped_apply, primary=True)
             self.anyway_btn = make_button("اعمال با این وجود", self.tapped_anyway, color=BAD)
+            self.faster_btn = make_button("دنبال IP سریع‌تر", self.tapped_faster, primary=True)
             self.done_btn = make_button("بازگشت", self.tapped_done)
-            for v in (self.stop_btn, self.apply_btn, self.anyway_btn, self.done_btn):
+            for v in (self.stop_btn, self.apply_btn, self.anyway_btn, self.faster_btn,
+                      self.done_btn):
                 self.add_subview(v)
-            self.apply_btn.hidden = self.anyway_btn.hidden = self.done_btn.hidden = True
+            for b in (self.apply_btn, self.anyway_btn, self.faster_btn, self.done_btn):
+                b.hidden = True
 
         @property
         def batch(self):
@@ -2986,8 +3032,8 @@ if ui is not None:
             self.scroll.content_size = (w, y)
             by = h - bottom + 12
             if self.stop_btn.hidden:
-                visible = [b for b in (self.apply_btn, self.anyway_btn, self.done_btn)
-                           if not b.hidden]
+                visible = [b for b in (self.apply_btn, self.anyway_btn, self.faster_btn,
+                                       self.done_btn) if not b.hidden]
                 gap = 8
                 bw = (inner - gap * (len(visible) - 1)) / max(1, len(visible))
                 x = w - pad - bw
@@ -3005,7 +3051,7 @@ if ui is not None:
             symbol, color = STEP_ICONS.get(status, STEP_ICONS["wait"])
             icon.text = symbol
             icon.text_color = color
-            name.text_color = INK if status in ("run", "ok", "fail", "hold") else MUTED
+            name.text_color = INK if status in ("run", "ok", "fail", "hold", "slow") else MUTED
             self.phase_state[index] = status
             if status == "run":
                 self.phase = index
@@ -3026,7 +3072,7 @@ if ui is not None:
                 if index == self.phase:
                     self.track.hidden = self.counter.hidden = True
                 det.text = fa(detail) if detail else ("" if status != "skip" else fa("لازم نشد"))
-                det.text_color = {"fail": BAD, "hold": WARN}.get(status, MUTED)
+                det.text_color = {"fail": BAD, "hold": WARN, "slow": WARN}.get(status, MUTED)
             self.layout()
 
         @on_main_thread
@@ -3104,6 +3150,8 @@ if ui is not None:
                 kind = r.get("kind")
                 self.apply_btn.hidden = kind not in ("pending", "apply_failed")
                 self.anyway_btn.hidden = kind != "conflict" or not r.get("record")
+                # happy with "healthy" but not with its delay: scan anyway
+                self.faster_btn.hidden = kind not in ("healthy", "unchanged")
                 self._show_outcome(result_line(r, store), kind in GOOD_KINDS)
             console.hud_alert("تمام شد · %s" % clock(time.time() - self.started), "success", 1.2)
             self.layout()
@@ -3125,6 +3173,25 @@ if ui is not None:
 
         def tapped_done(self, sender):
             self.app.nav.pop_view()
+
+        def tapped_faster(self, sender):
+            """Scan again on this network, keeping the record only if nothing
+            clearly faster turns up."""
+            if self.running:
+                return
+            self.mode = "force"
+            self.result = None
+            self.summary = []
+            for b in (self.apply_btn, self.anyway_btn, self.faster_btn, self.done_btn):
+                b.hidden = True
+            self.stop_btn.hidden = False
+            self.stop_btn.enabled = True
+            self.stop_btn.title = "توقف"
+            self.outcome.hidden = True
+            self.notes.text = ""
+            self.notes.hidden = True
+            self.started = time.time()
+            self.start()
 
         def tapped_apply(self, sender):
             sender.enabled = False
@@ -3393,9 +3460,11 @@ if ui is not None:
         def edit_advanced(self):
             s = self.store.settings
             fields = [
+                text_field("good_ping_ms", "تأخیر دلخواه: کُندتر از این، دنبال بهتر بگرد (ms، ۰=خاموش)",
+                           s["good_ping_ms"], "number"),
                 text_field("max_ping_ms", "حداکثر تأخیر کانفیگ سالم (ms)", s["max_ping_ms"], "number"),
                 text_field("max_loss_pct", "حداکثر افت مجاز (٪)", s["max_loss_pct"], "number"),
-                text_field("min_gain_pct", "اسکن کامل: حداقل بهبود برای تعویض (٪)", s["min_gain_pct"], "number"),
+                text_field("min_gain_pct", "حداقل بهبود برای تعویض IP سالم (٪)", s["min_gain_pct"], "number"),
                 text_field("fresh_hours", "اعتبار نتیجهٔ هر اینترنت (ساعت)", s["fresh_hours"], "number"),
                 text_field("ttl", "TTL رکورد (ثانیه)", s["ttl"], "number"),
                 text_field("candidates", "تعداد کاندید", s["candidates"], "number"),

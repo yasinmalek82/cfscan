@@ -1171,6 +1171,36 @@ class ScanJobTests(unittest.TestCase):
         self.assertEqual(result["kind"], "applied")
         self.assertIn("1.0.0.2", FakeAPI.calls)
 
+    def test_healthy_but_slow_looks_for_a_faster_address(self):
+        store = make_store(self.tmp)
+        FakeAPI.records[DE] = ["1.0.0.9"]
+        table = {"1.0.0.9": (True, 900.0, ""), "1.0.0.2": (True, 300.0, "")}
+        job = self.job(store, "mtn", table, candidates=["1.0.0.2"])
+        result = job.run()
+        self.assertIn((0, "slow"), job.events.steps)
+        self.assertEqual((result["kind"], result["ips"]), ("applied", ["1.0.0.2"]))
+        self.assertEqual(FakeAPI.records[DE], ["1.0.0.2"])
+        self.assertIn("1.0.0.2 (300ms)", app.result_line(result, store))
+
+    def test_slow_but_nothing_clearly_faster_keeps_the_address(self):
+        store = make_store(self.tmp)
+        FakeAPI.records[DE] = ["1.0.0.9"]
+        table = {"1.0.0.9": (True, 900.0, ""), "1.0.0.2": (True, 800.0, "")}
+        result = self.job(store, "mtn", table, candidates=["1.0.0.2"]).run()
+        self.assertEqual((result["kind"], result["ips"], result["slow"]),
+                         ("unchanged", ["1.0.0.9"], 900.0))
+        line = app.result_line(result, store)
+        self.assertIn("IP سریع‌تری", line)
+        self.assertIn("1.0.0.9 (900ms)", line)
+        self.assertEqual(FakeAPI.records[DE], ["1.0.0.9"])
+
+    def test_a_fast_enough_record_is_not_scanned(self):
+        for good_ms, kind in ((1000, "healthy"), (0, "healthy"), (500, "unchanged")):
+            store = make_store(tempfile.mkdtemp(dir=self.tmp), good_ping_ms=good_ms)
+            FakeAPI.records[DE] = ["1.0.0.9"]
+            job = self.job(store, "mtn", {"1.0.0.9": (True, 900.0, "")}, candidates=[])
+            self.assertEqual(job.run()["kind"], kind, good_ms)
+
     def test_every_long_step_reports_its_progress(self):
         store = make_store(self.tmp, stop_after=2)
         FakeAPI.records[DE] = ["1.0.0.9"]

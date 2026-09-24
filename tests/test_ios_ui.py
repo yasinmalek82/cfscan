@@ -315,6 +315,39 @@ class ScanFlowTests(AppTestCase):
         view._tick()
         self.assertIn(view.step_views[2][0].text, app.SPINNER)
 
+    def test_unhappy_with_a_healthy_delay_scan_anyway(self):
+        sid = self.ready()
+        self.store.update_settings({"good_ping_ms": 0})  # the wanted delay is off
+        engine.FakeAPI.records[("cdn1.germany.example.com", "A")] = ["1.0.0.1"]
+        view = self.scan()
+        self.assertEqual(view.result["kind"], "healthy")
+        self.assertIn("1.0.0.1 (300ms)", view.outcome.text)
+        self.assertFalse(view.faster_btn.hidden)
+        view.tapped_faster(view.faster_btn)
+        deadline = time.time() + 10
+        while (view.result is None or view.running) and time.time() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.05)
+        self.assertEqual(view.mode, "force")
+        self.assertEqual((view.result["kind"], view.result["ips"]), ("applied", ["1.0.0.2"]))
+        self.assertEqual(engine.FakeAPI.records[("cdn1.germany.example.com", "A")], ["1.0.0.2"])
+        self.assertTrue(view.faster_btn.hidden)
+        self.assertFalse(view.done_btn.hidden)
+        self.assertEqual(self.store.record_ips(app.slot_key(sid, "mobile")), ["1.0.0.2"])
+
+    def test_a_slow_address_is_marked_on_its_card(self):
+        sid = self.ready()
+        self.store.update_settings({"good_ping_ms": 250})
+        self.scan()  # MCI: 1.0.0.2 at 150ms
+        self.store.record_result(sid, "1.0.0.2", "mtn", True, 480.0)
+        self.main.refresh()
+        card = self.main.cards[0]
+        self.assertEqual((card.state, card.pill.text), ("warn", "‏کُند"))
+        chips = card.rows[0][1]
+        self.assertEqual(chips[0].text_color, app.GOOD)   # MCI 150
+        self.assertEqual(chips[1].text_color, app.WARN)   # Irancell 480
+        self.assertIn("ایرانسل ✓ کُند", card.summary.text)
+
     def test_stopping_marks_the_running_step(self):
         self.ready()
         view = app.ScanView(self.app, [self.store.selected["id"]], "mci", "auto")
