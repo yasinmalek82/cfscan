@@ -34,6 +34,7 @@ import ipaddress
 import json
 import os
 import random
+import re
 import socket
 import ssl
 import statistics
@@ -699,6 +700,51 @@ def build_candidates(state, count, version, ranges, rng=random, now=None,
 class CFError(Exception):
     """Cloudflare answered, and refused (bad token, missing zone, ...)."""
 
+    def __init__(self, message, codes=()):
+        super().__init__(message)
+        self.codes = tuple(codes)
+
+
+#: Cloudflare error codes worth a plain-language explanation.
+CF_ERROR_HINTS = {
+    1000: "توکن پذیرفته نشد؛ دوباره کپی کنید (بدون فاصله و بدون کلمهٔ Bearer)",
+    6003: "هدر احراز هویت نامعتبر است؛ احتمالاً Global API Key وارد شده، نه API Token",
+    6111: "هدر احراز هویت نامعتبر است؛ احتمالاً Global API Key وارد شده، نه API Token",
+    9109: "توکن محدودیت IP دارد و از این اینترنت اجازه ندارد (Client IP Address Filtering)",
+    10000: "توکن دسترسی لازم را ندارد (Zone → DNS → Edit)",
+}
+
+
+def sanitize_token(text):
+    """The token alone, from whatever was pasted.
+
+    Drops a leading ``Bearer``, quotes, spaces, line breaks and invisible
+    characters that copying on a phone tends to add.
+    """
+    token = str(text or "").strip().strip("\"'")
+    if token.lower().startswith("bearer "):
+        token = token[7:]
+    return re.sub(r"[^A-Za-z0-9_.\-]", "", token)
+
+
+def token_problem(token):
+    """A Persian explanation when ``token`` cannot be an API token, else ''."""
+    if not token:
+        return "توکن کلادفلر در تنظیمات وارد نشده"
+    if re.fullmatch(r"[0-9a-f]{37}", token):
+        return ("این Global API Key است. از بخش API Tokens یک توکن با دسترسی "
+                "Zone → DNS → Edit بسازید و آن را وارد کنید.")
+    if len(token) < 30:
+        return "توکن کوتاه است (%d کاراکتر)؛ احتمالاً کامل کپی نشده." % len(token)
+    return ""
+
+
+def token_fingerprint(token):
+    """Enough of the token to compare with the dashboard, never all of it."""
+    if len(token) < 12:
+        return "(%d کاراکتر)" % len(token)
+    return "%s…%s (%d کاراکتر)" % (token[:5], token[-4:], len(token))
+
 
 class NetError(Exception):
     """Cloudflare could not be reached at all."""
@@ -775,12 +821,49 @@ class CloudflareAPI:
         except ValueError:
             raise CFError("HTTP %s from Cloudflare" % status)
         if not data.get("success"):
-            messages = "; ".join(str(e.get("message", "")) for e in data.get("errors") or [])
-            raise CFError(messages or "HTTP %s" % status)
+            errors = data.get("errors") or []
+            codes = [e.get("code") for e in errors if isinstance(e, dict)]
+            messages = "; ".join("%s (%s)" % (e.get("message", ""), e.get("code"))
+                                 for e in errors if isinstance(e, dict))
+            hints = [CF_ERROR_HINTS[c] for c in codes if c in CF_ERROR_HINTS]
+            if hints:
+                messages += " — " + hints[0]
+            raise CFError(messages or "HTTP %s" % status, codes)
         return data.get("result")
 
     def verify_token(self):
-        return self.call("GET", "/user/tokens/verify")
+        """The token's status, for user tokens and account tokens alike.
+
+        Account API tokens (``cfat_...``) are refused by the user endpoint
+        with code 1000 even when valid; they verify under their account.
+        """
+        try:
+            result = self.call("GET", "/user/tokens/verify") or {}
+            result["kind"] = "user"
+            return result
+        except CFError as exc:
+            if 1000 not in exc.codes:
+                raise
+            first = exc
+        try:
+            zones = self.call("GET", "/zones", {"per_page": 50}) or []
+        except CFError:
+            raise first
+        accounts = []
+        for z in zones:
+            account = (z.get("account") or {}).get("id")
+            if account and account not in accounts:
+                accounts.append(account)
+        for account in accounts:
+            try:
+                result = self.call("GET", "/accounts/%s/tokens/verify" % account) or {}
+                result["kind"] = "account"
+                return result
+            except CFError:
+                continue
+        if zones:
+            return {"status": "active", "kind": "account"}
+        raise first
 
     def public_ranges(self):
         result = self.call("GET", "/ips")
@@ -821,9 +904,10 @@ class CloudflareAPI:
 
 def _api_attempts(store, via_ips, api_factory):
     """API clients to try: direct first, then through up to three clean IPs."""
-    token = store.secrets.get()
-    if not token:
-        raise CFError("توکن کلادفلر در تنظیمات وارد نشده")
+    token = sanitize_token(store.secrets.get())
+    problem = token_problem(token)
+    if problem:
+        raise CFError(problem)
     yield api_factory(token)
     for ip in list(via_ips)[:3]:
         yield api_factory(token, via_ip=ip)
@@ -1809,7 +1893,8 @@ if ui is not None:
             values = dialogs.form_dialog("تنظیمات", sections=sections, done_button_title="ذخیره")
             if values is None:
                 return
-            token = (values.pop("token", "") or "").strip()
+            raw_token = (values.pop("token", "") or "").strip()
+            token = "-" if raw_token == "-" else sanitize_token(raw_token)
             values["ip_version"] = 6 if values.get("ip_version") else 4
             values["path"] = normalise_path(values.get("path"))
             values["sni"] = normalise_host(values.get("sni"))
@@ -2034,16 +2119,18 @@ if ui is not None:
             self._apply_manual(target_pid, [ip], "manual")
 
         def test_cloudflare(self):
-            token = self.store.secrets.get()
-            if not token:
-                alert("کلادفلر", "توکن وارد نشده.")
+            token = sanitize_token(self.store.secrets.get())
+            problem = token_problem(token)
+            if problem:
+                alert("کلادفلر", problem)
                 return
             console.show_activity()
-            lines = []
+            lines = ["توکن ذخیره‌شده: %s" % token_fingerprint(token)]
             try:
                 try:
                     info, via = with_api(self.store, [], lambda api: api.verify_token())
-                    lines.append("توکن: %s" % (info or {}).get("status", "?"))
+                    kind = "توکن حساب" if (info or {}).get("kind") == "account" else "توکن کاربر"
+                    lines.append("وضعیت: %s (%s)" % ((info or {}).get("status", "?"), kind))
                 except (CFError, NetError) as exc:
                     lines.append("توکن: خطا (%s)" % exc)
                     alert("تست کلادفلر", "\n".join(lines))

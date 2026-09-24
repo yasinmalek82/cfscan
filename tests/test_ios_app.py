@@ -28,8 +28,11 @@ _LOG_DIR = tempfile.mkdtemp()
 app.LOG_PATH = os.path.join(_LOG_DIR, "cfscan_ios_log.txt")
 
 
+TEST_TOKEN = "Ab3dEf6hIj9lMn2pQr5tUv8xYz1bCd4fGh7jKl0n"
+
+
 class MemorySecrets:
-    def __init__(self, token="tok"):
+    def __init__(self, token=TEST_TOKEN):
         self.token = token
 
     def get(self):
@@ -39,7 +42,7 @@ class MemorySecrets:
         self.token = token
 
 
-def make_store(tmp, token="tok", **settings):
+def make_store(tmp, token=TEST_TOKEN, **settings):
     store = app.Store(os.path.join(tmp, "data.json"), secrets=MemorySecrets(token))
     base = {"sni": "cdn.example.test", "path": "/ws", "auto_apply": True,
             "verify_attempts": 3, "verify_top": 3, "stop_after": 0, "timeout": 0.5}
@@ -164,6 +167,57 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(app.ago(100, now=130), "همین الان")
         self.assertEqual(app.ago(0.5, now=7200.5), "2 ساعت پیش")
         self.assertEqual(app.parse_colos(" fra, AMS  muc"), {"FRA", "AMS", "MUC"})
+
+
+class TokenTests(unittest.TestCase):
+    def test_pasted_tokens_are_cleaned(self):
+        tok = "cfat_" + "A1b2C3d4" * 5
+        for pasted in (tok, " %s \n" % tok, "Bearer " + tok, '"%s"' % tok,
+                       tok[:10] + "\u200b" + tok[10:], tok[:10] + "\u00a0" + tok[10:]):
+            self.assertEqual(app.sanitize_token(pasted), tok, repr(pasted))
+
+    def test_global_key_and_short_tokens_are_explained(self):
+        self.assertIn("Global API Key", app.token_problem("0123456789abcdef0123456789abcdef01234"))
+        self.assertIn("کوتاه", app.token_problem("abc"))
+        self.assertEqual(app.token_problem("x" * 40), "")
+        self.assertNotIn("A1b2C3d4" * 3, app.token_fingerprint("cfat_" + "A1b2C3d4" * 5))
+
+    def test_an_account_token_verifies_under_its_account(self):
+        calls = []
+
+        class API(app.CloudflareAPI):
+            def call(self, method, path, query=None, body=None):
+                calls.append(path)
+                if path == "/user/tokens/verify":
+                    raise app.CFError("Invalid API Token (1000)", [1000])
+                if path == "/zones":
+                    return [{"id": "z1", "account": {"id": "acc1"}}]
+                if path == "/accounts/acc1/tokens/verify":
+                    return {"status": "active"}
+                raise AssertionError(path)
+
+        info = API("t").verify_token()
+        self.assertEqual((info["status"], info["kind"]), ("active", "account"))
+        self.assertEqual(calls, ["/user/tokens/verify", "/zones", "/accounts/acc1/tokens/verify"])
+
+    def test_a_really_invalid_token_still_fails(self):
+        class API(app.CloudflareAPI):
+            def call(self, method, path, query=None, body=None):
+                raise app.CFError("Invalid API Token (1000)", [1000])
+
+        with self.assertRaises(app.CFError):
+            API("t").verify_token()
+
+    def test_other_refusals_are_not_retried(self):
+        class API(app.CloudflareAPI):
+            def call(self, method, path, query=None, body=None):
+                if path != "/user/tokens/verify":
+                    raise AssertionError(path)
+                raise app.CFError("Cannot use the access token from location (9109)", [9109])
+
+        with self.assertRaises(app.CFError) as ctx:
+            API("t").verify_token()
+        self.assertEqual(ctx.exception.codes, (9109,))
 
 
 # ------------------------------------------------------------------ real sockets
