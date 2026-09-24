@@ -23,6 +23,9 @@ _PATH = Path(__file__).resolve().parent.parent / "ios" / "cfscan_ios.py"
 _spec = importlib.util.spec_from_file_location("cfscan_ios", _PATH)
 app = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(app)
+# The app logs next to itself; keep test runs out of the source tree.
+_LOG_DIR = tempfile.mkdtemp()
+app.LOG_PATH = os.path.join(_LOG_DIR, "cfscan_ios_log.txt")
 
 
 class MemorySecrets:

@@ -16,3 +16,9 @@ dist/
 # Scanner output that lands in the project folder when cfst is run from here.
 # Real results belong in ~/Documents/Cloudflare Scanner Results/.
 result.csv
+
+# Files the iPhone app writes next to itself
+ios/cfscan_ios_data.json
+ios/cfscan_ios_data.json.tmp
+ios/cfscan_ios_log.txt
+ios/smoke_log.txt
