@@ -686,6 +686,14 @@ class ProbeSocketTests(unittest.TestCase):
         self.assertEqual((version, user, cmd, host, port),
                          (0, VLESS_UUID, 1, app.DELAY_TEST_HOST, 80))
         self.assertTrue(request.startswith(b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com"))
+        # where the time went: every part measured, adding up to the whole
+        for part in ("tcp", "tls", "ws", "tunnel"):
+            self.assertGreaterEqual(r[part], 0, part)
+        self.assertAlmostEqual(r["tcp"] + r["tls"] + r["ws"] + r["tunnel"], r["total"], places=3)
+        m = app.measure("127.0.0.1", target, self.client_ctx(), 3, 3, True, pause=0)
+        self.assertEqual(m["ok"], 3)
+        for key in ("ping", "tls_ms", "ws_ms", "tunnel_ms"):
+            self.assertIsNotNone(m[key], key)
 
     def test_a_wrong_uuid_fails_after_the_upgrade(self):
         target = app.Target("cdn.example.test", "/ws", self.server.port, True,
@@ -712,6 +720,75 @@ class ProbeSocketTests(unittest.TestCase):
 
 
 # ------------------------------------------------------------------ robustness
+
+class DiagnoseTests(unittest.TestCase):
+    """Where a slow full delay comes from, from its parts (all ms)."""
+
+    def m(self, ping, tls, ws, tunnel):
+        return {"ping": ping, "tls_ms": tls, "ws_ms": ws, "tunnel_ms": tunnel,
+                "delay": ping + tls + ws + tunnel}
+
+    def test_the_first_line_compares_with_the_clients_ping(self):
+        lines = app.diagnose(self.m(160, 170, 330, 260))
+        self.assertIn("پینگ (یک رفت‌وبرگشت تا کلادفلر، مثل پینگ Happ): 160ms", lines[0])
+        self.assertIn("تأخیر کامل: 920ms", lines[0])
+        self.assertIn("TLS 170 · CF→سرور 330 · تونل 260", lines[1])
+
+    def test_each_slow_part_gets_its_cause(self):
+        self.assertIn("TLS کُند", app.diagnose(self.m(100, 600, 150, 150))[2])
+        self.assertIn("کلادفلر تا سرور", app.diagnose(self.m(100, 110, 600, 150))[2])
+        self.assertIn("DNS خود سرور", app.diagnose(self.m(100, 110, 150, 600))[2])
+        self.assertIn("رفت‌وبرگشت", app.diagnose(self.m(160, 170, 300, 250))[2])
+
+    def test_a_non_standard_port_points_at_the_port_test(self):
+        self.assertIn("تست پورت‌های کلادفلر", app.diagnose(self.m(160, 170, 300, 250), 2053)[-1])
+        self.assertNotIn("تست پورت", " ".join(app.diagnose(self.m(160, 170, 300, 250), 443)))
+
+    def test_nothing_measured_nothing_said(self):
+        self.assertEqual(app.diagnose({"ping": None, "delay": None}), [])
+
+
+class PortTests(unittest.TestCase):
+    def test_every_cloudflare_port_is_tried_and_the_faster_one_advised(self):
+        seen = []
+
+        def probe(ip, target, ctx, timeout):
+            seen.append(target.port)
+            total = 200.0 if target.port == 443 else 600.0
+            return {"ip": ip, "ok": True, "tcp": 80.0, "total": total, "tls": 60.0,
+                    "status": 200, "colo": "FRA", "loc": "IR", "client": "", "error": ""}
+
+        target = app.Target("germany.example.test", "/ws", 2053, True)
+        results = app.port_test("104.16.0.1", target, ctx_factory=lambda: None, probe=probe,
+                                attempts=3)
+        self.assertEqual([r["port"] for r in results], list(app.CF_HTTPS_PORTS))
+        self.assertEqual(set(seen), set(app.CF_HTTPS_PORTS))
+        advice = "\n".join(app.port_advice(results, 2053, "germany.example.test"))
+        self.assertIn("2053: 600ms (اتصال 80) · افت 0%  ← کانفیگ فعلی", advice)
+        self.assertIn("پورت 443 حدود 67% سریع‌تر از پورت 2053", advice)
+        self.assertIn("Hostname equals germany.example.test", advice)
+        self.assertIn("Rewrite to 2053", advice)
+
+    def test_no_clear_gain_means_the_port_is_fine(self):
+        results = [{"port": p, "delay": 300.0 + (p % 7), "ping": 90.0, "loss": 0.0, "jitter": 3}
+                   for p in app.CF_HTTPS_PORTS]
+        self.assertIn("پورت 2053 مشکلی ندارد", app.port_advice(results, 2053)[-1])
+
+    def test_a_dead_port_is_named(self):
+        results = [{"port": p, "delay": None if p == 2053 else 300.0, "ping": 90.0,
+                    "loss": 100.0 if p == 2053 else 0.0, "jitter": 0}
+                   for p in app.CF_HTTPS_PORTS]
+        advice = app.port_advice(results, 2053)
+        self.assertIn("2053: جواب نداد  ← کانفیگ فعلی", advice)
+        self.assertIn("پورت 2053 روی این اینترنت جواب نمی‌دهد", "\n".join(advice))
+
+    def test_plain_http_configs_use_the_http_ports(self):
+        target = app.Target("germany.example.test", "/ws", 8080, False)
+        ports = []
+        app.port_test("104.16.0.1", target, ctx_factory=lambda: None, attempts=2,
+                      probe=lambda ip, t, c, to: ports.append(t.port) or app._blank_result(ip))
+        self.assertEqual(sorted(set(ports)), sorted(app.CF_HTTP_PORTS))
+
 
 class RobustnessTests(unittest.TestCase):
     def setUp(self):
@@ -1181,7 +1258,7 @@ class ScanJobTests(unittest.TestCase):
         self.assertIn((0, "slow"), job.events.steps)
         self.assertEqual((result["kind"], result["ips"]), ("applied", ["1.0.0.2"]))
         self.assertEqual(FakeAPI.records[DE], ["1.0.0.2"])
-        self.assertIn("1.0.0.2 (300ms)", app.result_line(result, store))
+        self.assertIn("1.0.0.2 (پینگ 100 · کامل 300ms)", app.result_line(result, store))
 
     def test_slow_but_nothing_clearly_faster_keeps_the_address(self):
         store = make_store(self.tmp)
@@ -1192,8 +1269,36 @@ class ScanJobTests(unittest.TestCase):
                          ("unchanged", ["1.0.0.9"], 900.0))
         line = app.result_line(result, store)
         self.assertIn("IP سریع‌تری", line)
-        self.assertIn("1.0.0.9 (900ms)", line)
+        self.assertIn("1.0.0.9 (پینگ 300 · کامل 900ms)", line)
         self.assertEqual(FakeAPI.records[DE], ["1.0.0.9"])
+
+    def test_slow_again_soon_after_nothing_faster_is_not_rescanned(self):
+        store = make_store(self.tmp)
+        FakeAPI.records[DE] = ["1.0.0.9"]
+        table = {"1.0.0.9": (True, 900.0, ""), "1.0.0.2": (True, 800.0, "")}
+        first = self.job(store, "mtn", table, candidates=["1.0.0.2"]).run()
+        self.assertEqual(first["kind"], "unchanged")
+        self.assertTrue(store.best_checked("s1:mobile", "mtn", 3600))
+        again = self.job(store, "mtn", table, candidates=["1.0.0.2"])
+        self.assertEqual(again.run()["kind"], "healthy")          # no five-minute rescan
+        self.assertIn((0, "ok"), again.events.steps)
+        forced = self.job(store, "mtn", table, candidates=["1.0.0.2"], mode="force")
+        self.assertEqual(forced.run()["kind"], "unchanged")       # the button still scans
+        self.assertFalse(store.best_checked("s1:mobile", "mci", 3600))  # per network
+        store.set_record_ips("s1:mobile", ["1.0.0.2"])            # a change forgets it
+        self.assertFalse(store.best_checked("s1:mobile", "mtn", 3600))
+
+    def test_a_scan_explains_its_numbers(self):
+        store = make_store(self.tmp)
+        job = self.job(store, "mci", {"1.0.0.2": (True, 300.0, "")})
+        result = job.run()
+        self.assertTrue(result["diagnosis"][0].startswith("پینگ"))
+        self.assertTrue(any(n.startswith("چرا این عدد؟ (1.0.0.2)") for n in job.events.notes))
+        cell = store.cells("s1")["1.0.0.2"]["mci"]
+        self.assertEqual((cell["ping"], cell["delay"]), (100.0, 300.0))
+        self.assertEqual(app.cell_text(cell, time.time(), 3600), "100/300")
+        restored = app.normalise_data(json.loads(json.dumps(store.data)))
+        self.assertEqual(restored["matrix"]["s1"]["1.0.0.2"]["mci"]["ping"], 100.0)
 
     def test_a_fast_enough_record_is_not_scanned(self):
         for good_ms, kind in ((1000, "healthy"), (0, "healthy"), (500, "unchanged")):

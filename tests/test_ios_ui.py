@@ -83,6 +83,10 @@ class AppTestCase(unittest.TestCase):
                                "1.0.0.9": (True, 90.0, "FRA")},
                        "home": {"1.0.0.7": (True, 60.0, "FRA")}}
         self.patch(app, "run_bg", lambda fn, *a: fn(*a))
+        # the port test would reach Cloudflare; answer like 443 is faster
+        self.patch(app, "port_test", lambda ip, target, **kw: [
+            {"port": p, "delay": 200.0 if p == 443 else 400.0, "ping": 80.0, "loss": 0.0,
+             "jitter": 5.0} for p in app.CF_HTTPS_PORTS])
         self.forms = []
         self.patch(fake["ui"], "MODAL_HOOK", self.fill_form)
         self.patch(app, "detect_connection", lambda timeout=6.0: dict(self.conn))
@@ -256,7 +260,7 @@ class ScanFlowTests(AppTestCase):
         card.frame = (0, 0, 358, card.height_needed)
         card.layout()
         chips = [chip.text for chip in card.rows[0][1]]
-        self.assertEqual(chips, ["‏همراه اول 300", "‏ایرانسل 200"])
+        self.assertEqual(chips, ["‏همراه اول 100/300", "‏ایرانسل 67/200"])  # ping/full
         self.assertIn("همراه اول ✓ · ایرانسل ✓", card.summary.text)
         self.assertEqual((card.state, card.pill.text), ("ok", "‏سالم"))
         self.assertEqual(self.main.cards[1].pill.text, "‏اختیاری")
@@ -336,7 +340,7 @@ class ScanFlowTests(AppTestCase):
         self.assertIn("cdn1.germany.example.com", details[3])
         self.assertTrue(view.track.hidden and view.counter.hidden)  # nothing running
         self.assertRegex(view.clock_label.text, r"^\d+:\d\d$")
-        self.assertIn("تأخیر کانفیگ", view.table_title.text)
+        self.assertIn("تأخیر کامل کانفیگ", view.table_title.text)
         self.assertFalse(view.list_card.hidden)
         for i, (icon, name, detail) in enumerate(view.step_views[:-1]):
             below = view.step_views[i + 1][1]
@@ -367,7 +371,7 @@ class ScanFlowTests(AppTestCase):
         engine.FakeAPI.records[("cdn1.germany.example.com", "A")] = ["1.0.0.1"]
         view = self.scan()
         self.assertEqual(view.result["kind"], "healthy")
-        self.assertIn("1.0.0.1 (300ms)", view.outcome.text)
+        self.assertIn("1.0.0.1 (پینگ 100 · کامل 300ms)", view.outcome.text)
         self.assertFalse(view.faster_btn.hidden)
         view.tapped_faster(view.faster_btn)
         deadline = time.time() + 10
@@ -417,7 +421,7 @@ class ScanFlowTests(AppTestCase):
                          ["212ms", "640ms", "✕ جواب نداد", "در حال تست…", "در صف"])
         self.assertEqual([r.right.text_color for r in rows[:4]],
                          [app.GOOD, app.WARN, app.BAD, app.ACCENT])
-        self.assertIn("نوسان ±9 · افت 0% · FRA", rows[0].detail.text)
+        self.assertIn("±9 · FRA", rows[0].detail.text)
         self.assertIn("timeout", rows[2].detail.text)
         self.assertIn("تست اصلی", view.table_title.text)
         for i, r in enumerate(rows):  # stacked, inside the card, nothing overlapping
@@ -540,12 +544,12 @@ class MenuTests(AppTestCase):
         items = None
         # what each tool asks: an IP to test, IPs to set, a confirmation...
         alerts = {2: ["1.0.0.2", 1], 3: ["1.0.0.2"], 4: [1], 8: [1]}
-        for index in range(12):
+        for index in range(13):
             fake["dialogs"].LOG[:] = []
             self.answer(index, alerts=alerts.get(index, [1]))
             self.app.open_tools()
             items = items or fake["dialogs"].LOG[0][2]
-        self.assertEqual(len(items), 12)
+        self.assertEqual(len(items), 13)
         errors = [line for line in Path(app.LOG_PATH).read_text().splitlines()
                   if "failed" in line and "flow" in line]
         self.assertEqual(errors, [])
@@ -634,7 +638,8 @@ class MenuTests(AppTestCase):
 class LayoutTests(AppTestCase):
     def test_server_line_says_how_it_is_tested(self):
         sid = self.ready()
-        self.assertIn("germany.example.com · تأخیر کانفیگ ✓", self.main.server_info.text)
+        self.assertIn("germany.example.com · تأخیر کامل کانفیگ (real delay) ✓",
+                      self.main.server_info.text)
         self.store.set_uuid(sid, "")
         self.main.refresh()
         self.assertIn("لینک کانفیگ را اضافه کنید", self.main.server_info.text)
@@ -677,6 +682,50 @@ class LayoutTests(AppTestCase):
             for fg, bg in pairs:
                 ratio = contrast(palette[fg], palette[bg])
                 self.assertGreaterEqual(ratio, 4.5, "%s: %s on %s is %.2f" % (theme, fg, bg, ratio))
+
+    def test_dark_mode_has_no_dark_text(self):
+        """Every label on every screen takes its colour from the dark palette
+        (a colour fixed when the module loaded would be black on black)."""
+        self.addCleanup(app.apply_theme, "light")
+        self.patch(fake["ui"], "get_ui_style", lambda: "dark")
+        sid = self.ready()
+        view = self.scan()
+        forms = []
+        self.patch(fake["ui"], "MODAL_HOOK", lambda v: (forms.append(v), v.cancel()))
+        self.app.edit_server(sid)
+        self.app.edit_advanced()
+        dark = set(app.PALETTES["dark"].values())
+        light_only = set(app.PALETTES["light"].values()) - dark
+
+        def labels(v):
+            for sub in getattr(v, "subviews", []):
+                if isinstance(sub, fake["ui"].Label):
+                    yield sub
+                yield from labels(sub)
+
+        screens = [self.main, view] + forms
+        for screen in screens:
+            for label in labels(screen):
+                self.assertNotIn(label.text_color, light_only, (type(screen).__name__, label.text))
+        self.assertEqual(self.app.nav.title_color, app.PALETTES["dark"]["INK"])
+
+    def test_a_long_server_name_gets_two_lines(self):
+        sid = self.ready()
+        self.store.save_server(sid, dict(self.store.server(sid), name="germany-long.example.com"))
+        view = self.scan()
+        self.assertEqual(view.server_label.number_of_lines, 2)
+        self.assertGreater(view.server_label.height, 22)
+        self.assertGreaterEqual(view.record_label.y, view.server_label.y + view.server_label.height)
+
+    def test_the_port_tool_advises_a_faster_port(self):
+        sid = self.ready()
+        self.scan()
+        self.store.save_server(sid, dict(self.store.server(sid), port=2053))
+        self.app.test_ports(sid)
+        title, text = self.alerts()[-1][1], self.alerts()[-1][2]
+        self.assertTrue(title.startswith("پورت‌ها · "))
+        self.assertIn("پورت 443", text)
+        self.assertIn("Rewrite to 2053", text)
 
     def test_every_palette_has_every_colour(self):
         light, dark = app.PALETTES["light"], app.PALETTES["dark"]

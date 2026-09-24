@@ -70,7 +70,7 @@ except ImportError:
         return fn
 
 APP_NAME = "CF Scanner"
-APP_VERSION = "5.1"
+APP_VERSION = "5.2"
 
 try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -318,9 +318,13 @@ def _cell(raw):
         delay = None
     ts = raw.get("ts", 0)
     colo = raw.get("colo", "")
-    return {"ok": bool(raw.get("ok")), "delay": delay,
+    cell = {"ok": bool(raw.get("ok")), "delay": delay,
             "colo": colo if isinstance(colo, str) else "",
             "ts": ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0}
+    ping = raw.get("ping") if "delay" in raw else None  # old files had "ping" = delay
+    if isinstance(ping, (int, float)) and not isinstance(ping, bool) and ping >= 0:
+        cell["ping"] = ping
+    return cell
 
 
 def _as_dict(value):
@@ -330,6 +334,10 @@ def _as_dict(value):
 def _as_list(value):
     return value if isinstance(value, list) else []
 
+
+#: After a full scan found nothing clearly faster, a slow-but-healthy record is
+#: not scanned again automatically for this long.
+BEST_CHECK_S = 12 * 3600
 
 #: A full sweep of a network is reused (its answering addresses only) this long.
 SWEEP_REUSE_S = 20 * 60
@@ -460,6 +468,10 @@ def normalise_data(raw):
             records[target] = {"ips": [str(ip) for ip in _as_list(entry.get("ips"))
                                        if isinstance(ip, str) and ip],
                                "ts": ts if isinstance(ts, (int, float)) else 0}
+            checked = {str(n): t for n, t in _as_dict(entry.get("checked")).items()
+                       if isinstance(t, (int, float)) and not isinstance(t, bool)}
+            if checked:
+                records[target]["checked"] = checked
     history = []
     for h in _as_list(raw.get("history")):
         if not isinstance(h, dict):
@@ -757,11 +769,14 @@ class Store:
         with self.lock:
             return copy.deepcopy(self.data["matrix"].get(sid) or {})
 
-    def record_result(self, sid, ip, nid, ok, delay=None, colo="", ts=None):
+    def record_result(self, sid, ip, nid, ok, delay=None, colo="", ts=None, ping=None):
         with self.lock:
             table = self.cells(sid)
-            table.setdefault(ip, {})[nid] = {"ok": bool(ok), "delay": delay, "colo": colo or "",
-                                             "ts": time.time() if ts is None else ts}
+            cell = {"ok": bool(ok), "delay": delay, "colo": colo or "",
+                    "ts": time.time() if ts is None else ts}
+            if ping is not None:
+                cell["ping"] = ping  # one round trip to Cloudflare, as clients show it
+            table.setdefault(ip, {})[nid] = cell
             if ok:
                 self.data["bad"].get(nid, {}).pop(ip, None)
             if len(table) > MATRIX_LIMIT:
@@ -809,6 +824,17 @@ class Store:
 
     def record_changed_at(self, key):
         return (self.data["records"].get(key) or {}).get("ts")
+
+    def best_checked(self, key, nid, max_age_s):
+        """True when a full scan on ``nid`` lately found nothing clearly better
+        than what the record holds now (a record change forgets it)."""
+        ts = ((self.data["records"].get(key) or {}).get("checked") or {}).get(nid)
+        return isinstance(ts, (int, float)) and time.time() - ts < max_age_s
+
+    def mark_best_checked(self, key, nid):
+        with self.lock:
+            entry = self.data["records"].setdefault(key, {"ips": [], "ts": 0})
+            entry.setdefault("checked", {})[nid] = time.time()
 
     def set_record_ips(self, key, ips):
         with self.lock:
@@ -1010,8 +1036,12 @@ def parse_trace(data):
 
 
 def _blank_result(ip):
-    return {"ip": ip, "ok": False, "tcp": None, "total": None, "status": None,
-            "colo": "", "loc": "", "client": "", "error": ""}
+    return {"ip": ip, "ok": False, "tcp": None, "tls": None, "ws": None, "tunnel": None,
+            "total": None, "status": None, "colo": "", "loc": "", "client": "", "error": ""}
+
+
+def _since(start):
+    return (time.perf_counter() - start) * 1000
 
 
 def trace_probe(ip, target, ctx, timeout):
@@ -1024,6 +1054,7 @@ def trace_probe(ip, target, ctx, timeout):
     sock = None
     try:
         sock, start, r["tcp"] = _connect(ip, target, ctx, timeout)
+        r["tls"] = _since(start) - r["tcp"]  # the handshake (0 without TLS)
         request = ("GET /cdn-cgi/trace HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
                    "Accept: */*\r\nConnection: close\r\n\r\n" % (target.host, USER_AGENT))
         sock.sendall(request.encode("ascii"))
@@ -1131,12 +1162,15 @@ def ws_probe(ip, target, ctx, timeout):
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     try:
         sock, start, r["tcp"] = _connect(ip, target, ctx, timeout)
+        r["tls"] = _since(start) - r["tcp"]  # the handshake (0 without TLS)
         request = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
                    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                    "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
                    % (target.path or "/", target.host, USER_AGENT, key))
         sock.sendall(request.encode("ascii"))
         data = _read(sock, until_head=True)
+        upgraded = _since(start)
+        r["ws"] = upgraded - r["tcp"] - r["tls"]  # to Cloudflare, on to the server, back
         r["status"] = parse_status(data)
         if r["status"] != 101:
             r["total"] = (time.perf_counter() - start) * 1000
@@ -1147,7 +1181,8 @@ def ws_probe(ip, target, ctx, timeout):
         else:
             pending = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
             status = _vless_exchange(sock, pending, target)
-            r["total"] = (time.perf_counter() - start) * 1000
+            r["total"] = _since(start)
+            r["tunnel"] = r["total"] - upgraded  # a request through the tunnel
             r["status"] = status
             r["ok"] = status is not None and 200 <= status < 400
             if not r["ok"]:
@@ -1186,7 +1221,9 @@ def measure(ip, target, ctx, attempts, timeout, use_ws, cancel=None, pause=0.15,
             probe_trace=trace_probe, probe_ws=ws_probe, warmup=False, fail_fast=2):
     """``attempts`` sequential probes of one address, summarised.
 
-    ``delay`` is the median time of a whole probe - with a VLESS target the
+    ``ping`` (the median TCP connect, one round trip to Cloudflare) is what
+    clients such as Happ show as "ping"; ``tls_ms``/``ws_ms``/``tunnel_ms``
+    split the rest. ``delay`` is the median time of a whole probe - with a VLESS target the
     client's "real delay"; ``ping`` the median TCP connect. ``warmup``
     first makes one probe whose time is not counted: on a phone the first
     packets wake the radio and would count 50-200 ms that no later request
@@ -1196,6 +1233,7 @@ def measure(ip, target, ctx, attempts, timeout, use_ws, cancel=None, pause=0.15,
     """
     probe = probe_ws if use_ws else probe_trace
     tcp, total, errors = [], [], []
+    parts = {"tls": [], "ws": [], "tunnel": []}
     colo = ""
     if warmup and not (cancel is not None and cancel.is_set()):
         r = _safe_probe(probe, ip, target, ctx, timeout)
@@ -1212,6 +1250,9 @@ def measure(ip, target, ctx, attempts, timeout, use_ws, cancel=None, pause=0.15,
         if r["ok"]:
             tcp.append(r["tcp"])
             total.append(r["total"])
+            for key, values in parts.items():
+                if r.get(key) is not None:
+                    values.append(r[key])
             colo = r.get("colo") or colo
         else:
             errors.append(r["error"])
@@ -1225,6 +1266,11 @@ def measure(ip, target, ctx, attempts, timeout, use_ws, cancel=None, pause=0.15,
         "total": statistics.median(total) if total else None,
         "delay": statistics.median(total) if total else None,
         "jitter": successive_jitter_ms(total),
+        # where the time goes: the TLS handshake, the WebSocket upgrade
+        # (Cloudflare -> the server -> back) and one request in the tunnel
+        "tls_ms": statistics.median(parts["tls"]) if parts["tls"] else None,
+        "ws_ms": statistics.median(parts["ws"]) if parts["ws"] else None,
+        "tunnel_ms": statistics.median(parts["tunnel"]) if parts["tunnel"] else None,
         "colo": colo, "errors": errors,
     }
 
@@ -1234,6 +1280,102 @@ def score(m):
     if m.get("delay") is None:
         return float("inf")
     return m["delay"] + 2 * (m.get("jitter") or 0) + 50 * m.get("loss", 100)
+
+
+#: Cloudflare's HTTPS ports; any of them reaches the same edge.
+CF_HTTPS_PORTS = (443, 2053, 2083, 2087, 2096, 8443)
+
+
+def diagnose(m, port=443):
+    """Where a measured address's time goes, in plain Persian lines.
+
+    The full delay is a new connection: TCP (one round trip to Cloudflare -
+    what Happ shows as ping), TLS, the WebSocket upgrade (Cloudflare opens
+    the way to the server) and one request through the tunnel. Each part
+    beyond its own round trip points at a different cause.
+    """
+    rtt, tls, ws, tunnel = m.get("ping"), m.get("tls_ms"), m.get("ws_ms"), m.get("tunnel_ms")
+    if rtt is None or m.get("delay") is None:
+        return []
+    lines = ["پینگ (یک رفت‌وبرگشت تا کلادفلر، مثل پینگ Happ): %.0fms · تأخیر کامل: %.0fms"
+             % (rtt, m["delay"])]
+    parts = [("TLS", tls), ("CF→سرور", ws), ("تونل", tunnel)]
+    known = [(name, v) for name, v in parts if v is not None]
+    if known:
+        lines.append("تقسیم: اتصال %.0f · %s" % (rtt, " · ".join("%s %.0f" % kv for kv in known)))
+    causes = []
+    if tls is not None and tls > max(2.5 * rtt, rtt + 150):
+        causes.append("TLS کُند است (%.0fms)؛ فیلترینگ دست‌دادن TLS را کُند می‌کند. اگر روی همهٔ "
+                      "IPها همین است، دامنهٔ CDN (SNI) روی این اینترنت محدود شده." % tls)
+    if ws is not None and ws - rtt > 250:
+        causes.append("مسیر کلادفلر تا سرور کُند است (%.0fms بیشتر از پینگ). این برای همهٔ IPها "
+                      "یکی است و با عوض کردن IP بهتر نمی‌شود: SSL mode (Flexible/Full)، پورت "
+                      "مبدأ، شلوغی یا دوری سرور را بررسی کنید." % (ws - rtt))
+    if tunnel is not None and tunnel - rtt > 250:
+        causes.append("درخواست داخل تونل کُند است (%.0fms بیشتر از پینگ): اینترنت یا DNS خود سرور "
+                      "(بخش dns و outbound در Xray) را بررسی کنید." % (tunnel - rtt))
+    if not causes:
+        causes.append("بیشتر زمان، رفت‌وبرگشت‌های تا کلادفلر است (هر اتصال جدید حدود ۴ تا). فقط "
+                      "IP یا دیتاسنتر نزدیک‌تر کمکش می‌کند.")
+    if port not in (443, 80):
+        causes.append("پورت کانفیگ %d است؛ «ابزارها ← تست پورت‌های کلادفلر» آن را با 443 و "
+                      "بقیه مقایسه می‌کند." % port)
+    return lines + causes
+
+
+#: Cloudflare's plain-HTTP ports, for a config without TLS.
+CF_HTTP_PORTS = (80, 8080, 8880, 2052, 2082, 2086, 2095)
+
+
+def port_test(ip, target, ctx_factory=make_context, probe=trace_probe, attempts=5, timeout=3.0,
+              cancel=None):
+    """The same address on each of Cloudflare's ports (``/cdn-cgi/trace``).
+
+    Only the phone -> Cloudflare part is compared, which is where an ISP
+    slows a port down; Cloudflare reaches the server the same way.
+    """
+    ports = CF_HTTPS_PORTS if target.tls else CF_HTTP_PORTS
+    out = []
+    for port in ports:
+        if cancel is not None and cancel.is_set():
+            break
+        t = Target(target.sni, target.path, port, target.tls, target.host)
+        m = measure(ip, t, ctx_factory(), attempts, timeout, False, probe_trace=probe,
+                    warmup=True, cancel=cancel)
+        out.append(dict(m, port=port))
+    return out
+
+
+def port_advice(results, current, sni=""):
+    """Persian lines: each port's time, then what to do about the config's."""
+    lines = []
+    for r in results:
+        mark = "  ← کانفیگ فعلی" if r["port"] == current else ""
+        if r.get("delay") is None:
+            lines.append("%d: جواب نداد%s" % (r["port"], mark))
+        else:
+            lines.append("%d: %.0fms (اتصال %.0f) · افت %.0f%%%s"
+                         % (r["port"], r["delay"], r["ping"] or 0, r["loss"], mark))
+    working = [r for r in results if r.get("delay") is not None and r["loss"] < 50]
+    if not working:
+        return lines + ["", "هیچ پورتی جواب نداد؛ IP یا اینترنت را بررسی کنید."]
+    best = min(working, key=score)
+    mine = next((r for r in results if r["port"] == current), None)
+    mine_ok = mine is not None and mine.get("delay") is not None and mine["loss"] < 50
+    if mine_ok and (best["port"] == current or best["delay"] > mine["delay"] * 0.8):
+        return lines + ["", "پورت %d مشکلی ندارد (پورت دیگری واضحاً سریع‌تر نیست)؛ کُندی از جای "
+                            "دیگری است. «چرا این عدد؟» در صفحهٔ اسکن را ببینید." % current]
+    why = ("پورت %d روی این اینترنت جواب نمی‌دهد یا افت دارد." % current if not mine_ok else
+           "پورت %d حدود %.0f%% سریع‌تر از پورت %d است."
+           % (best["port"], 100 * (1 - best["delay"] / mine["delay"]), current))
+    return lines + [
+        "", why,
+        "برای استفاده از پورت %d:" % best["port"],
+        "۱. در پنل، پورت هاست/کانفیگ CDN را %d کنید." % best["port"],
+        "۲. کلادفلر روی همان پورت به سرور وصل می‌شود. یا اینباند Xray را روی %d بگذارید، یا در "
+        "کلادفلر: Rules ← Origin Rules ← Create rule ← Hostname equals %s ← Destination Port: "
+        "Rewrite to %d (پورت فعلی اینباند)." % (best["port"], sni or "دامنهٔ CDN", current),
+        "۳. بعد لینک جدید را در ویرایش سرور این برنامه بچسبانید."]
 
 
 def is_healthy(m, max_loss, max_delay):
@@ -1788,7 +1930,11 @@ def cell_text(cell, now, window_s):
         return "؟"
     if status == "fail":
         return "✕"
-    return "%.0f" % cell["delay"] if cell.get("delay") is not None else "✓"
+    if cell.get("delay") is None:
+        return "✓"
+    if cell.get("ping") is not None:
+        return "%.0f/%.0f" % (cell["ping"], cell["delay"])  # ping / full delay
+    return "%.0f" % cell["delay"]
 
 
 def choose_for_record(cells, nid, group_nets, now, window_s, count, current=(),
@@ -1982,6 +2128,7 @@ class ScanJob:
         self.cancel_event = threading.Event()
         self.result = None
         self.running = False
+        self.measured = {}  # address -> its careful measurement in this run
 
     def cancel(self):
         self.cancel_event.set()
@@ -2006,9 +2153,11 @@ class ScanJob:
         result["elapsed"] = time.time() - started
         try:
             cells = self.store.cells_copy(self.sid)
-            result["delays"] = {
-                ip: (cells.get(ip) or {}).get(self.nid, {}).get("delay")
-                for ip in list(result.get("ips") or []) + list(result.get("conflict") or [])}
+            addresses = list(result.get("ips") or []) + list(result.get("conflict") or [])
+            result["delays"] = {ip: (cells.get(ip) or {}).get(self.nid, {}).get("delay")
+                                for ip in addresses}
+            result["pings"] = {ip: (cells.get(ip) or {}).get(self.nid, {}).get("ping")
+                               for ip in addresses}
         except Exception:  # a summary detail; never lose the result over it
             result["delays"] = {}
         self.result = result
@@ -2069,6 +2218,13 @@ class ScanJob:
             healthy = all(self._ok(m) for m in ms)
             text = "\n".join(self._measure_text(m) for m in ms)
             slow_ms = self._slow(ms) if healthy else None
+            if (slow_ms is not None and self.mode == "auto"
+                    and store.best_checked(key, self.nid, BEST_CHECK_S)):
+                # a full scan here lately found nothing clearly faster: another
+                # one now would take minutes for the same answer
+                text += ("\nکُندتر از تأخیر دلخواه است، ولی اسکن کامل اخیر چیز سریع‌تری پیدا "
+                         "نکرده بود؛ برای اسکن دوباره «دنبال IP سریع‌تر» را بزنید.")
+                slow_ms = None
             if slow_ms is not None:
                 result["slow"] = slow_ms
                 text += ("\nسالم ولی کُندتر از تأخیر دلخواه (%.0fms)؛ دنبال IP سریع‌تر می‌گردم"
@@ -2087,6 +2243,7 @@ class ScanJob:
                                    network_hints(store, self.sid, current, group_nets, now, window))
             result.update(kind="healthy", ips=current,
                           unverified=[n for n in group_nets if health[n] != "ok"])
+            self._explain(result, current, target.port)
             return result
 
         # 2. scan: what works for this server on the group's other network first
@@ -2179,6 +2336,7 @@ class ScanJob:
                                    float(s["min_gain_pct"]), since=run_started, hints=hints)
         result.update(ips=choice["ips"], unverified=choice["unverified"],
                       conflict=choice["conflict"], via=[m["ip"] for m in ms if m["ok"]])
+        self._explain(result, choice["ips"] or choice["conflict"], target.port)
         names = {n["id"]: n["name"] for n in store.networks}
         if choice["kind"] == "none":
             errs = [e for m in ms for e in m["errors"]]
@@ -2206,6 +2364,8 @@ class ScanJob:
         if choice["kind"] == "keep":
             self.events.step(3, "ok", "رکورد همین IPها را دارد")
             result["kind"] = "unchanged"
+            if record:
+                store.mark_best_checked(key, self.nid)
         elif not record:
             self.events.step(3, "skip", "رکورد %s تنظیم نشده" % GROUP_NAMES[group])
             result["kind"] = "found"
@@ -2236,6 +2396,9 @@ class ScanJob:
             result["message"] = str(exc)
             return False
         self.events.step(3, "ok", "%s → %s" % (result.get("record"), ", ".join(ips)))
+        if kind == "apply":  # the scan's own choice: the best there was, just now
+            self.store.mark_best_checked(result["key"], self.nid)
+            self.store.save()
         result["kind"] = "applied"
         result["ips"] = ips
         return True
@@ -2287,8 +2450,9 @@ class ScanJob:
 
     def _record(self, ms):
         for m in ms:
+            self.measured[m["ip"]] = m
             self.store.record_result(self.sid, m["ip"], self.nid, self._ok(m), m.get("delay"),
-                                     m.get("colo", ""))
+                                     m.get("colo", ""), ping=m.get("ping"))
 
     @staticmethod
     def _rank(r):
@@ -2398,6 +2562,15 @@ class ScanJob:
         text = "%s ✓ %.0fms" % (m["ip"], m["delay"])
         return text + (" · افت %.0f%%" % m["loss"] if m.get("loss") else "")
 
+    def _explain(self, result, ips, port):
+        """The diagnosis of the record's (first) address, as a note."""
+        for ip in ips:
+            m = self.measured.get(ip)
+            if m and m.get("delay") is not None:
+                result["diagnosis"] = diagnose(m, port)
+                self.events.note("\n".join(["چرا این عدد؟ (%s)" % ip] + result["diagnosis"]))
+                return
+
     @staticmethod
     def _stopped(result):
         result["kind"] = "stopped"
@@ -2436,7 +2609,8 @@ RESULT_TEXT = {
     "error": "خطا",
 }
 GOOD_KINDS = ("healthy", "applied", "unchanged", "pending", "found")
-TEST_LABEL = {"vless": "تأخیر کانفیگ", "ws": "تأخیر تا سرور", "trace": "تأخیر تا کلادفلر"}
+TEST_LABEL = {"vless": "تأخیر کامل کانفیگ (real delay)", "ws": "تأخیر تا سرور",
+              "trace": "تأخیر تا کلادفلر"}
 
 
 def result_line(result, store=None):
@@ -2449,10 +2623,17 @@ def result_line(result, store=None):
         text = "IP سریع‌تری (حداقل ۲۰٪ بهتر) پیدا نشد؛ همان IP فعلی ماند"
     ips = result.get("ips") if kind in GOOD_KINDS else result.get("conflict")
     delays = result.get("delays") or {}
+    pings = result.get("pings") or {}
+
+    def timed(ip):
+        if not isinstance(delays.get(ip), (int, float)):
+            return ip
+        if isinstance(pings.get(ip), (int, float)):
+            return "%s (پینگ %.0f · کامل %.0fms)" % (ip, pings[ip], delays[ip])
+        return "%s (%.0fms)" % (ip, delays[ip])
+
     if ips:
-        text += "\n" + ", ".join("%s (%.0fms)" % (ip, delays[ip])
-                                 if isinstance(delays.get(ip), (int, float)) else ip
-                                 for ip in ips)
+        text += "\n" + ", ".join(timed(ip) for ip in ips)
     if store is not None and result.get("unverified") and kind in GOOD_KINDS:
         names = {n["id"]: n["name"] for n in store.networks}
         text += "\n⚠ روی %s تأیید نشده؛ با همان اینترنت اسکن کنید" % "، ".join(
@@ -2597,11 +2778,12 @@ if ui is not None:
 
     ALIGN = {"right": ui.ALIGN_RIGHT, "left": ui.ALIGN_LEFT, "center": ui.ALIGN_CENTER}
 
-    def make_label(text="", size=15, bold=False, color=INK, align="right", mono=False, lines=1):
+    def make_label(text="", size=15, bold=False, color=None, align="right", mono=False, lines=1):
         lab = ui.Label()
         lab.text = text if mono else fa(text)
         lab.font = ("Menlo" if mono else ("<System-Bold>" if bold else "<System>"), size)
-        lab.text_color = color
+        # the palette is chosen at start (dark or light): read it now, not at import
+        lab.text_color = color or INK
         lab.alignment = ALIGN[align]
         lab.number_of_lines = lines
         return lab
@@ -2959,9 +3141,14 @@ if ui is not None:
             healthy = is_healthy(row, settings["max_loss_pct"], settings["max_ping_ms"])
             colour = BAD if not healthy else (
                 WARN if good_ms and row["delay"] > good_ms else GOOD)
-            detail = "نوسان ±%.0f · افت %.0f%%" % (row.get("jitter") or 0, row.get("loss") or 0)
-            if row.get("colo"):
-                detail += " · " + row["colo"]
+            parts = [("TLS", row.get("tls_ms")), ("CF→سرور", row.get("ws_ms")),
+                     ("تونل", row.get("tunnel_ms"))]
+            detail = " · ".join(["%s %.0f" % (n, v) for n, v in parts if v is not None]
+                                + ["±%.0f" % (row.get("jitter") or 0)]
+                                + (["افت %.0f%%" % row["loss"]] if row.get("loss") else [])
+                                + ([row["colo"]] if row.get("colo") else []))
+            if row.get("ping") is not None:
+                return ip, "پینگ %.0f · کامل %.0f" % (row["ping"], row["delay"]), colour, detail
             return ip, "%.0fms" % row["delay"], colour, detail
         detail = "فقط دسترسی"
         if row.get("total") is not None:
@@ -2993,8 +3180,9 @@ if ui is not None:
 
         def layout(self):
             w, h = self.width, self.height
-            self.left.frame = (14, 6, w * 0.58, 22)
-            self.right.frame = (w * 0.58 + 14, 6, max(0, w * 0.42 - 28), 22)
+            lw = min(w * 0.5, 142)  # "255.255.255.255" in Menlo 15; the rest for the numbers
+            self.left.frame = (14, 6, lw, 22)
+            self.right.frame = (14 + lw + 4, 6, max(0, w - lw - 32), 22)
             self.detail.frame = (14, 28, max(0, w - 28), h - 32)
             self.line.frame = (14, h - 1, max(0, w - 28), 1)
             self.tap.frame = (0, 0, w, h)
@@ -3029,7 +3217,7 @@ if ui is not None:
             self.scroll = ui.ScrollView()
             self.add_subview(self.scroll)
             self.batch_label = make_label("", 13, bold=True, color=ACCENT)
-            self.server_label = make_label("", 17, bold=True)
+            self.server_label = make_label("", 17, bold=True, lines=2)
             self.record_label = make_label("", 12, color=MUTED, mono=True)
             self.clock_label = make_label("0:00", 15, bold=True, color=ACCENT, align="left",
                                           mono=True)
@@ -3155,9 +3343,11 @@ if ui is not None:
                 self.batch_label.frame = (pad, y, inner, 20)
                 y += 22
             self.clock_label.frame = (pad, y, 64, 22)
-            self.server_label.frame = (pad + 68, y, max(0, inner - 68), 22)
-            self.record_label.frame = (pad, y + 24, inner, 18)
-            y += 50
+            sw = max(0, inner - 68)
+            sh = max(22, min(46, text_height(self.server_label.text, sw, 17)))  # 2 lines at most
+            self.server_label.frame = (pad + 68, y, sw, sh)
+            self.record_label.frame = (pad, y + sh + 2, inner, 18)
+            y += sh + 28
             text_w = max(40, inner - 64)
             row_y = 14
             for i, (icon, name, detail) in enumerate(self.step_views):
@@ -3602,6 +3792,9 @@ if ui is not None:
             self.nav = ui.NavigationView(self.main)
             self.nav.background_color = BG
             self.nav.tint_color = ACCENT
+            # the title bar follows the palette too (dark titles on a dark bar otherwise)
+            self.nav.title_color = INK
+            self.nav.bar_tint_color = CARD
             self.nav.present("fullscreen", hide_title_bar=False)
             if not self.store.servers or not self.store.token:
                 run_bg(self.first_run)
@@ -3980,11 +4173,12 @@ if ui is not None:
                 "کپی تنظیمات (بدون توکن و UUID)",
                 "وارد کردن تنظیمات از کلیپ‌بورد",
                 "کپی لاگ برای گزارش خطا",
+                "تست پورت‌های کلادفلر روی «%s»" % name,
             ]
             index = pick("ابزارها", items)
             if index is None:
                 return
-            if index in (0, 1, 2, 3, 4) and server is None:
+            if index in (0, 1, 2, 3, 4, 12) and server is None:
                 alert("سرور", "اول یک سرور اضافه کنید.")
                 return
             if index == 0:
@@ -4035,6 +4229,37 @@ if ui is not None:
             elif index == 11:
                 clipboard.set(read_log_tail(120))
                 console.hud_alert("لاگ کپی شد")
+            elif index == 12:
+                self.test_ports(server["id"])
+
+        def test_ports(self, sid, ip=None):
+            """Which Cloudflare port answers fastest here, on the record's address."""
+            store = self.store
+            server = store.server(sid)
+            network = self.detect(True)
+            if network is None:
+                alert("اینترنت", "اول VPN را خاموش کنید و اینترنت را بررسی کنید.")
+                return
+            if ip is None:
+                ips = store.record_ips(slot_key(sid, network["group"]))
+                ip = ips[0] if ips else console.input_alert(
+                    "تست پورت‌ها", "رکورد هنوز IP ندارد؛ یک IP کلادفلر بدهید", "", "تست").strip()
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                alert("IP نامعتبر", ip)
+                return
+            target = store.target(server)
+            console.show_activity()
+            console.hud_alert("تست %d پورت روی %s…" % (
+                len(CF_HTTPS_PORTS if target.tls else CF_HTTP_PORTS), ip), "success", 1.5)
+            try:
+                results = port_test(ip, target, timeout=float(store.settings["timeout"]) + 1)
+            finally:
+                console.hide_activity()
+            log("port test %s: %s" % (ip, [(r["port"], r["delay"]) for r in results]))
+            alert("پورت‌ها · %s · %s" % (ip, network["name"]),
+                  "\n".join(port_advice(results, target.port, server["sni"])))
 
         def pick_slot(self, sid):
             slots = self.store.slots(sid)
@@ -4106,7 +4331,8 @@ if ui is not None:
             finally:
                 console.hide_activity()
             ok = is_healthy(m, s["max_loss_pct"], s["max_ping_ms"])
-            store.record_result(sid, ip, network["id"], ok, m["delay"], trace.get("colo", ""))
+            store.record_result(sid, ip, network["id"], ok, m["delay"], trace.get("colo", ""),
+                                ping=m["ping"])
             store.save()
             self.main.refresh()
             lines = ["%s · %s" % (server["name"], network["name"]),
