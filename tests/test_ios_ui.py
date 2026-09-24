@@ -722,7 +722,7 @@ class MonkeyTests(AppTestCase):
         self.patch(fake["dialogs"], "LENIENT", True)
         died = []
         self.patch(threading, "excepthook", lambda args: died.append(args.exc_value))
-        sid = self.ready()
+        self.ready()
         self.store.save_server(None, {"name": "ترکیه", "sni": "turkey.example.com",
                                       "record_mobile": "cdn1.turkey.example.com"})
         views = []
