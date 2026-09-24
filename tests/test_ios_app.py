@@ -32,23 +32,27 @@ TEST_TOKEN = "Ab3dEf6hIj9lMn2pQr5tUv8xYz1bCd4fGh7jKl0n"
 
 
 class MemorySecrets:
+    """Tokens by server id; ``None`` is the main token."""
+
     def __init__(self, token=TEST_TOKEN):
-        self.token = token
+        self.tokens = {None: token}
 
-    def get(self):
-        return self.token
+    def get(self, sid=None):
+        return self.tokens.get(sid, "")
 
-    def set(self, token):
-        self.token = token
+    def set(self, token, sid=None):
+        self.tokens[sid] = token
 
 
-def make_store(tmp, token=TEST_TOKEN, **settings):
+def make_store(tmp, token=TEST_TOKEN, sni="cdn.example.test", path="/ws", **settings):
+    """A store with one server ``s1`` whose MCI record is mci.example.test."""
     store = app.Store(os.path.join(tmp, "data.json"), secrets=MemorySecrets(token))
-    base = {"sni": "cdn.example.test", "path": "/ws", "auto_apply": True,
-            "verify_attempts": 3, "verify_top": 3, "stop_after": 0, "timeout": 0.5}
+    base = {"auto_apply": True, "verify_attempts": 3, "verify_top": 3, "stop_after": 0,
+            "timeout": 0.5}
     base.update(settings)
     store.update_settings(base)
-    store.edit_profile("mci", "MCI", "mci.example.test")
+    store.save_server(None, {"name": "DE", "sni": sni, "path": path},
+                      {"mci": "mci.example.test"})
     return store
 
 
@@ -61,24 +65,101 @@ class StoreTests(unittest.TestCase):
 
     def test_defaults_fill_a_missing_file(self):
         store = app.Store(os.path.join(self.tmp, "none.json"), secrets=MemorySecrets())
-        self.assertEqual(store.settings["port"], 443)
-        self.assertEqual([p["id"] for p in store.profiles], ["mci", "mtn", "home"])
+        self.assertEqual(store.settings["ttl"], 60)
+        self.assertEqual(store.servers, [])
+        self.assertIsNone(store.active)
+        self.assertEqual([c["id"] for c in store.carriers], ["mci", "mtn", "home"])
 
     def test_settings_round_trip_and_bad_values_change_nothing(self):
         store = make_store(self.tmp, workers="16", colos="fra, ams")
         again = app.Store(store.path, secrets=MemorySecrets())
         self.assertEqual(again.settings["workers"], 16)
-        self.assertEqual(again.settings["path"], "/ws")
+        self.assertEqual(again.server("s1")["path"], "/ws")
         with self.assertRaises(ValueError):
-            again.update_settings({"workers": "8", "port": "70000"})
+            again.update_settings({"workers": "8", "ttl": "5"})
         self.assertEqual(again.settings["workers"], 16)
+        with self.assertRaises(ValueError):
+            again.save_server("s1", {"port": "70000"})
+        self.assertEqual(again.server("s1")["port"], 443)
+
+    def test_version_one_data_becomes_one_server(self):
+        v1 = {"settings": {"sni": "CDN.Example.com", "path": "ws", "port": 2053, "ttl": 120,
+                           "zone_id": "z"},
+              "profiles": [{"id": "mci", "name": "MCI", "record": "mci.cdn.example.com"},
+                           {"id": "mtn", "name": "MTN", "record": "mtn.cdn.example.com"}],
+              "state": {"mci": {"current": ["1.1.1.1"], "status": "ok",
+                                "good": {"1.1.1.1": {"ts": 5}}, "bad": {"9.9.9.9": 6}}},
+              "history": [{"ts": 1, "profile": "mci", "kind": "apply", "old": [], "new": ["1.1.1.1"]}]}
+        data = app.normalise_data(v1)
+        self.assertEqual(data["version"], 2)
+        server = data["servers"][0]
+        self.assertEqual((server["id"], server["sni"], server["path"], server["port"],
+                          server["zone_id"]), ("s1", "cdn.example.com", "/ws", 2053, "z"))
+        self.assertEqual(server["records"], {"mci": "mci.cdn.example.com",
+                                             "mtn": "mtn.cdn.example.com"})
+        self.assertEqual(data["settings"]["ttl"], 120)
+        self.assertEqual(data["state"]["s1|mci"]["current"], ["1.1.1.1"])
+        self.assertIn("1.1.1.1", data["memory"]["mci"]["good"])
+        self.assertEqual(data["history"][0]["server"], "s1")
+        self.assertEqual(data["history"][0]["carrier"], "mci")
+        self.assertEqual(data["active_server"], "s1")
+        self.assertEqual([c["prefix"] for c in data["carriers"]], ["mci", "mtn"])
 
     def test_stored_garbage_is_ignored(self):
-        data = app.normalise_data({"settings": {"port": "x", "ttl": 5, "sni": "A.B."},
-                                   "profiles": [{"id": "a", "record": "X.Test."}, {"id": "a"}]})
-        self.assertEqual(data["settings"]["port"], 443)
-        self.assertEqual(data["settings"]["ttl"], 60)  # below the limit: default kept
-        self.assertEqual(data["profiles"], [{"id": "a", "name": "a", "record": "x.test"}])
+        data = app.normalise_data({"settings": {"ttl": 5, "workers": "x"},
+                                   "servers": [{"id": "a", "port": "x", "sni": "A.B."},
+                                               {"id": "a"}, "junk"],
+                                   "carriers": [{"id": "c", "prefix": "R T!"}, {"id": "c"}]})
+        self.assertEqual(data["settings"]["ttl"], 60)
+        self.assertEqual(data["settings"]["workers"], 32)
+        self.assertEqual([s["id"] for s in data["servers"]], ["a", "s3"])
+        self.assertEqual((data["servers"][0]["port"], data["servers"][0]["sni"]), (443, "a.b"))
+        self.assertEqual(data["carriers"], [{"id": "c", "name": "c", "prefix": "rt"}])
+
+    def test_servers_are_added_suggested_switched_and_deleted(self):
+        store = make_store(self.tmp)
+        sid = store.save_server(None, {"name": "NL", "sni": "https://cdn2.example.org/"})
+        self.assertEqual(sid, "s2")
+        self.assertEqual(store.server(sid)["sni"], "cdn2.example.org")
+        self.assertEqual(store.suggest_record(sid, "mtn"), "mtn.cdn2.example.org")
+        self.assertEqual(store.active["id"], "s1")
+        store.set_active(sid)
+        self.assertEqual(store.active["id"], "s2")
+        store.state(sid, "mci")["current"] = ["1.1.1.1"]
+        store.secrets.set("per-server", sid)
+        store.delete_server(sid)
+        self.assertEqual(store.active["id"], "s1")
+        self.assertNotIn("s2|mci", store.data["state"])
+        self.assertEqual(store.secrets.get(sid), "")
+
+    def test_changing_a_record_forgets_its_state(self):
+        store = make_store(self.tmp)
+        store.state("s1", "mci").update(current=["1.1.1.1"], status="ok")
+        store.save_server("s1", {}, {"mci": "mci.example.test"})
+        self.assertEqual(store.state("s1", "mci")["current"], ["1.1.1.1"])
+        store.save_server("s1", {}, {"mci": "new.example.test"})
+        self.assertEqual(store.state("s1", "mci")["current"], [])
+        store.save_server("s1", {}, {"mci": ""})
+        self.assertEqual(store.record("s1", "mci"), "")
+
+    def test_carriers_can_be_added_and_removed_everywhere(self):
+        store = make_store(self.tmp)
+        cid = store.save_carrier(None, "رایتل", "RTL")
+        self.assertEqual((cid, store.carrier(cid)["prefix"]), ("rtl", "rtl"))
+        self.assertEqual(store.suggest_record("s1", cid), "rtl.cdn.example.test")
+        store.save_server("s1", {}, {cid: "rtl.example.test"})
+        store.remember_good(cid, "1.1.1.1", 50, "FRA")
+        store.delete_carrier(cid)
+        self.assertNotIn(cid, store.server("s1")["records"])
+        self.assertNotIn(cid, store.data["memory"])
+
+    def test_a_server_token_overrides_the_main_one(self):
+        store = make_store(self.tmp)
+        sid = store.save_server(None, {"sni": "cdn.other.test"})
+        self.assertEqual(store.token_for(sid), TEST_TOKEN)
+        store.secrets.set(" Bearer " + "Z" * 40 + " ", sid)
+        self.assertEqual(store.token_for(sid), "Z" * 40)
+        self.assertEqual(store.token_for("s1"), TEST_TOKEN)
 
     def test_the_token_is_never_written_to_the_data_file(self):
         store = make_store(self.tmp, token="secret-token-123")
@@ -86,20 +167,38 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("secret-token-123", Path(store.path).read_text(encoding="utf-8"))
         self.assertNotIn("secret-token-123", store.export_json())
 
-    def test_export_import_keeps_settings_and_carriers(self):
-        store = make_store(self.tmp)
-        text = store.export_json()
+    def test_export_import_keeps_servers_carriers_and_settings(self):
+        store = make_store(self.tmp, workers="20")
+        store.save_server(None, {"sni": "cdn2.example.test"}, {"mtn": "mtn.cdn2.example.test"})
         other = app.Store(os.path.join(self.tmp, "other.json"), secrets=MemorySecrets())
-        other.import_json(text)
-        self.assertEqual(other.profile("mci")["record"], "mci.example.test")
+        other.import_json(store.export_json())
+        self.assertEqual([s["sni"] for s in other.servers], ["cdn.example.test", "cdn2.example.test"])
+        self.assertEqual(other.record("s2", "mtn"), "mtn.cdn2.example.test")
+        self.assertEqual(other.settings["workers"], 20)
         with self.assertRaises(ValueError):
             other.import_json('{"hello": 1}')
 
-    def test_previous_ips_come_from_the_last_change(self):
+    def test_a_version_one_export_still_imports(self):
+        other = app.Store(os.path.join(self.tmp, "other.json"), secrets=MemorySecrets())
+        other.import_json('{"app": "cfscan_ios", "settings": {"sni": "cdn.x.test"}, '
+                          '"profiles": [{"id": "mci", "name": "MCI", "record": "mci.x.test"}]}')
+        self.assertEqual(other.record("s1", "mci"), "mci.x.test")
+
+    def test_previous_ips_and_history_filters(self):
         store = make_store(self.tmp)
-        store.add_history("mci", "apply", ["1.1.1.1"], ["2.2.2.2"])
-        store.add_history("mci", "check", ["2.2.2.2"], ["2.2.2.2"])
-        self.assertEqual(store.previous_ips("mci"), ["1.1.1.1"])
+        store.add_history("s1", "mci", "apply", ["1.1.1.1"], ["2.2.2.2"])
+        store.add_history("s1", "mci", "check", ["2.2.2.2"], ["2.2.2.2"])
+        store.add_history("s2", "mci", "apply", ["7.7.7.7"], ["8.8.8.8"])
+        self.assertEqual(store.previous_ips("s1", "mci"), ["1.1.1.1"])
+        self.assertEqual(len(store.history("s1")), 2)
+        self.assertEqual(len(store.history(cid="mci")), 3)
+
+    def test_memory_is_shared_by_servers_of_a_carrier(self):
+        store = make_store(self.tmp)
+        store.remember_good("mci", "1.1.1.1", 50, "FRA")
+        store.remember_bad("mci", ["1.1.1.1"], forget_good=True)
+        self.assertNotIn("1.1.1.1", store.memory("mci")["good"])
+        self.assertIn("1.1.1.1", store.memory("mci")["bad"])
 
 
 # ------------------------------------------------------------------ pure helpers
@@ -276,9 +375,10 @@ class ZoneTests(unittest.TestCase):
     def test_a_wrong_zone_id_in_the_settings_falls_back_to_the_lookup(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
-        store = make_store(tmp, zone_id="0123456789abcdef0123456789abcdef")
+        store = make_store(tmp)
+        store.save_server("s1", {"zone_id": "0123456789abcdef0123456789abcdef"})
         api = self.api()
-        ips = app.with_zone(store, api, "mtn.cdn.example.com",
+        ips = app.with_zone(store, api, store.server("s1"), "mtn.cdn.example.com",
                             lambda zone: [r["content"] for r in
                                           api.list_records(zone, "mtn.cdn.example.com", "A")])
         self.assertEqual(ips, ["1.1.1.1"])
@@ -490,7 +590,7 @@ class ScanJobTests(unittest.TestCase):
 
     def job(self, store, mode="auto", table=None, loc="IR"):
         probe = scripted_probe(self.table if table is None else table, loc)
-        return app.ScanJob(store, "mci", events=RecordingEvents(), mode=mode,
+        return app.ScanJob(store, "s1", "mci", events=RecordingEvents(), mode=mode,
                            context_factory=lambda: None, api_factory=FakeAPI,
                            candidates=["1.0.0.1", "1.0.0.2", "1.0.0.3", "1.0.0.4"],
                            probe_trace=probe, probe_ws=probe)
@@ -502,12 +602,15 @@ class ScanJobTests(unittest.TestCase):
         self.assertEqual(result["kind"], "applied")
         self.assertEqual(result["chosen"], ["1.0.0.2"])
         self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["1.0.0.2"])
-        st = store.state("mci")
+        st = store.state("s1", "mci")
         self.assertEqual((st["status"], st["current"]), ("ok", ["1.0.0.2"]))
-        self.assertIn("1.0.0.2", st["good"])
-        self.assertIn("1.0.0.4", st["bad"])
-        self.assertIn("9.9.9.9", st["bad"])
-        self.assertEqual(store.previous_ips("mci"), ["9.9.9.9"])
+        mem = store.memory("mci")
+        self.assertIn("1.0.0.2", mem["good"])
+        self.assertIn("1.0.0.4", mem["bad"])
+        self.assertIn("9.9.9.9", mem["bad"])
+        self.assertEqual(store.previous_ips("s1", "mci"), ["9.9.9.9"])
+        self.assertEqual(st["last_scan"]["scanned"], 4)
+        self.assertIn("1.0.0.2", app.result_line(result))
         self.assertEqual(job.events.steps[-1], (3, "ok"))
         self.assertIs(job.events.result, result)
 
@@ -555,7 +658,7 @@ class ScanJobTests(unittest.TestCase):
         result = self.job(store, table={}).run()
         self.assertEqual(result["kind"], "nothing")
         self.assertIn("timeout", result["hint"])
-        self.assertNotIn("1.0.0.4", store.state("mci")["bad"])
+        self.assertNotIn("1.0.0.4", store.memory("mci")["bad"])
 
     def test_a_foreign_location_warns_about_the_vpn(self):
         store = make_store(self.tmp)
@@ -565,7 +668,8 @@ class ScanJobTests(unittest.TestCase):
         self.assertTrue(job.events.notes)
 
     def test_missing_cdn_domain_is_a_clear_error(self):
-        store = make_store(self.tmp, sni="")
+        store = make_store(self.tmp)
+        store.data["servers"][0]["sni"] = ""
         result = self.job(store).run()
         self.assertEqual(result["kind"], "error")
         self.assertIn("CDN", result["message"])
@@ -575,6 +679,69 @@ class ScanJobTests(unittest.TestCase):
         result = self.job(store).run()
         self.assertEqual(result["kind"], "found")
         self.assertEqual(result["chosen"], ["1.0.0.2"])
+
+    def test_each_server_is_probed_with_its_own_domain_and_token(self):
+        store = make_store(self.tmp)
+        sid = store.save_server(None, {"name": "NL", "sni": "cdn2.example.test", "path": "/x"},
+                                {"mci": "mci.cdn2.example.test"})
+        store.secrets.set("Q" * 40, sid)
+        FakeAPI.records[("mci.cdn2.example.test", "A")] = ["9.9.9.9"]
+        seen, tokens = [], []
+
+        def probe(ip, target, ctx, timeout):
+            seen.append((target.sni, target.path))
+            return scripted_probe(self.table)(ip, target, ctx, timeout)
+
+        class TokenAPI(FakeAPI):
+            def __init__(self, token="", via_ip=None, **kw):
+                tokens.append(token)
+                super().__init__(token, via_ip)
+
+        job = app.ScanJob(store, sid, "mci", events=RecordingEvents(),
+                          context_factory=lambda: None, api_factory=TokenAPI,
+                          candidates=["1.0.0.2"], probe_trace=probe, probe_ws=probe)
+        self.assertEqual(job.run()["kind"], "applied")
+        self.assertEqual(set(seen), {("cdn2.example.test", "/x")})
+        self.assertEqual(set(tokens), {"Q" * 40})
+        self.assertEqual(FakeAPI.records[("mci.cdn2.example.test", "A")], ["1.0.0.2"])
+        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["9.9.9.9"])
+
+    def test_a_second_server_starts_from_what_the_first_found(self):
+        store = make_store(self.tmp)
+        self.job(store).run()
+        sid = store.save_server(None, {"sni": "cdn2.example.test"}, {"mci": "mci.cdn2.example.test"})
+        cands = app.build_candidates(store.memory("mci"), 10, 4, app.CF_RANGES_V4,
+                                     rng=random.Random(1))
+        self.assertIn(cands[0], ("1.0.0.2", "1.0.0.3", "1.0.0.1"))
+        self.assertTrue(sid)
+
+    def test_connection_check_reads_the_location(self):
+        class Resp:
+            def __init__(self, body):
+                self.body = body
+
+            def read(self, n=-1):
+                return self.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        original = app.urllib.request.urlopen
+        try:
+            app.urllib.request.urlopen = lambda req, timeout: Resp(b"ip=5.6.7.8\ncolo=GYD\nloc=IR\n")
+            self.assertEqual(app.connection_check(), {"ok": True, "loc": "IR", "ip": "5.6.7.8",
+                                                      "colo": "GYD", "error": ""})
+
+            def fail(req, timeout):
+                raise socket.timeout()
+
+            app.urllib.request.urlopen = fail
+            self.assertEqual(app.connection_check()["error"], "timeout")
+        finally:
+            app.urllib.request.urlopen = original
 
     def test_cancel_stops_the_run(self):
         store = make_store(self.tmp)

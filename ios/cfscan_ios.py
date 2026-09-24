@@ -9,16 +9,17 @@ carrier (MCI, Irancell, home Wi-Fi, ...), one tap:
    (known-good ones and their /24 neighbours first, then random ones),
 3. re-measures the fastest few with several attempts each (latency, jitter,
    loss, and a real WebSocket upgrade on the config's path when one is set),
-4. points the carrier's DNS-only record (``mci.example.com``) at the winner
-   through the Cloudflare API.
+4. points the carrier's DNS-only record (``mci.cdn.example.com``) at the
+   winner through the Cloudflare API.
 
-Every carrier has its own record, and the panel's hosts use those records as
-their address, so the panel itself never has to be touched.
+Several servers can be kept, each with its own CDN domain (SNI), path and
+per-carrier records; one run can fix a carrier on every server. The panel's
+hosts use the records as their address, so the panel is never touched.
 
-Secrets: the Cloudflare API token lives in the iOS Keychain, never in the
-data file. Everything else (settings, carrier state, history) is kept in
+Secrets: Cloudflare API tokens live in the iOS Keychain, never in the data
+file. Everything else (servers, carriers, state, history) is kept in
 ``cfscan_ios_data.json`` next to this script. ``cfscan_ios_log.txt`` holds a
-step log for bug reports; it never contains the token.
+step log for bug reports; it never contains a token.
 
 The network, Cloudflare and scan code does not import any Pythonista module,
 so it is unit tested on a computer (``tests/test_ios_app.py``).
@@ -41,6 +42,7 @@ import statistics
 import threading
 import time
 import urllib.parse
+import urllib.request
 
 try:  # Pythonista only; everything below the UI marker needs these.
     import ui
@@ -57,7 +59,7 @@ except ImportError:
         return fn
 
 APP_NAME = "CF Scanner"
-APP_VERSION = "1.0"
+APP_VERSION = "2.0"
 
 try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -87,12 +89,9 @@ CF_RANGES_V6 = (
     "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
 )
 
+
+#: Scan and DNS settings shared by every server.
 DEFAULT_SETTINGS = {
-    "sni": "",              # CDN domain (orange cloud): SNI and Host header
-    "path": "",             # WebSocket path of the config; empty = trace test only
-    "port": 443,
-    "tls": True,
-    "zone_id": "",          # optional; looked up from the record name when empty
     "ttl": 60,
     "ips_per_record": 1,
     "auto_apply": True,
@@ -109,6 +108,19 @@ DEFAULT_SETTINGS = {
     "bad_ttl_hours": 6,
 }
 
+#: What one server (one CDN domain) is made of, besides its per-carrier records.
+SERVER_DEFAULTS = {
+    "name": "",
+    "sni": "",              # CDN domain (orange cloud): SNI and Host header
+    "path": "",             # WebSocket path of the config; empty = trace test only
+    "port": 443,
+    "tls": True,
+    "zone_id": "",          # optional; looked up from the record name when empty
+}
+
+_ALL_DEFAULTS = dict(SERVER_DEFAULTS)
+_ALL_DEFAULTS.update(DEFAULT_SETTINGS)
+
 #: (minimum, maximum) for every numeric setting.
 SETTING_LIMITS = {
     "port": (1, 65535), "ttl": (60, 86400), "ips_per_record": (1, 3),
@@ -118,16 +130,16 @@ SETTING_LIMITS = {
     "bad_ttl_hours": (0, 168),
 }
 
-DEFAULT_PROFILES = [
-    {"id": "mci", "name": "همراه اول", "record": ""},
-    {"id": "mtn", "name": "ایرانسل", "record": ""},
-    {"id": "home", "name": "اینترنت خانگی", "record": ""},
+#: ``prefix`` builds the suggested record: ``mtn`` + ``cdn.example.com``.
+DEFAULT_CARRIERS = [
+    {"id": "mci", "name": "همراه اول", "prefix": "mci"},
+    {"id": "mtn", "name": "ایرانسل", "prefix": "mtn"},
+    {"id": "home", "name": "اینترنت خانگی", "prefix": "home"},
 ]
 
-HISTORY_LIMIT = 300
+HISTORY_LIMIT = 400
 GOOD_LIMIT = 200
 BAD_LIMIT = 5000
-
 
 # ---------------------------------------------------------------- logging
 
@@ -167,11 +179,29 @@ def read_log_tail(lines=60):
         return ""
 
 
+
 # ---------------------------------------------------------------- storage
+
+def normalise_host(value):
+    """A bare hostname from a pasted value (``https://A.b.com/x`` -> ``a.b.com``)."""
+    host = re.sub(r"[\s​-‏⁠﻿]", "", str(value or ""))
+    host = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", host)
+    host = host.split("/", 1)[0].split("?", 1)[0]
+    if host.count(":") == 1:  # a port, not an IPv6 address
+        host = host.split(":", 1)[0]
+    return host.strip(".").lower()
+
+
+def normalise_path(value):
+    path = re.sub(r"[\s​-‏⁠﻿]", "", str(value or ""))
+    if path and not path.startswith("/"):
+        path = "/" + path
+    return path
+
 
 def _coerce(key, value):
     """``value`` as the type of the default for ``key``, clamped to its limits."""
-    default = DEFAULT_SETTINGS[key]
+    default = _ALL_DEFAULTS[key]
     if isinstance(default, bool):
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
@@ -186,88 +216,148 @@ def _coerce(key, value):
         if key == "ip_version" and int(number) not in (4, 6):
             raise ValueError("ip_version must be 4 or 6")
         return int(number) if isinstance(default, int) else number
+    if key == "sni":
+        return normalise_host(value)
+    if key == "path":
+        return normalise_path(value)
     return str(value).strip()
 
 
-def normalise_data(raw):
-    """A complete data document built from whatever was stored."""
+def _slug(text, fallback):
+    slug = re.sub(r"[^a-z0-9-]", "", str(text or "").lower())
+    return slug or fallback
+
+
+def normalise_server(raw, index=1):
     raw = raw if isinstance(raw, dict) else {}
+    server = {"id": str(raw.get("id") or "s%d" % index)}
+    for key, default in SERVER_DEFAULTS.items():
+        try:
+            server[key] = _coerce(key, raw.get(key, default))
+        except (TypeError, ValueError):
+            server[key] = default
+    server["name"] = server["name"] or server["sni"] or "سرور %d" % index
+    records = raw.get("records") if isinstance(raw.get("records"), dict) else {}
+    server["records"] = {str(k): normalise_host(v) for k, v in records.items() if v}
+    return server
+
+
+def normalise_data(raw):
+    """A complete version-2 document from whatever was stored.
+
+    Version 1 (one CDN domain in the settings, carriers as ``profiles`` with
+    one record each) becomes one server holding those records.
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    legacy = "servers" not in raw and "profiles" in raw
+    raw_settings = raw.get("settings") if isinstance(raw.get("settings"), dict) else {}
+
     settings = dict(DEFAULT_SETTINGS)
-    for key, value in (raw.get("settings") or {}).items():
+    for key, value in raw_settings.items():
         if key in DEFAULT_SETTINGS:
             try:
                 settings[key] = _coerce(key, value)
             except (TypeError, ValueError):
                 pass
-    profiles = []
-    seen = set()
-    for p in raw.get("profiles") or copy.deepcopy(DEFAULT_PROFILES):
-        if not isinstance(p, dict) or not p.get("id") or p["id"] in seen:
+
+    source = raw.get("carriers") if not legacy else raw.get("profiles")
+    carriers, seen = [], set()
+    for c in source or copy.deepcopy(DEFAULT_CARRIERS):
+        if not isinstance(c, dict) or not c.get("id") or str(c["id"]) in seen:
             continue
-        seen.add(p["id"])
-        profiles.append({"id": str(p["id"]), "name": str(p.get("name") or p["id"]),
-                         "record": normalise_host(p.get("record") or "")})
-    state = raw.get("state") if isinstance(raw.get("state"), dict) else {}
-    history = [h for h in (raw.get("history") or []) if isinstance(h, dict)]
+        cid = str(c["id"])
+        seen.add(cid)
+        default_prefix = cid if cid in ("mci", "mtn", "home") else ""
+        carriers.append({"id": cid, "name": str(c.get("name") or cid),
+                         "prefix": _slug(c.get("prefix", default_prefix), "")})
+
+    state, memory, history = {}, {}, []
+    raw_state = raw.get("state") if isinstance(raw.get("state"), dict) else {}
+    if legacy:
+        server = {k: raw_settings.get(k, v) for k, v in SERVER_DEFAULTS.items()}
+        server["id"] = "s1"
+        server["records"] = {str(p["id"]): p.get("record", "")
+                             for p in raw.get("profiles") or [] if isinstance(p, dict) and p.get("id")}
+        servers = [normalise_server(server, 1)]
+        for cid, st in raw_state.items():
+            if not isinstance(st, dict):
+                continue
+            memory[cid] = {"good": st.get("good") or {}, "bad": st.get("bad") or {}}
+            state["s1|%s" % cid] = {k: v for k, v in st.items() if k not in ("good", "bad")}
+        for h in raw.get("history") or []:
+            if isinstance(h, dict):
+                h = dict(h)
+                h["server"] = "s1"
+                h["carrier"] = h.pop("profile", "")
+                history.append(h)
+    else:
+        servers, ids = [], set()
+        for i, s in enumerate(raw.get("servers") or [], 1):
+            server = normalise_server(s, i)
+            if server["id"] not in ids:
+                ids.add(server["id"])
+                servers.append(server)
+        state = {k: v for k, v in raw_state.items() if isinstance(v, dict)}
+        raw_memory = raw.get("memory") if isinstance(raw.get("memory"), dict) else {}
+        memory = {k: v for k, v in raw_memory.items() if isinstance(v, dict)}
+        history = [h for h in raw.get("history") or [] if isinstance(h, dict)]
+
+    ids = [s["id"] for s in servers]
+    active = raw.get("active_server")
     return {
-        "version": 1,
+        "version": 2,
         "settings": settings,
-        "profiles": profiles,
+        "servers": servers,
+        "carriers": carriers,
+        "active_server": active if active in ids else (ids[0] if ids else None),
         "state": state,
+        "memory": memory,
         "history": history[-HISTORY_LIMIT:],
         "zones": raw.get("zones") if isinstance(raw.get("zones"), dict) else {},
         "ranges": raw.get("ranges") if isinstance(raw.get("ranges"), dict) else {},
     }
 
 
-def normalise_host(value):
-    """A bare hostname from a pasted value (``https://A.b.com/x`` -> ``a.b.com``)."""
-    host = re.sub(r"[\s\u200b-\u200f\u2060\ufeff]", "", str(value or ""))
-    host = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", host)
-    host = host.split("/", 1)[0].split("?", 1)[0]
-    if host.count(":") == 1:  # a port, not an IPv6 address
-        host = host.split(":", 1)[0]
-    return host.strip(".").lower()
-
-
-def normalise_path(value):
-    path = str(value or "").strip()
-    if path and not path.startswith("/"):
-        path = "/" + path
-    return path
-
-
 class Secrets:
-    """The Cloudflare token: iOS Keychain in Pythonista, memory elsewhere."""
+    """Cloudflare tokens: iOS Keychain in Pythonista, memory elsewhere.
+
+    ``sid`` None is the main token; a server may have its own for a domain
+    in another Cloudflare account.
+    """
 
     def __init__(self):
-        self._memory = ""
+        self._memory = {}
         try:
             import keychain
         except ImportError:
             keychain = None
         self._keychain = keychain
 
-    def get(self):
-        if self._keychain is None:
-            return self._memory
-        return self._keychain.get_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) or ""
+    @staticmethod
+    def _account(sid):
+        return KEYCHAIN_ACCOUNT if not sid else "%s:%s" % (KEYCHAIN_ACCOUNT, sid)
 
-    def set(self, token):
-        token = (token or "").strip()
+    def get(self, sid=None):
         if self._keychain is None:
-            self._memory = token
+            return self._memory.get(self._account(sid), "")
+        return self._keychain.get_password(KEYCHAIN_SERVICE, self._account(sid)) or ""
+
+    def set(self, token, sid=None):
+        token = (token or "").strip()
+        account = self._account(sid)
+        if self._keychain is None:
+            self._memory[account] = token
         elif token:
-            self._keychain.set_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, token)
+            self._keychain.set_password(KEYCHAIN_SERVICE, account, token)
         else:
             try:
-                self._keychain.delete_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                self._keychain.delete_password(KEYCHAIN_SERVICE, account)
             except Exception:
                 pass
 
 
 class Store:
-    """Settings, carriers, per-carrier state and history in one JSON file."""
+    """Servers, carriers, settings, state and history in one JSON file."""
 
     def __init__(self, path=DATA_PATH, secrets=None):
         self.path = path
@@ -287,28 +377,11 @@ class Store:
                 json.dump(self.data, fh, ensure_ascii=False, indent=1)
             os.replace(tmp, self.path)
 
+    # -- settings ----------------------------------------------------------
+
     @property
     def settings(self):
         return self.data["settings"]
-
-    @property
-    def profiles(self):
-        return self.data["profiles"]
-
-    def profile(self, pid):
-        for p in self.profiles:
-            if p["id"] == pid:
-                return p
-        raise KeyError(pid)
-
-    def state(self, pid):
-        with self.lock:
-            st = self.data["state"].setdefault(pid, {})
-            st.setdefault("current", [])
-            st.setdefault("status", "unknown")
-            st.setdefault("good", {})
-            st.setdefault("bad", {})
-            return st
 
     def update_settings(self, values):
         """Validate every value first, so a bad one changes nothing."""
@@ -318,81 +391,198 @@ class Store:
             self.settings.update(clean)
             self.save()
 
-    def add_profile(self, name, record):
-        with self.lock:
-            base = "p%d" % int(time.time())
-            pid, n = base, 1
-            ids = {p["id"] for p in self.profiles}
-            while pid in ids:
-                n += 1
-                pid = "%s_%d" % (base, n)
-            self.profiles.append({"id": pid, "name": name.strip() or pid,
-                                  "record": normalise_host(record)})
-            self.save()
-            return pid
+    # -- servers -----------------------------------------------------------
 
-    def edit_profile(self, pid, name, record):
-        with self.lock:
-            p = self.profile(pid)
-            p["name"] = name.strip() or p["name"]
-            new_record = normalise_host(record)
-            if new_record != p["record"]:
-                p["record"] = new_record
-                self.state(pid)["current"] = []
-                self.state(pid)["status"] = "unknown"
-            self.save()
+    @property
+    def servers(self):
+        return self.data["servers"]
 
-    def delete_profile(self, pid):
+    def server(self, sid):
+        for s in self.servers:
+            if s["id"] == sid:
+                return s
+        raise KeyError(sid)
+
+    @property
+    def active(self):
+        sid = self.data.get("active_server")
+        for s in self.servers:
+            if s["id"] == sid:
+                return s
+        return self.servers[0] if self.servers else None
+
+    def set_active(self, sid):
         with self.lock:
-            self.data["profiles"] = [p for p in self.profiles if p["id"] != pid]
-            self.data["state"].pop(pid, None)
+            self.server(sid)
+            self.data["active_server"] = sid
             self.save()
 
-    def add_history(self, pid, kind, old=(), new=(), note=""):
+    def save_server(self, sid, values, records=None):
+        """Create (``sid`` None) or update a server; returns its id."""
+        clean = {key: _coerce(key, value) for key, value in values.items()
+                 if key in SERVER_DEFAULTS}
+        clean_records = {cid: normalise_host(v) for cid, v in (records or {}).items()}
         with self.lock:
-            self.data["history"].append({"ts": time.time(), "profile": pid, "kind": kind,
-                                         "old": list(old), "new": list(new), "note": note})
+            if sid is None:
+                n = len(self.servers) + 1
+                ids = {s["id"] for s in self.servers}
+                sid = "s%d" % n
+                while sid in ids:
+                    n += 1
+                    sid = "s%d" % n
+                server = normalise_server(dict(clean, id=sid), n)
+                self.servers.append(server)
+                if not self.data.get("active_server"):
+                    self.data["active_server"] = sid
+            else:
+                server = self.server(sid)
+                server.update(clean)
+                server["name"] = server["name"] or server["sni"] or sid
+            if records is not None:
+                for cid, record in clean_records.items():
+                    if record != server["records"].get(cid, ""):
+                        self.data["state"].pop(self.key(sid, cid), None)
+                    if record:
+                        server["records"][cid] = record
+                    else:
+                        server["records"].pop(cid, None)
+            self.save()
+            return sid
+
+    def delete_server(self, sid):
+        with self.lock:
+            self.data["servers"] = [s for s in self.servers if s["id"] != sid]
+            for key in [k for k in self.data["state"] if k.startswith(sid + "|")]:
+                del self.data["state"][key]
+            if self.data.get("active_server") == sid:
+                self.data["active_server"] = self.servers[0]["id"] if self.servers else None
+            self.save()
+        self.secrets.set("", sid)
+
+    def record(self, sid, cid):
+        return self.server(sid)["records"].get(cid, "")
+
+    def suggest_record(self, sid, cid):
+        """``<prefix>.<sni>``, e.g. ``mtn.cdn.example.com``."""
+        server, carrier = self.server(sid), self.carrier(cid)
+        if carrier.get("prefix") and server.get("sni"):
+            return "%s.%s" % (carrier["prefix"], server["sni"])
+        return ""
+
+    def token_for(self, sid):
+        return sanitize_token(self.secrets.get(sid) or self.secrets.get(None))
+
+    # -- carriers ----------------------------------------------------------
+
+    @property
+    def carriers(self):
+        return self.data["carriers"]
+
+    def carrier(self, cid):
+        for c in self.carriers:
+            if c["id"] == cid:
+                return c
+        raise KeyError(cid)
+
+    def save_carrier(self, cid, name, prefix):
+        with self.lock:
+            if cid is None:
+                base = _slug(prefix, "") or "c%d" % int(time.time())
+                cid, n = base, 1
+                ids = {c["id"] for c in self.carriers}
+                while cid in ids:
+                    n += 1
+                    cid = "%s%d" % (base, n)
+                self.carriers.append({"id": cid, "name": name.strip() or cid,
+                                      "prefix": _slug(prefix, "")})
+            else:
+                c = self.carrier(cid)
+                c["name"] = name.strip() or c["name"]
+                c["prefix"] = _slug(prefix, "")
+            self.save()
+            return cid
+
+    def delete_carrier(self, cid):
+        with self.lock:
+            self.data["carriers"] = [c for c in self.carriers if c["id"] != cid]
+            for s in self.servers:
+                s["records"].pop(cid, None)
+            for key in [k for k in self.data["state"] if k.endswith("|" + cid)]:
+                del self.data["state"][key]
+            self.data["memory"].pop(cid, None)
+            self.save()
+
+    # -- per server x carrier state and per carrier memory ------------------
+
+    @staticmethod
+    def key(sid, cid):
+        return "%s|%s" % (sid, cid)
+
+    def state(self, sid, cid):
+        with self.lock:
+            st = self.data["state"].setdefault(self.key(sid, cid), {})
+            st.setdefault("current", [])
+            st.setdefault("status", "unknown")
+            return st
+
+    def memory(self, cid):
+        """Addresses that worked or failed on a carrier, shared by all servers."""
+        with self.lock:
+            mem = self.data["memory"].setdefault(cid, {})
+            mem.setdefault("good", {})
+            mem.setdefault("bad", {})
+            return mem
+
+    def remember_good(self, cid, ip, ping, colo):
+        with self.lock:
+            mem = self.memory(cid)
+            mem["good"][ip] = {"ts": time.time(), "ping": ping, "colo": colo}
+            mem["bad"].pop(ip, None)
+            if len(mem["good"]) > GOOD_LIMIT:
+                keep = sorted(mem["good"].items(), key=lambda kv: -kv[1].get("ts", 0))
+                mem["good"] = dict(keep[:GOOD_LIMIT])
+
+    def remember_bad(self, cid, ips, forget_good=False):
+        with self.lock:
+            mem = self.memory(cid)
+            now = time.time()
+            for ip in ips:
+                mem["bad"][ip] = now
+                if forget_good:
+                    mem["good"].pop(ip, None)
+            if len(mem["bad"]) > BAD_LIMIT:
+                keep = sorted(mem["bad"].items(), key=lambda kv: -kv[1])
+                mem["bad"] = dict(keep[:BAD_LIMIT])
+
+    def clear_bad(self):
+        with self.lock:
+            for mem in self.data["memory"].values():
+                mem["bad"] = {}
+            self.save()
+
+    # -- history -----------------------------------------------------------
+
+    def add_history(self, sid, cid, kind, old=(), new=(), note=""):
+        with self.lock:
+            self.data["history"].append({"ts": time.time(), "server": sid, "carrier": cid,
+                                         "kind": kind, "old": list(old), "new": list(new),
+                                         "note": note})
             del self.data["history"][:-HISTORY_LIMIT]
 
-    def history(self, pid=None):
-        items = self.data["history"]
-        if pid:
-            items = [h for h in items if h.get("profile") == pid]
+    def history(self, sid=None, cid=None):
+        items = [h for h in self.data["history"]
+                 if (sid is None or h.get("server") == sid)
+                 and (cid is None or h.get("carrier") == cid)]
         return list(reversed(items))
 
-    def previous_ips(self, pid):
+    def previous_ips(self, sid, cid):
         """The addresses the record had before its last change, if any."""
-        for h in self.history(pid):
+        for h in self.history(sid, cid):
             if h.get("kind") in ("apply", "manual", "rollback") and h.get("old"):
                 return list(h["old"])
         return []
 
-    def remember_good(self, pid, ip, ping, colo):
-        with self.lock:
-            st = self.state(pid)
-            st["good"][ip] = {"ts": time.time(), "ping": ping, "colo": colo}
-            st["bad"].pop(ip, None)
-            if len(st["good"]) > GOOD_LIMIT:
-                keep = sorted(st["good"].items(), key=lambda kv: -kv[1].get("ts", 0))
-                st["good"] = dict(keep[:GOOD_LIMIT])
-
-    def remember_bad(self, pid, ips, forget_good=False):
-        with self.lock:
-            st = self.state(pid)
-            now = time.time()
-            for ip in ips:
-                st["bad"][ip] = now
-                if forget_good:
-                    st["good"].pop(ip, None)
-            if len(st["bad"]) > BAD_LIMIT:
-                keep = sorted(st["bad"].items(), key=lambda kv: -kv[1])
-                st["bad"] = dict(keep[:BAD_LIMIT])
-
-    def clear_bad(self):
-        with self.lock:
-            for st in self.data["state"].values():
-                st["bad"] = {}
-            self.save()
+    # -- misc --------------------------------------------------------------
 
     def zone_for(self, record):
         return self.data["zones"].get(record, "")
@@ -408,21 +598,23 @@ class Store:
         return list(CF_RANGES_V6 if version == 6 else CF_RANGES_V4)
 
     def export_json(self):
-        """Settings and carriers as JSON, without the token or history."""
-        return json.dumps({"app": "cfscan_ios", "settings": self.settings,
-                           "profiles": self.profiles}, ensure_ascii=False, indent=1)
+        """Servers, carriers and settings as JSON, without tokens or history."""
+        return json.dumps({"app": "cfscan_ios", "version": 2, "settings": self.settings,
+                           "servers": self.servers, "carriers": self.carriers},
+                          ensure_ascii=False, indent=1)
 
     def import_json(self, text):
         raw = json.loads(text)
         if not isinstance(raw, dict) or raw.get("app") != "cfscan_ios":
             raise ValueError("not a CF Scanner export")
-        merged = normalise_data({"settings": raw.get("settings"),
-                                 "profiles": raw.get("profiles")})
+        merged = normalise_data({k: raw.get(k) for k in ("settings", "servers", "carriers",
+                                                          "profiles") if k in raw})
         with self.lock:
-            self.data["settings"] = merged["settings"]
-            self.data["profiles"] = merged["profiles"]
+            for key in ("settings", "servers", "carriers", "active_server"):
+                self.data[key] = merged[key]
+            if merged["state"]:
+                self.data["state"].update(merged["state"])
             self.save()
-
 
 # ---------------------------------------------------------------- probes
 
@@ -951,26 +1143,24 @@ class CloudflareAPI:
         return ops
 
 
-def _api_attempts(store, via_ips, api_factory):
-    """API clients to try: direct first, then through up to three clean IPs."""
-    token = sanitize_token(store.secrets.get())
+
+def with_api(store, sid, via_ips, fn, api_factory=CloudflareAPI):
+    """``fn(api)`` directly, or through a clean address if the API is blocked.
+
+    Uses the server's own token when it has one, else the main token.
+    """
+    token = store.token_for(sid)
     problem = token_problem(token)
     if problem:
         raise CFError(problem)
-    yield api_factory(token)
-    for ip in list(via_ips)[:3]:
-        yield api_factory(token, via_ip=ip)
-
-
-def with_api(store, via_ips, fn, api_factory=CloudflareAPI):
-    """``fn(api)`` directly, or through a clean address if the API is blocked."""
     last = None
-    for api in _api_attempts(store, via_ips, api_factory):
+    for via in [None] + list(via_ips)[:3]:
+        api = api_factory(token) if via is None else api_factory(token, via_ip=via)
         try:
-            return fn(api), api.via_ip
+            return fn(api), via
         except NetError as exc:
             last = exc
-            log("api unreachable via %s: %s" % (api.via_ip or "direct", exc))
+            log("api unreachable via %s: %s" % (via or "direct", exc))
     raise last or NetError("unreachable")
 
 
@@ -978,14 +1168,14 @@ def with_api(store, via_ips, fn, api_factory=CloudflareAPI):
 _BAD_ZONE_CODES = (7000, 7003, 1001)
 
 
-def with_zone(store, api, record, fn):
+def with_zone(store, api, server, record, fn):
     """``fn(zone_id)`` for the zone ``record`` is in.
 
-    The Zone ID from the settings, else the one remembered for this record,
-    else a lookup. A wrong Zone ID in the settings (an Account ID pasted by
-    mistake) or a stale remembered one falls back to the lookup.
+    The server's Zone ID, else the one remembered for this record, else a
+    lookup. A wrong Zone ID (an Account ID pasted by mistake) or a stale
+    remembered one falls back to the lookup.
     """
-    configured = store.settings["zone_id"].strip()
+    configured = (server.get("zone_id") or "").strip()
     zone = configured or store.zone_for(record)
     if zone:
         try:
@@ -1001,19 +1191,29 @@ def with_zone(store, api, record, fn):
     return fn(zone)
 
 
-def read_record_ips(store, profile, rtype, via_ips=(), api_factory=CloudflareAPI):
-    record = profile["record"]
+def _record_or_fail(store, sid, cid):
+    record = store.record(sid, cid)
+    if not record:
+        raise CFError("زیردامنهٔ «%s» برای سرور «%s» تنظیم نشده"
+                      % (store.carrier(cid)["name"], store.server(sid)["name"]))
+    return record
+
+
+def read_record_ips(store, sid, cid, rtype, via_ips=(), api_factory=CloudflareAPI):
+    record = _record_or_fail(store, sid, cid)
+    server = store.server(sid)
 
     def fn(api):
-        return with_zone(store, api, record,
+        return with_zone(store, api, server, record,
                          lambda zone: [r["content"] for r in api.list_records(zone, record, rtype)])
 
-    return with_api(store, via_ips, fn, api_factory)[0]
+    return with_api(store, sid, via_ips, fn, api_factory)[0]
 
 
-def inspect_record(store, profile, rtype, api_factory=CloudflareAPI):
-    """(zone name, addresses, notes) for the settings check."""
-    record = profile["record"]
+def inspect_record(store, sid, cid, rtype, api_factory=CloudflareAPI):
+    """(zone name, addresses, notes) for the Cloudflare check."""
+    record = _record_or_fail(store, sid, cid)
+    server = store.server(sid)
 
     def fn(api):
         def look(zone):
@@ -1023,37 +1223,50 @@ def inspect_record(store, profile, rtype, api_factory=CloudflareAPI):
             except CFError:
                 zone_name = ""
             return zone_name, ips, notes
-        return with_zone(store, api, record, look)
+        return with_zone(store, api, server, record, look)
 
-    return with_api(store, [], fn, api_factory)[0]
+    return with_api(store, sid, [], fn, api_factory)[0]
 
 
-def apply_ips(store, pid, ips, via_ips=(), kind="apply", note="", api_factory=CloudflareAPI):
-    """Point the carrier's record at ``ips``; returns the ops and the route."""
-    profile = store.profile(pid)
-    record = profile["record"]
-    if not record:
-        raise CFError("زیردامنهٔ این اپراتور تنظیم نشده")
+def apply_ips(store, sid, cid, ips, via_ips=(), kind="apply", note="", api_factory=CloudflareAPI):
+    """Point the record of ``cid`` on server ``sid`` at ``ips``."""
+    record = _record_or_fail(store, sid, cid)
+    server = store.server(sid)
     if not ips:
         raise CFError("هیچ IP برای اعمال نیست")
     rtype = "AAAA" if ":" in ips[0] else "A"
     ttl = int(store.settings["ttl"])
 
     def fn(api):
-        return with_zone(store, api, record,
+        return with_zone(store, api, server, record,
                          lambda zone: api.sync_records(zone, record, ips, rtype, ttl))
 
-    ops, via = with_api(store, via_ips, fn, api_factory)
+    ops, via = with_api(store, sid, via_ips, fn, api_factory)
     with store.lock:
-        st = store.state(pid)
+        st = store.state(sid, cid)
         old = list(st.get("current") or [])
         st["current"] = list(ips)
         st["status"] = "ok"
         st["checked_at"] = time.time()
-        store.add_history(pid, kind, old, ips, note or ("via %s" % via if via else ""))
+        store.add_history(sid, cid, kind, old, ips, "via %s" % via if via else note)
         store.save()
     log("applied %s -> %s (%s)" % (record, ips, kind))
     return ops, via
+
+
+def connection_check(timeout=6.0, url="https://speed.cloudflare.com/cdn-cgi/trace"):
+    """Where Cloudflare sees this phone: ``{"ok", "loc", "ip", "colo", "error"}``.
+
+    ``loc`` other than ``IR`` means the traffic leaves through a VPN.
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            info = parse_trace(b"\r\n\r\n" + resp.read(4096))
+        return {"ok": True, "loc": info.get("loc", ""), "ip": info.get("ip", ""),
+                "colo": info.get("colo", ""), "error": ""}
+    except Exception as exc:
+        return {"ok": False, "loc": "", "ip": "", "colo": "", "error": describe_error(exc)}
 
 
 # ---------------------------------------------------------------- scan engine
@@ -1085,17 +1298,18 @@ class UserError(Exception):
 
 
 class ScanJob:
-    """One carrier's check -> scan -> verify -> apply run.
+    """One server x carrier run: check -> scan -> verify -> apply.
 
     ``mode``: ``auto`` scans only when the current address is broken,
     ``force`` scans anyway, ``check`` only re-checks the current address.
     """
 
-    def __init__(self, store, pid, events=None, mode="auto", context_factory=make_context,
+    def __init__(self, store, sid, cid, events=None, mode="auto", context_factory=make_context,
                  api_factory=CloudflareAPI, candidates=None, rng=None,
                  probe_trace=trace_probe, probe_ws=ws_probe):
         self.store = store
-        self.pid = pid
+        self.sid = sid
+        self.cid = cid
         self.events = events or Events()
         self.mode = mode
         self.context_factory = context_factory
@@ -1117,18 +1331,21 @@ class ScanJob:
 
     def run(self):
         self.running = True
-        log("job start %s mode=%s" % (self.pid, self.mode))
+        log("job start %s/%s mode=%s" % (self.sid, self.cid, self.mode))
+        started = time.time()
         try:
             result = self._run()
-        except (UserError, CFError, NetError) as exc:
+        except (UserError, CFError, NetError, KeyError) as exc:
             result = {"kind": "error", "message": str(exc)}
         except Exception as exc:
             log("job crashed: %r" % (exc,))
             result = {"kind": "error", "message": "%s: %s" % (exc.__class__.__name__, exc)}
-        result.setdefault("profile", self.pid)
+        result.setdefault("server", self.sid)
+        result.setdefault("carrier", self.cid)
+        result["elapsed"] = time.time() - started
         self.result = result
         self.running = False
-        log("job end %s: %s" % (self.pid, result.get("kind")))
+        log("job end %s/%s: %s" % (self.sid, self.cid, result.get("kind")))
         self.events.finished(result)
         return result
 
@@ -1136,31 +1353,29 @@ class ScanJob:
 
     def _run(self):
         s = self.store.settings
-        profile = self.store.profile(self.pid)
-        target = Target.from_settings(s)
+        server = self.store.server(self.sid)
+        record = self.store.record(self.sid, self.cid)
+        target = Target.from_settings(server)
         if not target.sni:
-            raise UserError("دامنهٔ CDN در تنظیمات خالی است")
+            raise UserError("دامنهٔ CDN برای سرور «%s» خالی است" % server["name"])
         version = int(s["ip_version"])
         rtype = "AAAA" if version == 6 else "A"
         ctx = self.context_factory()
         use_ws = bool(target.path)
-        started = time.time()
-        result = {"kind": None, "profile": self.pid, "current": [], "current_measure": [],
-                  "verified": [], "chosen": [], "warning": "", "scanned": 0,
-                  "answered": 0, "errors": "", "record": profile["record"]}
+        has_token = bool(self.store.token_for(self.sid))
+        result = {"kind": None, "server": self.sid, "carrier": self.cid, "record": record,
+                  "current": [], "current_measure": [], "verified": [], "chosen": [],
+                  "warning": "", "scanned": 0, "answered": 0, "errors": ""}
 
         # 1. the address the record has now
         self.events.step(0, "run")
-        current = []
-        if profile["record"] and self.store.secrets.get():
+        current = list(self.store.state(self.sid, self.cid).get("current") or [])
+        if record and has_token:
             try:
-                current = read_record_ips(self.store, profile, rtype,
+                current = read_record_ips(self.store, self.sid, self.cid, rtype,
                                           api_factory=self.api_factory)
             except (CFError, NetError) as exc:
                 self.events.note("خواندن رکورد از کلادفلر نشد: %s" % exc)
-                current = list(self.store.state(self.pid).get("current") or [])
-        else:
-            current = list(self.store.state(self.pid).get("current") or [])
         current = [ip for ip in current if (":" in ip) == (version == 6)]
         result["current"] = current
         healthy = None
@@ -1169,15 +1384,14 @@ class ScanJob:
             ms = self._measure_many(current, target, ctx, attempts, use_ws)
             result["current_measure"] = ms
             healthy = all(is_healthy(m, s["max_loss_pct"], s["max_ping_ms"]) for m in ms)
-            first = ms[0]
             with self.store.lock:
-                st = self.store.state(self.pid)
+                st = self.store.state(self.sid, self.cid)
                 st.update(current=current, status="ok" if healthy else "bad",
-                          checked_at=time.time(), ping=first["ping"],
-                          detail=self._measure_text(first))
+                          checked_at=time.time(), ping=ms[0]["ping"],
+                          detail=self._measure_text(ms[0]))
                 if not healthy:
                     dead = [m["ip"] for m in ms if m["ok"] == 0]
-                    self.store.remember_bad(self.pid, dead, forget_good=True)
+                    self.store.remember_bad(self.cid, dead, forget_good=True)
                 self.store.save()
             self.events.step(0, "ok" if healthy else "fail",
                              "  ".join(self._measure_text(m) for m in ms))
@@ -1189,21 +1403,23 @@ class ScanJob:
             for i in (1, 2, 3):
                 self.events.step(i, "skip")
             result["kind"] = "healthy" if healthy else ("broken" if healthy is False else "unknown")
-            self.store.add_history(self.pid, "check", current, current,
-                                   "سالم" if healthy else "خراب")
-            self.store.save()
+            if self.mode == "check":
+                self.store.add_history(self.sid, self.cid, "check", current, current,
+                                       "سالم" if healthy else "خراب")
+                self.store.save()
             return result
 
         # 2. fast pass over the candidates
         self.events.step(1, "run")
-        st = self.store.state(self.pid)
+        mem = self.store.memory(self.cid)
         if self.fixed_candidates is not None:
             cands = list(self.fixed_candidates)
         else:
-            cands = build_candidates(st, int(s["candidates"]), version,
+            cands = build_candidates(mem, int(s["candidates"]), version,
                                      self.store.ranges(version), rng=self.rng,
                                      bad_ttl_s=float(s["bad_ttl_hours"]) * 3600,
                                      exclude=current)
+        started = time.time()
         answered, scanned, failed, errors = self._fast_pass(cands, target, ctx, s)
         result["scanned"], result["answered"] = scanned, len(answered)
         result["errors"] = error_summary(errors)
@@ -1213,7 +1429,11 @@ class ScanJob:
                                  % ", ".join(sorted(locs)))
             self.events.note(result["warning"])
         if answered:
-            self.store.remember_bad(self.pid, failed)
+            self.store.remember_bad(self.cid, failed)
+        with self.store.lock:
+            self.store.state(self.sid, self.cid)["last_scan"] = {
+                "ts": time.time(), "scanned": scanned, "answered": len(answered),
+                "seconds": round(time.time() - started, 1)}
             self.store.save()
         if self.cancelled:
             return self._stopped(result)
@@ -1237,7 +1457,7 @@ class ScanJob:
         self.events.found(ms)
         passing = [m for m in ms if m["ok"] > 0 and m["loss"] <= s["max_loss_pct"]]
         for m in passing:
-            self.store.remember_good(self.pid, m["ip"], m["ping"], m["colo"])
+            self.store.remember_good(self.cid, m["ip"], m["ping"], m["colo"])
         self.store.save()
         if self.cancelled:
             return self._stopped(result)
@@ -1248,17 +1468,17 @@ class ScanJob:
             result["hint"] = self._hint(errs, version, verify=True, use_ws=use_ws)
             return result
         best = passing[0]
+        result["best"] = best
         self.events.step(2, "ok", "بهترین: %s  %s" % (best["ip"], self._measure_text(best)))
 
         # 4. the DNS record
         chosen = [m["ip"] for m in passing[:int(s["ips_per_record"])]]
         result["chosen"] = chosen
         result["via"] = [m["ip"] for m in passing]
-        result["elapsed"] = time.time() - started
         if current and sorted(current) == sorted(chosen):
             self.events.step(3, "ok", "رکورد همین IP را دارد")
             result["kind"] = "unchanged"
-        elif not profile["record"] or not self.store.secrets.get():
+        elif not record or not has_token:
             self.events.step(3, "skip", "زیردامنه یا توکن تنظیم نشده")
             result["kind"] = "found"
         elif not s["auto_apply"]:
@@ -1273,15 +1493,14 @@ class ScanJob:
         result = result if result is not None else (self.result or {})
         self.events.step(3, "run")
         try:
-            ops, via = apply_ips(self.store, self.pid, ips, result.get("via") or [],
+            ops, via = apply_ips(self.store, self.sid, self.cid, ips, result.get("via") or [],
                                  kind=kind, api_factory=self.api_factory)
         except (CFError, NetError) as exc:
             self.events.step(3, "fail", str(exc))
             result["kind"] = "apply_failed"
             result["message"] = str(exc)
             return False
-        record = self.store.profile(self.pid)["record"]
-        detail = "%s → %s" % (record, ", ".join(ips))
+        detail = "%s → %s" % (self.store.record(self.sid, self.cid), ", ".join(ips))
         if via:
             detail += "  (API از طریق %s)" % via
         self.events.step(3, "ok", detail)
@@ -1361,7 +1580,8 @@ class ScanJob:
             return "%s: پاسخ نداد (%s)" % (m["ip"], error_summary(m.get("errors") or [], 1))
         return "%.0fms  jitter %.0f  loss %.0f%%" % (m["ping"], m.get("jitter") or 0, m["loss"])
 
-    def _stopped(self, result):
+    @staticmethod
+    def _stopped(result):
         result["kind"] = "stopped"
         return result
 
@@ -1369,16 +1589,47 @@ class ScanJob:
     def _hint(errors, version, verify=False, use_ws=False):
         joined = " ".join(errors)
         if version == 6 and ("unreachable" in joined.lower() or "No route" in joined):
-            return "این اینترنت IPv6 ندارد؛ در تنظیمات IPv4 را انتخاب کنید."
+            return "این اینترنت IPv6 ندارد؛ در تنظیمات اسکن IPv4 را انتخاب کنید."
         if verify and use_ws and "HTTP 404" in joined:
-            return "پاسخ 404 گرفتیم: path کانفیگ در تنظیمات با inbound سرور یکی نیست."
+            return "پاسخ 404 گرفتیم: path این سرور با inbound یکی نیست."
         if verify and use_ws and any(code in joined for code in ("HTTP 52", "HTTP 50")):
             return "کلادفلر به سرور شما وصل نشد (خطای 5xx): سرور یا پورت را بررسی کنید."
         if "TLS" in joined or "reset" in joined:
-            return "اتصال TLS قطع می‌شود؛ ممکن است SNI دامنهٔ شما روی این اپراتور فیلتر باشد."
+            return "اتصال TLS قطع می‌شود؛ ممکن است SNI این سرور روی این اپراتور فیلتر باشد."
         if errors and all(e == "timeout" for e in errors):
             return "همه timeout شدند؛ اینترنت، حالت هواپیما یا روشن بودن VPN را بررسی کنید."
         return ""
+
+
+RESULT_TEXT = {
+    "healthy": "IP فعلی سالم است",
+    "applied": "IP جدید اعمال شد",
+    "unchanged": "بهترین IP همان قبلی است",
+    "pending": "IP پیدا شد؛ «اعمال» را بزنید",
+    "found": "IP پیدا شد (زیردامنه یا توکن تنظیم نشده)",
+    "stopped": "متوقف شد",
+    "broken": "IP فعلی خراب است",
+    "unknown": "IP ثبت‌شده‌ای نیست",
+    "nothing": "IP سالمی پیدا نشد",
+    "apply_failed": "اعمال روی DNS نشد",
+    "error": "خطا",
+}
+GOOD_KINDS = ("healthy", "applied", "unchanged", "pending", "found")
+
+
+def result_line(result):
+    """One Persian line for a finished run, for summaries and alerts."""
+    kind = result.get("kind")
+    text = RESULT_TEXT.get(kind, kind or "?")
+    ips = result.get("chosen") or (result.get("current") if kind == "healthy" else [])
+    if ips:
+        text += ": " + ", ".join(ips)
+    best = result.get("best")
+    if best and best.get("ping") is not None and kind in ("applied", "pending", "unchanged", "found"):
+        text += " · %.0fms %s" % (best["ping"], best.get("colo", ""))
+    if kind in ("error", "apply_failed") and result.get("message"):
+        text += " — " + result["message"]
+    return text
 
 
 def ago(ts, now=None):
@@ -1416,6 +1667,7 @@ MUTED = "#5B5E66"
 LINE = "#E2DED6"
 BORDER = "#C9C4B8"
 ACCENT = "#1F4FD1"
+ACCENT_BG = "#EEF2FC"
 GOOD = "#17663F"
 GOOD_BG = "#E3F2EA"
 BAD = "#A3261C"
@@ -1461,6 +1713,14 @@ if ui is not None:
             b.border_color = BORDER
         return b
 
+    def make_card(border=LINE, width=1):
+        v = ui.View()
+        v.background_color = CARD
+        v.corner_radius = 18
+        v.border_width = width
+        v.border_color = border
+        return v
+
     def run_bg(fn, *args):
         """Dialogs block, so every dialog flow runs off the main thread."""
         def wrapper():
@@ -1470,15 +1730,11 @@ if ui is not None:
                 pass  # a dialog was cancelled
             except Exception as exc:
                 log("flow %s failed: %r" % (getattr(fn, "__name__", fn), exc))
-                try:
-                    console.alert("خطا", "%s: %s" % (exc.__class__.__name__, exc), "باشه",
-                                  hide_cancel_button=True)
-                except KeyboardInterrupt:
-                    pass
+                alert("خطا", "%s: %s" % (exc.__class__.__name__, exc))
         threading.Thread(target=wrapper, name="flow", daemon=True).start()
 
     def alert(title, message="", *buttons):
-        """console.alert with Persian defaults; returns the pressed index or 0."""
+        """console.alert with Persian defaults; the pressed index, 0 on cancel."""
         try:
             if buttons:
                 return console.alert(title, message, *buttons)
@@ -1487,30 +1743,46 @@ if ui is not None:
         except KeyboardInterrupt:
             return 0
 
+    def pick(title, items):
+        """list_dialog returning the index, or None."""
+        choice = dialogs.list_dialog(title, list(items))
+        if choice is None:
+            return None
+        return list(items).index(choice)
+
+    def text_field(key, title, value, kind="text"):
+        return {"type": kind, "key": key, "title": title, "value": str(value),
+                "autocorrection": False, "autocapitalization": ui.AUTOCAPITALIZE_NONE}
+
     STATUS_STYLE = {
         "ok": ("سالم", GOOD, GOOD_BG),
         "bad": ("قطع", BAD, BAD_BG),
         "unknown": ("بررسی نشده", NEUTRAL, NEUTRAL_BG),
-        "unset": ("تنظیم نشده", NEUTRAL, NEUTRAL_BG),
+        "unset": ("بدون زیردامنه", NEUTRAL, NEUTRAL_BG),
     }
 
-    class ProfileCard(ui.View):
-        HEIGHT = 168
+    # ------------------------------------------------------------------ cards
 
-        def __init__(self, app, profile):
+    class CarrierCard(ui.View):
+        HEIGHT = 172
+
+        def __init__(self, app, sid, carrier):
             self.app = app
-            self.pid = profile["id"]
-            st = app.store.state(self.pid)
-            status = st.get("status", "unknown") if profile["record"] else "unset"
+            self.sid = sid
+            self.cid = carrier["id"]
+            store = app.store
+            record = store.record(sid, self.cid)
+            st = store.state(sid, self.cid)
+            status = st.get("status", "unknown") if record else "unset"
             text, fg, bg = STATUS_STYLE.get(status, STATUS_STYLE["unknown"])
             self.background_color = CARD
             self.corner_radius = 18
             self.border_width = 1.5 if status == "bad" else 1
             self.border_color = BAD if status == "bad" else LINE
 
-            self.name_label = make_label(profile["name"], 18, bold=True)
-            self.record_label = make_label(profile["record"] or "زیردامنه تنظیم نشده",
-                                           12, color=MUTED, mono=bool(profile["record"]))
+            self.name_label = make_label(carrier["name"], 18, bold=True)
+            self.record_label = make_label(record or "زیردامنه تنظیم نشده — «بیشتر» را بزنید",
+                                           12, color=MUTED, mono=bool(record))
             self.pill = make_label(text, 13, bold=True, color=fg, align="center")
             self.pill.background_color = bg
             self.pill.corner_radius = 12
@@ -1522,28 +1794,46 @@ if ui is not None:
                 info = "%.0fms · %s" % (st["ping"], info)
             elif status == "bad" and st.get("detail"):
                 info = "%s · %s" % (st["detail"], info)
+            last = st.get("last_scan")
+            if last:
+                info += " · اسکن: %d/%d در %.0f ثانیه" % (last["answered"], last["scanned"],
+                                                         last["seconds"])
             self.info_label = make_label(info, 12, color=BAD if status == "bad" else MUTED)
-            self.go = make_button("تست و اصلاح", self.tapped_go, primary=(status == "bad"))
-            self.more = make_button("بیشتر", self.tapped_more, size=15)
+
+            many = len(store.servers) > 1
+            self.go = make_button("تست و اصلاح", self.tapped_go, primary=(status == "bad"),
+                                  size=15)
+            self.all = make_button("همه سرورها", self.tapped_all, size=14) if many else None
+            self.more = make_button("بیشتر", self.tapped_more, size=14)
             for v in (self.name_label, self.record_label, self.pill, self.ip_label,
-                      self.info_label, self.go, self.more):
-                self.add_subview(v)
+                      self.info_label, self.go, self.more, self.all):
+                if v is not None:
+                    self.add_subview(v)
 
         def layout(self):
             w = self.width
-            self.pill.frame = (16, 16, 96, 26)
-            self.name_label.frame = (120, 12, w - 136, 26)
-            self.record_label.frame = (16, 42, w - 32, 18)
+            self.pill.frame = (16, 16, 104, 26)
+            self.name_label.frame = (128, 12, w - 144, 26)
+            self.record_label.frame = (16, 44, w - 32, 18)
             self.ip_label.frame = (16, 70, w - 32, 22)
             self.info_label.frame = (16, 94, w - 32, 18)
-            self.more.frame = (16, 120, 86, 36)
-            self.go.frame = (110, 120, w - 126, 36)
+            y, h = 124, 38
+            if self.all is None:
+                self.more.frame = (16, y, 80, h)
+                self.go.frame = (104, y, w - 120, h)
+            else:
+                self.more.frame = (16, y, 70, h)
+                self.all.frame = (94, y, 104, h)
+                self.go.frame = (206, y, w - 222, h)
 
         def tapped_go(self, sender):
-            self.app.start_scan(self.pid, "auto")
+            self.app.start_scan([(self.sid, self.cid)], "auto")
+
+        def tapped_all(self, sender):
+            self.app.start_all_servers(self.cid)
 
         def tapped_more(self, sender):
-            run_bg(self.app.profile_menu, self.pid)
+            run_bg(self.app.carrier_menu, self.sid, self.cid)
 
     class MainView(ui.View):
         def __init__(self, app):
@@ -1553,85 +1843,142 @@ if ui is not None:
             self.scroll = ui.ScrollView()
             self.scroll.always_bounce_vertical = True
             self.add_subview(self.scroll)
-            self.subtitle = make_label("IP تمیز برای هر اپراتور", 14, color=MUTED)
-            self.banner = ui.View()
-            self.banner.background_color = WARN_BG
-            self.banner.corner_radius = 14
-            self.banner_label = make_label(
-                "قبل از اسکن VPN را خاموش کنید و اینترنت گوشی را روی همان اپراتور بگذارید.",
-                13, color=WARN, lines=2)
-            self.banner.add_subview(self.banner_label)
+
+            self.server_card = make_card(border=ACCENT, width=1.5)
+            self.server_caption = make_label("سرور فعال", 12, color=MUTED)
+            self.server_name = make_label("", 20, bold=True)
+            self.server_sni = make_label("", 12, color=MUTED, mono=True)
+            self.server_btn = make_button("تغییر سرور", self.tapped_server, size=14)
+            for v in (self.server_caption, self.server_name, self.server_sni, self.server_btn):
+                self.server_card.add_subview(v)
+
+            self.net_btn = ui.Button()
+            self.net_btn.corner_radius = 14
+            self.net_btn.font = ("<System-Bold>", 13)
+            self.net_btn.action = lambda s: run_bg(self.app.check_connection)
+            self.set_connection(None)
+
+            self.empty = make_label("هنوز سروری ندارید. «افزودن سرور» را بزنید: دامنهٔ CDN، "
+                                    "path و زیردامنهٔ هر اپراتور.", 15, color=MUTED, lines=4)
+            self.empty_btn = make_button("افزودن سرور", lambda s: run_bg(self.app.edit_server, None),
+                                         primary=True)
             self.footer = make_label("", 12, color=MUTED, align="center", lines=2)
-            for v in (self.subtitle, self.banner, self.footer):
+            for v in (self.server_card, self.net_btn, self.empty, self.empty_btn, self.footer):
                 self.scroll.add_subview(v)
             self.cards = []
             self.right_button_items = [
-                ui.ButtonItem(title="تنظیمات", action=lambda s: run_bg(self.app.open_settings)),
                 ui.ButtonItem(title="ابزارها", action=lambda s: run_bg(self.app.open_tools)),
+                ui.ButtonItem(title="تنظیمات", action=lambda s: run_bg(self.app.open_settings)),
             ]
             self.refresh()
 
         @on_main_thread
         def refresh(self):
+            store = self.app.store
             for c in self.cards:
                 self.scroll.remove_subview(c)
-            self.cards = [ProfileCard(self.app, p) for p in self.app.store.profiles]
-            for c in self.cards:
-                self.scroll.add_subview(c)
-            s = self.app.store.settings
-            if not s["sni"] or not self.app.store.secrets.get():
-                self.footer.text = fa("اول «تنظیمات» را کامل کنید: دامنهٔ CDN و توکن کلادفلر.")
+            server = store.active
+            self.cards = []
+            if server:
+                self.cards = [CarrierCard(self.app, server["id"], c) for c in store.carriers]
+                for c in self.cards:
+                    self.scroll.add_subview(c)
+                self.server_name.text = fa(server["name"])
+                self.server_sni.text = "%s%s" % (server["sni"] or "(CDN domain?)",
+                                                 "  " + server["path"] if server["path"] else "")
+                count = len(store.servers)
+                self.server_caption.text = fa("سرور فعال (%d از %d)" % (
+                    [s["id"] for s in store.servers].index(server["id"]) + 1, count))
+            self.server_card.hidden = server is None
+            self.empty.hidden = self.empty_btn.hidden = server is not None
+            s = store.settings
+            if not store.secrets.get(None) and server and not store.secrets.get(server["id"]):
+                self.footer.text = fa("توکن کلادفلر وارد نشده: «تنظیمات ← حساب کلادفلر».")
                 self.footer.text_color = BAD
             else:
-                self.footer.text = fa("%s · IPv%d · %s" % (s["sni"], s["ip_version"],
-                                                          "اعمال خودکار" if s["auto_apply"]
-                                                          else "اعمال با تأیید"))
+                self.footer.text = fa("IPv%d · %d کاندید · %s" % (
+                    s["ip_version"], s["candidates"],
+                    "اعمال خودکار" if s["auto_apply"] else "اعمال با تأیید"))
                 self.footer.text_color = MUTED
             self.layout()
+
+        @on_main_thread
+        def set_connection(self, info):
+            if info is None:
+                text, fg, bg = "در حال بررسی اتصال…", NEUTRAL, NEUTRAL_BG
+            elif not info["ok"]:
+                text, fg, bg = "اینترنت در دسترس نیست (%s) — بزنید" % info["error"], BAD, BAD_BG
+            elif info["loc"] and info["loc"] != "IR":
+                text, fg, bg = "VPN روشن است (%s) — خاموشش کنید، بعد بزنید" % info["loc"], BAD, BAD_BG
+            else:
+                text, fg, bg = "✓ اینترنت ایران · %s · %s" % (info["ip"], info["colo"]), GOOD, GOOD_BG
+            self.net_btn.title = fa(text)
+            self.net_btn.tint_color = fg
+            self.net_btn.background_color = bg
+
+        def tapped_server(self, sender):
+            run_bg(self.app.server_menu)
 
         def layout(self):
             w, h = self.width, self.height
             pad = 16
             inner = w - 2 * pad
             self.scroll.frame = (0, 0, w, h)
-            y = 10
-            self.subtitle.frame = (pad, y, inner, 22)
-            y += 30
-            self.banner.frame = (pad, y, inner, 56)
-            self.banner_label.frame = (12, 6, inner - 24, 44)
-            y += 68
+            y = 12
+            if not self.server_card.hidden:
+                self.server_card.frame = (pad, y, inner, 92)
+                self.server_btn.frame = (12, 28, 104, 36)
+                self.server_caption.frame = (124, 10, inner - 136, 18)
+                self.server_name.frame = (124, 30, inner - 136, 28)
+                self.server_sni.frame = (124, 60, inner - 136, 20)
+                y += 104
+            self.net_btn.frame = (pad, y, inner, 40)
+            y += 52
+            if not self.empty.hidden:
+                self.empty.frame = (pad, y, inner, 90)
+                self.empty_btn.frame = (pad, y + 96, inner, 48)
+                y += 160
             for c in self.cards:
-                c.frame = (pad, y, inner, ProfileCard.HEIGHT)
-                y += ProfileCard.HEIGHT + 12
+                c.frame = (pad, y, inner, CarrierCard.HEIGHT)
+                y += CarrierCard.HEIGHT + 12
             self.footer.frame = (pad, y, inner, 40)
             y += 56
             self.scroll.content_size = (w, y)
+
+    # ------------------------------------------------------------------ scan screen
 
     STEP_ICONS = {"wait": ("○", MUTED), "run": ("●", ACCENT), "ok": ("✓", GOOD),
                   "fail": ("✕", BAD), "skip": ("–", MUTED)}
 
     class ScanView(ui.View):
-        """Implements the :class:`Events` methods the scan calls."""
+        """Runs one or more server x carrier jobs, one after the other.
 
-        def __init__(self, app, pid, mode):
+        Implements the :class:`Events` methods the jobs call.
+        """
+
+        def __init__(self, app, targets, mode):
             self.app = app
-            self.pid = pid
-            profile = app.store.profile(pid)
-            self.name = profile["name"]
-            self.background_color = BG
-            self.result = None
+            self.targets = list(targets)
+            self.index = 0
+            self.mode = mode
+            self.summary = []
             self.rows = []
+            self.result = None
+            self.job = None
+            self.started = time.time()
+            carrier = app.store.carrier(self.targets[0][1])
+            self.name = carrier["name"]
+            self.background_color = BG
 
             self.scroll = ui.ScrollView()
             self.add_subview(self.scroll)
-            self.record_label = make_label(profile["record"] or "", 13, color=MUTED, mono=True)
-            self.scroll.add_subview(self.record_label)
+            self.batch_label = make_label("", 13, bold=True, color=ACCENT)
+            self.server_label = make_label("", 16, bold=True)
+            self.record_label = make_label("", 12, color=MUTED, mono=True)
+            for v in (self.batch_label, self.server_label, self.record_label):
+                self.scroll.add_subview(v)
 
-            self.step_card = ui.View()
-            self.step_card.background_color = CARD
-            self.step_card.corner_radius = 18
-            self.step_card.border_width = 1
-            self.step_card.border_color = LINE
+            self.step_card = make_card()
             self.scroll.add_subview(self.step_card)
             self.step_views = []
             for title in STEP_TITLES:
@@ -1641,7 +1988,6 @@ if ui is not None:
                 for v in (icon, name, detail):
                     self.step_card.add_subview(v)
                 self.step_views.append((icon, name, detail))
-
             self.track = ui.View()
             self.track.background_color = "#E7E3DA"
             self.track.corner_radius = 4
@@ -1649,19 +1995,19 @@ if ui is not None:
             self.fill.background_color = ACCENT
             self.fill.corner_radius = 4
             self.track.add_subview(self.fill)
-            self.step_card.add_subview(self.track)
             self.counter = make_label("", 12, color=MUTED)
+            self.step_card.add_subview(self.track)
             self.step_card.add_subview(self.counter)
             self.fraction = 0.0
 
-            self.notes = make_label("", 13, color=WARN, lines=4)
+            self.outcome = make_label("", 16, bold=True, lines=3, align="center")
+            self.outcome.corner_radius = 14
+            self.outcome.hidden = True
+            self.notes = make_label("", 13, color=WARN, lines=5)
             self.notes.background_color = WARN_BG
             self.notes.corner_radius = 12
             self.notes.hidden = True
-            self.scroll.add_subview(self.notes)
-
             self.table_title = make_label("بهترین‌ها تا این لحظه", 14, bold=True)
-            self.scroll.add_subview(self.table_title)
             self.table = ui.TableView()
             self.table.corner_radius = 16
             self.table.border_width = 1
@@ -1671,27 +2017,59 @@ if ui is not None:
             self.ds.font = ("Menlo", 13)
             self.ds.text_color = INK
             self.ds.action = self.row_tapped
-            self.table.data_source = self.ds
-            self.table.delegate = self.ds
-            self.scroll.add_subview(self.table)
-            self.table_hint = make_label("روی هر ردیف بزنید تا همان IP را اعمال یا کپی کنید.",
-                                         12, color=MUTED)
+            self.table.data_source = self.table.delegate = self.ds
+            self.table_hint = make_label("روی هر ردیف بزنید تا همان IP را اعمال، کپی یا دوباره تست کنید.",
+                                         12, color=MUTED, lines=2)
             self.table_hint.hidden = True
-            self.scroll.add_subview(self.table_hint)
+            for v in (self.outcome, self.notes, self.table_title, self.table, self.table_hint):
+                self.scroll.add_subview(v)
 
             self.stop_btn = make_button("توقف", self.tapped_stop, color=BAD)
             self.apply_btn = make_button("اعمال روی DNS", self.tapped_apply, primary=True)
-            self.copy_btn = make_button("کپی IPها", self.tapped_copy)
+            self.copy_btn = make_button("کپی IP", self.tapped_copy)
             self.again_btn = make_button("اسکن دوباره", self.tapped_again)
             for v in (self.stop_btn, self.apply_btn, self.copy_btn, self.again_btn):
                 self.add_subview(v)
             self.apply_btn.hidden = self.copy_btn.hidden = self.again_btn.hidden = True
 
-            self.mode = mode
-            self.job = ScanJob(app.store, pid, events=self, mode=mode)
+        @property
+        def batch(self):
+            return len(self.targets) > 1
+
+        @property
+        def running(self):
+            return self.job is not None and self.job.running
+
+        def current_target(self):
+            return self.targets[min(self.index, len(self.targets) - 1)]
+
+        # -- running ------------------------------------------------------
 
         def start(self):
             console.set_idle_timer_disabled(True)
+            self._begin(0)
+
+        @on_main_thread
+        def _begin(self, index):
+            self.index = index
+            sid, cid = self.targets[index]
+            store = self.app.store
+            server = store.server(sid)
+            self.server_label.text = fa("سرور: %s" % server["name"])
+            self.record_label.text = store.record(sid, cid) or server["sni"]
+            self.batch_label.text = fa("سرور %d از %d" % (index + 1, len(self.targets))) \
+                if self.batch else ""
+            for icon, name, detail in self.step_views:
+                icon.text, icon.text_color = STEP_ICONS["wait"]
+                name.text_color = MUTED
+                detail.text = ""
+            self.fraction = 0.0
+            self.counter.text = ""
+            self.rows = []
+            self.ds.items = []
+            self.table_title.text = fa("بهترین‌ها تا این لحظه")
+            self.job = ScanJob(store, sid, cid, events=self, mode=self.mode)
+            self.layout()
             threading.Thread(target=self.job.run, name="job", daemon=True).start()
 
         def layout(self):
@@ -1701,8 +2079,12 @@ if ui is not None:
             bottom = 76
             self.scroll.frame = (0, 0, w, h - bottom)
             y = 8
-            self.record_label.frame = (pad, y, inner, 20)
-            y += 28
+            if self.batch:
+                self.batch_label.frame = (pad, y, inner, 20)
+                y += 22
+            self.server_label.frame = (pad, y, inner, 22)
+            self.record_label.frame = (pad, y + 22, inner, 18)
+            y += 48
             row_y = 14
             for icon, name, detail in self.step_views:
                 icon.frame = (inner - 40, row_y, 28, 24)
@@ -1715,16 +2097,19 @@ if ui is not None:
             card_h = row_y + 40
             self.step_card.frame = (pad, y, inner, card_h)
             y += card_h + 12
+            if not self.outcome.hidden:
+                self.outcome.frame = (pad, y, inner, 76)
+                y += 88
             if not self.notes.hidden:
-                self.notes.frame = (pad, y, inner, 72)
-                y += 84
+                self.notes.frame = (pad, y, inner, 84)
+                y += 96
             self.table_title.frame = (pad, y, inner, 22)
             y += 28
-            table_h = max(4, len(self.rows)) * 40
+            table_h = max(3, len(self.ds.items)) * 40
             self.table.frame = (pad, y, inner, table_h)
             y += table_h + 6
-            self.table_hint.frame = (pad, y, inner, 18)
-            y += 30
+            self.table_hint.frame = (pad, y, inner, 34)
+            y += 44
             self.scroll.content_size = (w, y)
             by = h - bottom + 12
             if self.stop_btn.hidden:
@@ -1758,7 +2143,8 @@ if ui is not None:
         def progress(self, done, total, found):
             self.fraction = (done / float(total)) if total else 0.0
             self.fill.width = self.track.width * self.fraction
-            self.counter.text = fa("%d / %d بررسی شد · %d پاسخ" % (done, total, found))
+            self.counter.text = fa("%d / %d بررسی شد · %d پاسخ · %d ثانیه" % (
+                done, total, found, time.time() - self.started))
 
         @on_main_thread
         def found(self, rows):
@@ -1769,49 +2155,77 @@ if ui is not None:
 
         @on_main_thread
         def note(self, text):
-            self.notes.text = fa(((self.notes.text or "").strip(RLM) + "\n" + text).strip())
+            old = (self.notes.text or "").replace(RLM, "").strip()
+            if text in old:
+                return
+            self.notes.text = fa((old + "\n" + text).strip())
             self.notes.hidden = False
             self.layout()
 
         @on_main_thread
         def finished(self, result):
             self.result = result
+            sid, cid = self.targets[self.index]
+            if result.get("hint") or (result.get("kind") in ("error", "apply_failed")
+                                      and result.get("message")):
+                self.note(result.get("hint") or result["message"])
+            if self.batch:
+                self.summary.append((sid, result))
+                if self.index + 1 < len(self.targets) and result.get("kind") != "stopped":
+                    self._begin(self.index + 1)
+                    return
+            self._done()
+
+        def _done(self):
             console.set_idle_timer_disabled(False)
-            kind = result.get("kind")
             self.stop_btn.hidden = True
             self.again_btn.hidden = False
-            self.copy_btn.hidden = not (result.get("verified") or result.get("chosen"))
-            self.apply_btn.hidden = kind not in ("pending", "apply_failed")
-            self.table_hint.hidden = not result.get("verified")
-            messages = {
-                "healthy": ("IP فعلی سالم است", "success"),
-                "applied": ("IP جدید اعمال شد", "success"),
-                "unchanged": ("بهترین IP همان قبلی است", "success"),
-                "pending": ("IP پیدا شد؛ «اعمال» را بزنید", "success"),
-                "found": ("IP پیدا شد", "success"),
-                "stopped": ("متوقف شد", "error"),
-                "broken": ("IP فعلی خراب است", "error"),
-                "nothing": ("IP سالمی پیدا نشد", "error"),
-                "apply_failed": ("اعمال روی DNS نشد", "error"),
-                "error": ("خطا", "error"),
-            }
-            text, icon = messages.get(kind, ("تمام شد", "success"))
-            console.hud_alert(text, icon, 1.6)
-            extra = result.get("hint") or result.get("message") or ""
-            if extra:
-                self.note(extra)
+            store = self.app.store
+            if self.batch:
+                self.batch_label.text = fa("%d سرور بررسی شد" % len(self.summary))
+                lines = []
+                ok = 0
+                for sid, r in self.summary:
+                    ok += r.get("kind") in GOOD_KINDS
+                    lines.append(fa("%s: %s" % (store.server(sid)["name"], result_line(r))))
+                self.rows = []
+                self.ds.items = lines
+                self.ds.font = ("<System>", 13)
+                self.table.row_height = 52
+                self.table_title.text = fa("نتیجهٔ همهٔ سرورها")
+                self.table_hint.hidden = True
+                good = ok == len(self.summary)
+                self._show_outcome("%d از %d سرور درست شد" % (ok, len(self.summary)), good)
+                self.copy_btn.hidden = True
+                self.apply_btn.hidden = True
+            else:
+                r = self.result or {}
+                kind = r.get("kind")
+                self.copy_btn.hidden = not (r.get("chosen") or r.get("verified"))
+                self.apply_btn.hidden = kind not in ("pending", "apply_failed")
+                self.table_hint.hidden = not r.get("verified")
+                self._show_outcome(result_line(r), kind in GOOD_KINDS)
+            seconds = time.time() - self.started
+            console.hud_alert("تمام شد · %.0f ثانیه" % seconds, "success", 1.2)
             self.layout()
             self.app.main.refresh()
+
+        def _show_outcome(self, text, good):
+            self.outcome.text = fa(text)
+            self.outcome.text_color = GOOD if good else BAD
+            self.outcome.background_color = GOOD_BG if good else BAD_BG
+            self.outcome.hidden = False
 
         # -- buttons ------------------------------------------------------
 
         def tapped_stop(self, sender):
-            self.job.cancel()
+            if self.job is not None:
+                self.job.cancel()
             sender.enabled = False
-            sender.title = "در حال توقف..."
+            sender.title = "در حال توقف…"
 
         def tapped_again(self, sender):
-            self.app.pop_and_scan(self.pid, "force")
+            self.app.restart_scan(self.targets, "force")
 
         def tapped_copy(self, sender):
             r = self.result or {}
@@ -1833,63 +2247,68 @@ if ui is not None:
         def _after_apply(self, ok):
             self.apply_btn.enabled = True
             self.apply_btn.hidden = ok
+            r = self.result or {}
+            self._show_outcome(result_line(r), ok)
             console.hud_alert("اعمال شد" if ok else "اعمال نشد", "success" if ok else "error")
             self.layout()
             self.app.main.refresh()
 
         def row_tapped(self, ds):
             index = ds.selected_row
-            if self.result is None or index < 0 or index >= len(self.rows):
+            if self.running or self.batch or index < 0 or index >= len(self.rows):
                 return
             run_bg(self._row_menu, self.rows[index])
 
         def _row_menu(self, row):
             ip = row["ip"]
-            choice = dialogs.list_dialog(ip, ["اعمال همین IP روی رکورد", "کپی IP",
-                                              "تست دوباره (۱۰ بار)"])
-            if choice == "کپی IP":
+            sid, cid = self.current_target()
+            store = self.app.store
+            choice = pick(ip, ["اعمال همین IP روی رکورد", "کپی IP", "تست دوباره (۱۰ بار)"])
+            if choice == 1:
                 clipboard.set(ip)
                 console.hud_alert("کپی شد")
-            elif choice == "اعمال همین IP روی رکورد":
-                if alert("اعمال", "رکورد %s روی %s تنظیم شود؟" % (
-                        self.app.store.profile(self.pid)["record"], ip), "اعمال") == 1:
+            elif choice == 0:
+                if alert("اعمال", "رکورد %s روی %s تنظیم شود؟" % (store.record(sid, cid), ip),
+                         "اعمال") == 1:
                     self._apply_flow([ip])
-            elif choice:
-                self.app.test_ip_flow(ip, self.pid)
+            elif choice == 2:
+                self.app.test_ip_flow(ip, sid, cid)
 
     class HistoryView(ui.View):
-        def __init__(self, app, pid=None):
+        def __init__(self, app, sid=None, cid=None):
             self.name = "تاریخچه"
             self.background_color = BG
-            names = {p["id"]: p["name"] for p in app.store.profiles}
+            store = app.store
+            servers = {s["id"]: s["name"] for s in store.servers}
+            carriers = {c["id"]: c["name"] for c in store.carriers}
             kinds = {"apply": "تغییر", "manual": "دستی", "rollback": "برگشت", "check": "بررسی"}
             items = []
-            for h in app.store.history(pid):
+            for h in store.history(sid, cid):
                 when = time.strftime("%m/%d %H:%M", time.localtime(h.get("ts", 0)))
                 old = ",".join(h.get("old") or []) or "—"
                 new = ",".join(h.get("new") or []) or "—"
-                if h.get("kind") == "check":
-                    change = "%s %s" % (new, h.get("note", ""))
-                else:
-                    change = "%s → %s" % (old, new)
-                items.append(fa("%s · %s · %s · %s" % (when, names.get(h.get("profile"), "?"),
-                                                       kinds.get(h.get("kind"), h.get("kind")),
-                                                       change)))
+                change = ("%s %s" % (new, h.get("note", "")) if h.get("kind") == "check"
+                          else "%s → %s" % (old, new))
+                items.append(fa("%s · %s · %s · %s · %s" % (
+                    when, servers.get(h.get("server"), "?"), carriers.get(h.get("carrier"), "?"),
+                    kinds.get(h.get("kind"), h.get("kind")), change)))
             self.table = ui.TableView()
             self.ds = ui.ListDataSource(items or [fa("هنوز چیزی ثبت نشده")])
             self.ds.font = ("<System>", 13)
             self.table.data_source = self.table.delegate = self.ds
-            self.table.row_height = 48
+            self.table.row_height = 52
             self.table.allows_selection = False
             self.add_subview(self.table)
 
         def layout(self):
             self.table.frame = (0, 0, self.width, self.height)
 
+    # ------------------------------------------------------------------ the app
+
     class App:
         def __init__(self, store):
             self.store = store
-            self.active = None  # the ScanView of a running job
+            self.active_scan = None
             self.main = None
             self.nav = None
 
@@ -1899,9 +2318,11 @@ if ui is not None:
             self.main = MainView(self)
             self.nav = ui.NavigationView(self.main)
             self.nav.present("fullscreen", hide_title_bar=False)
-            s = self.store.settings
-            if not s["sni"] or not self.store.secrets.get():
+            run_bg(self.check_connection)
+            if not self.store.servers or not self.store.secrets.get(None):
                 run_bg(self.first_run)
+
+        # -- navigation (main thread) ------------------------------------
 
         @on_main_thread
         def push(self, view_class, *args):
@@ -1909,121 +2330,458 @@ if ui is not None:
             self.nav.push_view(view_class(self, *args))
 
         @on_main_thread
-        def pop_and_scan(self, pid, mode):
-            self.nav.pop_view()
-            ui.delay(lambda: self.start_scan(pid, mode), 0.5)
-
-        @on_main_thread
-        def start_scan(self, pid, mode):
-            if self.active is not None and self.active.job.running:
-                if self.active.pid == pid:
-                    self.nav.push_view(self.active)
+        def start_scan(self, targets, mode):
+            targets = [t for t in targets if self.store.server(t[0])]
+            if not targets:
+                return
+            if self.active_scan is not None and self.active_scan.running:
+                if self.active_scan.targets == targets:
+                    self.nav.push_view(self.active_scan)
                 else:
                     console.hud_alert("یک اسکن دیگر در حال اجراست", "error")
                 return
-            view = ScanView(self, pid, mode)
-            self.active = view
+            view = ScanView(self, targets, mode)
+            self.active_scan = view
             self.nav.push_view(view)
             view.start()
 
-        # -- flows (background threads) -----------------------------------
+        @on_main_thread
+        def restart_scan(self, targets, mode):
+            self.nav.pop_view()
+            ui.delay(lambda: self.start_scan(targets, mode), 0.5)
+
+        def start_all_servers(self, cid):
+            targets = [(s["id"], cid) for s in self.store.servers if s["records"].get(cid)]
+            if not targets:
+                console.hud_alert("هیچ سروری برای این اپراتور زیردامنه ندارد", "error")
+                return
+            self.start_scan(targets, "auto")
+
+        # -- flows (background threads) ----------------------------------
+
+        def check_connection(self):
+            self.main.set_connection(None)
+            self.main.set_connection(connection_check())
 
         def first_run(self):
             alert("خوش آمدید",
-                  "برای شروع: دامنهٔ CDN (همان SNI کانفیگ‌ها)، path و توکن کلادفلر را "
-                  "وارد کنید، بعد از «ابزارها» زیردامنهٔ هر اپراتور را تنظیم کنید.")
-            self.open_settings()
+                  "سه قدم:\n۱. توکن API کلادفلر\n۲. یک سرور: دامنهٔ CDN (SNI) و path\n"
+                  "۳. زیردامنهٔ هر اپراتور برای آن سرور (پیشنهاد خودکار دارد)")
+            if not self.store.secrets.get(None):
+                self.edit_token(None)
+            if not self.store.servers:
+                self.edit_server(None)
 
         def open_settings(self):
-            s = self.store.settings
-            has_token = bool(self.store.secrets.get())
+            server = self.store.active
+            items = ["حساب کلادفلر (توکن اصلی)", "تنظیمات اسکن و DNS",
+                     "سرورها", "اپراتورها"]
+            if server:
+                items.insert(0, "ویرایش سرور «%s»" % server["name"])
+            index = pick("تنظیمات", items)
+            if index is None:
+                return
+            if server:
+                index -= 1
+            if index == -1:
+                self.edit_server(server["id"])
+            elif index == 0:
+                self.edit_token(None)
+            elif index == 1:
+                self.edit_scan_settings()
+            elif index == 2:
+                self.manage_servers()
+            elif index == 3:
+                self.manage_carriers()
 
-            def text(key, title, value=None, kind="text"):
-                return {"type": kind, "key": key, "title": title,
-                        "value": str(s[key] if value is None else value),
-                        "autocorrection": False, "autocapitalization": ui.AUTOCAPITALIZE_NONE}
-
-            def switch(key, title, value=None):
-                return {"type": "switch", "key": key, "title": title,
-                        "value": bool(s[key] if value is None else value)}
-
-            sections = [
-                ("کانفیگ", [
-                    text("sni", "دامنهٔ CDN (SNI)"),
-                    text("path", "WebSocket path"),
-                    text("port", "پورت", kind="number"),
-                    switch("tls", "TLS"),
-                ], "همان دامنه و path که در هاست‌های پنل است. با path خالی فقط /cdn-cgi/trace تست می‌شود."),
-                ("کلادفلر", [
-                    {"type": "password", "key": "token",
-                     "title": "API Token (%s)" % ("ذخیره شده" if has_token else "خالی"),
-                     "value": ""},
-                    text("zone_id", "Zone ID (اختیاری)"),
-                    text("ttl", "TTL (ثانیه)", kind="number"),
-                    text("ips_per_record", "تعداد IP در رکورد (۱ تا ۳)", kind="number"),
-                    switch("auto_apply", "اعمال خودکار بعد از تست"),
-                ], "توکن فقط در Keychain آیفون ذخیره می‌شود. خالی گذاشتن یعنی بدون تغییر؛ برای پاک کردن «-» بنویسید."),
-                ("اسکن", [
-                    text("candidates", "تعداد کاندید", kind="number"),
-                    text("workers", "تست همزمان", kind="number"),
-                    text("timeout", "مهلت هر اتصال (ثانیه)", kind="number"),
-                    text("stop_after", "توقف بعد از این تعداد پاسخ (۰=همه)", kind="number"),
-                    text("verify_top", "تعداد IP برای تأیید دقیق", kind="number"),
-                    text("verify_attempts", "تلاش برای هر IP", kind="number"),
-                    text("max_loss_pct", "حداکثر افت مجاز (٪)", kind="number"),
-                    text("max_ping_ms", "حداکثر پینگ سالم (ms)", kind="number"),
-                    text("colos", "فقط این دیتاسنترها (مثلاً FRA,AMS)"),
-                    switch("ip_version", "IPv6 به جای IPv4", value=s["ip_version"] == 6),
-                    text("bad_ttl_hours", "نادیده گرفتن IPهای بد (ساعت)", kind="number"),
-                ]),
-            ]
-            values = dialogs.form_dialog("تنظیمات", sections=sections, done_button_title="ذخیره")
+        def edit_token(self, sid):
+            label = "توکن اصلی" if sid is None else "توکن جدا برای «%s»" % self.store.server(sid)["name"]
+            has = bool(self.store.secrets.get(sid))
+            fields = [{"type": "password", "key": "token",
+                       "title": "API Token (%s)" % ("ذخیره شده" if has else "خالی"), "value": ""}]
+            values = dialogs.form_dialog(label, sections=[(label, fields,
+                "توکن فقط در Keychain آیفون ذخیره می‌شود. خالی = بدون تغییر، «-» = پاک کردن. "
+                "دسترسی لازم: Zone → DNS → Edit (و بهتر است Zone → Zone → Read).")],
+                done_button_title="ذخیره")
             if values is None:
                 return
-            raw_token = (values.pop("token", "") or "").strip()
-            token = "-" if raw_token == "-" else sanitize_token(raw_token)
+            raw = (values.get("token") or "").strip()
+            if not raw:
+                return
+            if raw == "-":
+                self.store.secrets.set("", sid)
+                console.hud_alert("پاک شد")
+            else:
+                token = sanitize_token(raw)
+                problem = token_problem(token)
+                if problem:
+                    alert("توکن", problem)
+                    return
+                self.store.secrets.set(token, sid)
+                console.hud_alert("ذخیره شد")
+                if sid or self.store.active:
+                    self.test_cloudflare(sid)
+            self.main.refresh()
+
+        def edit_scan_settings(self):
+            s = self.store.settings
+            sections = [
+                ("DNS", [
+                    text_field("ttl", "TTL (ثانیه)", s["ttl"], "number"),
+                    text_field("ips_per_record", "تعداد IP در رکورد (۱ تا ۳)", s["ips_per_record"], "number"),
+                    {"type": "switch", "key": "auto_apply", "title": "اعمال خودکار بعد از تست",
+                     "value": s["auto_apply"]},
+                ], "با چند IP در رکورد، اگر یکی بسته شود کلاینت‌ها معمولاً بعدی را امتحان می‌کنند."),
+                ("اسکن", [
+                    text_field("candidates", "تعداد کاندید", s["candidates"], "number"),
+                    text_field("workers", "تست همزمان", s["workers"], "number"),
+                    text_field("timeout", "مهلت هر اتصال (ثانیه)", s["timeout"], "number"),
+                    text_field("stop_after", "توقف بعد از N پاسخ (۰=همه)", s["stop_after"], "number"),
+                    text_field("verify_top", "تعداد IP برای تأیید دقیق", s["verify_top"], "number"),
+                    text_field("verify_attempts", "تلاش برای هر IP", s["verify_attempts"], "number"),
+                    text_field("max_loss_pct", "حداکثر افت مجاز (٪)", s["max_loss_pct"], "number"),
+                    text_field("max_ping_ms", "حداکثر پینگ سالم (ms)", s["max_ping_ms"], "number"),
+                    text_field("colos", "فقط این دیتاسنترها (مثلاً FRA,AMS)", s["colos"]),
+                    {"type": "switch", "key": "ip_version", "title": "IPv6 به جای IPv4",
+                     "value": s["ip_version"] == 6},
+                    text_field("bad_ttl_hours", "نادیده گرفتن IPهای بد (ساعت)", s["bad_ttl_hours"], "number"),
+                ]),
+            ]
+            values = dialogs.form_dialog("تنظیمات اسکن", sections=sections, done_button_title="ذخیره")
+            if values is None:
+                return
             values["ip_version"] = 6 if values.get("ip_version") else 4
-            values["path"] = normalise_path(values.get("path"))
-            values["sni"] = normalise_host(values.get("sni"))
             try:
                 self.store.update_settings(values)
             except ValueError as exc:
                 alert("مقدار نامعتبر", str(exc))
-                return self.open_settings()
-            if token == "-":
-                self.store.secrets.set("")
-            elif token:
-                self.store.secrets.set(token)
+                return self.edit_scan_settings()
             self.main.refresh()
             console.hud_alert("ذخیره شد")
-            if token and token != "-":
-                self.test_cloudflare()
+
+        def edit_server(self, sid):
+            store = self.store
+            server = store.server(sid) if sid else dict(SERVER_DEFAULTS, records={})
+            record_fields = []
+            for c in store.carriers:
+                value = server["records"].get(c["id"], "")
+                record_fields.append(text_field("rec:" + c["id"], c["name"], value))
+            sections = [
+                ("سرور", [
+                    text_field("name", "نام (مثلاً آلمان ۱)", server["name"]),
+                    text_field("sni", "دامنهٔ CDN (SNI و Host)", server["sni"]),
+                    text_field("path", "WebSocket path", server["path"]),
+                    text_field("port", "پورت", server["port"], "number"),
+                    {"type": "switch", "key": "tls", "title": "TLS", "value": server["tls"]},
+                ], "همان مقادیری که در هاست‌های پنل برای این سرور است."),
+                ("زیردامنهٔ هر اپراتور (ابر خاکستری)", record_fields,
+                 "خالی بگذارید تا از الگوی پیشوند اپراتور + دامنهٔ CDN پیشنهاد شود، "
+                 "مثلاً mtn.cdn.example.com."),
+                ("کلادفلر (اختیاری)", [
+                    text_field("zone_id", "Zone ID", server["zone_id"]),
+                    {"type": "password", "key": "token",
+                     "title": "توکن جدا (%s)" % ("دارد" if sid and store.secrets.get(sid)
+                                                  else "از توکن اصلی"), "value": ""},
+                ], "فقط اگر دامنهٔ این سرور در حساب کلادفلر دیگری است توکن جدا بدهید."),
+            ]
+            title = "ویرایش سرور" if sid else "سرور جدید"
+            values = dialogs.form_dialog(title, sections=sections, done_button_title="ذخیره")
+            if values is None:
+                return
+            records = {k[4:]: v for k, v in values.items() if k.startswith("rec:")}
+            token = (values.pop("token", "") or "").strip()
+            if not normalise_host(values.get("sni")):
+                alert("دامنهٔ CDN", "دامنهٔ CDN (SNI) را وارد کنید.")
+                return self.edit_server(sid)
+            try:
+                new_sid = store.save_server(sid, values, records)
+            except ValueError as exc:
+                alert("مقدار نامعتبر", str(exc))
+                return self.edit_server(sid)
+            missing = [c for c in store.carriers
+                       if not store.record(new_sid, c["id"]) and store.suggest_record(new_sid, c["id"])]
+            if missing:
+                preview = "\n".join(store.suggest_record(new_sid, c["id"]) for c in missing)
+                if alert("زیردامنه‌ها", "این‌ها ثبت شوند؟\n" + preview, "بله") == 1:
+                    store.save_server(new_sid, {}, {c["id"]: store.suggest_record(new_sid, c["id"])
+                                                    for c in missing})
+            if token == "-":
+                store.secrets.set("", new_sid)
+            elif token:
+                store.secrets.set(sanitize_token(token), new_sid)
+            if sid is None:
+                store.set_active(new_sid)
+            self.main.refresh()
+            console.hud_alert("ذخیره شد")
+            if store.token_for(new_sid) and alert("تست", "اتصال به کلادفلر و رکوردها بررسی شود؟",
+                                                   "بررسی") == 1:
+                self.test_cloudflare(new_sid)
+
+        def server_menu(self):
+            store = self.store
+            servers = store.servers
+            active = store.active
+            items = [("● " if active and s["id"] == active["id"] else "") + "%s — %s" % (s["name"], s["sni"])
+                     for s in servers]
+            items += ["+ سرور جدید", "مدیریت سرورها"]
+            index = pick("سرور", items)
+            if index is None:
+                return
+            if index < len(servers):
+                store.set_active(servers[index]["id"])
+                self.main.refresh()
+            elif index == len(servers):
+                self.edit_server(None)
+            else:
+                self.manage_servers()
+
+        def manage_servers(self):
+            store = self.store
+            while True:
+                servers = store.servers
+                items = ["%s — %s" % (s["name"], s["sni"]) for s in servers] + ["+ سرور جدید"]
+                index = pick("سرورها", items)
+                if index is None:
+                    break
+                if index == len(servers):
+                    self.edit_server(None)
+                    continue
+                sid = servers[index]["id"]
+                action = pick(servers[index]["name"], ["فعال کردن", "ویرایش", "تکثیر (کپی)",
+                                                      "توکن جدا", "حذف"])
+                if action == 0:
+                    store.set_active(sid)
+                elif action == 1:
+                    self.edit_server(sid)
+                elif action == 2:
+                    src = store.server(sid)
+                    copy_values = {k: src[k] for k in SERVER_DEFAULTS}
+                    copy_values["name"] = src["name"] + " (کپی)"
+                    store.save_server(None, copy_values, {})
+                    console.hud_alert("کپی شد؛ دامنه و زیردامنه‌ها را ویرایش کنید")
+                elif action == 3:
+                    self.edit_token(sid)
+                elif action == 4:
+                    if alert("حذف", "سرور «%s» حذف شود؟ رکوردهای DNS دست نمی‌خورند."
+                             % servers[index]["name"], "حذف") == 1:
+                        store.delete_server(sid)
+            self.main.refresh()
+
+        def manage_carriers(self):
+            store = self.store
+            while True:
+                carriers = store.carriers
+                items = ["%s — پیشوند %s" % (c["name"], c["prefix"] or "ندارد") for c in carriers]
+                items.append("+ اپراتور جدید")
+                index = pick("اپراتورها", items)
+                if index is None:
+                    break
+                cid = None if index == len(carriers) else carriers[index]["id"]
+                c = store.carrier(cid) if cid else {"name": "", "prefix": ""}
+                fields = [text_field("name", "نام (مثلاً رایتل)", c["name"]),
+                          text_field("prefix", "پیشوند زیردامنه (مثلاً rtl)", c["prefix"])]
+                if cid:
+                    fields.append({"type": "switch", "key": "delete", "title": "حذف این اپراتور",
+                                   "value": False})
+                values = dialogs.form_dialog("اپراتور", fields, done_button_title="ذخیره")
+                if values is None:
+                    continue
+                if cid and values.get("delete"):
+                    if alert("حذف", "«%s» از همهٔ سرورها حذف شود؟ رکوردهای DNS دست نمی‌خورند."
+                             % c["name"], "حذف") == 1:
+                        store.delete_carrier(cid)
+                    continue
+                store.save_carrier(cid, values.get("name", ""), values.get("prefix", ""))
+            self.main.refresh()
+
+        def carrier_menu(self, sid, cid):
+            store = self.store
+            carrier = store.carrier(cid)
+            items = ["فقط بررسی IP فعلی", "اسکن کامل (حتی اگر سالم است)",
+                     "اصلاح برای همهٔ سرورها", "تنظیم IP دستی", "برگرداندن IP قبلی",
+                     "IPهای خوب ذخیره‌شده", "تاریخچه", "ویرایش زیردامنه"]
+            index = pick("%s · %s" % (carrier["name"], store.server(sid)["name"]), items)
+            if index == 0:
+                self.start_scan([(sid, cid)], "check")
+            elif index == 1:
+                self.start_scan([(sid, cid)], "force")
+            elif index == 2:
+                self.start_all_servers(cid)
+            elif index == 3:
+                text = console.input_alert("IP دستی", "یک یا چند IP، با کاما جدا کنید", "", "اعمال")
+                ips = [x.strip() for x in text.replace(" ", ",").split(",") if x.strip()]
+                self._apply_manual(sid, cid, ips, "manual")
+            elif index == 4:
+                old = store.previous_ips(sid, cid)
+                if not old:
+                    alert("برگرداندن", "IP قبلی برای این رکورد ثبت نشده.")
+                elif alert("برگرداندن", "رکورد به %s برگردد؟" % ", ".join(old), "برگردان") == 1:
+                    self._apply_manual(sid, cid, old, "rollback")
+            elif index == 5:
+                self.good_list(sid, cid)
+            elif index == 6:
+                self.push(HistoryView, sid, cid)
+            elif index == 7:
+                current = store.record(sid, cid) or store.suggest_record(sid, cid)
+                value = console.input_alert("زیردامنهٔ %s" % carrier["name"],
+                                            "برای سرور «%s»" % store.server(sid)["name"],
+                                            current, "ذخیره")
+                store.save_server(sid, {}, {cid: value})
+                self.main.refresh()
+
+        def _apply_manual(self, sid, cid, ips, kind):
+            if not ips:
+                return
+            try:
+                for ip in ips:
+                    ipaddress.ip_address(ip)
+            except ValueError:
+                alert("IP نامعتبر", ", ".join(ips))
+                return
+            console.show_activity()
+            try:
+                apply_ips(self.store, sid, cid, ips, kind=kind)
+            except (CFError, NetError) as exc:
+                alert("اعمال نشد", str(exc))
+                return
+            finally:
+                console.hide_activity()
+            self.main.refresh()
+            console.hud_alert("اعمال شد")
+
+        def good_list(self, sid, cid):
+            good = sorted(self.store.memory(cid)["good"].items(), key=lambda kv: -kv[1].get("ts", 0))
+            if not good:
+                alert("IPهای خوب", "هنوز IP خوبی برای این اپراتور ذخیره نشده.")
+                return
+            items = ["%s  %sms  %s  %s" % (ip, "%.0f" % g["ping"] if g.get("ping") else "?",
+                                            g.get("colo", ""), ago(g.get("ts")))
+                     for ip, g in good[:60]]
+            index = pick("IPهای خوب %s" % self.store.carrier(cid)["name"], items)
+            if index is None:
+                return
+            ip = good[index][0]
+            if alert(ip, "دوباره تست شود یا مستقیم اعمال شود؟", "تست", "اعمال مستقیم") == 2:
+                self._apply_manual(sid, cid, [ip], "manual")
+            else:
+                self.test_ip_flow(ip, sid, cid)
+
+        def test_ip_flow(self, ip, sid=None, cid=None):
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                alert("IP نامعتبر", ip)
+                return
+            store = self.store
+            server = store.server(sid) if sid else store.active
+            if not server or not server["sni"]:
+                alert("سرور", "اول یک سرور با دامنهٔ CDN بسازید.")
+                return
+            s = store.settings
+            target = Target.from_settings(server)
+            console.show_activity()
+            try:
+                trace = trace_probe(ip, target, make_context(), float(s["timeout"]) + 1)
+                m = measure(ip, target, make_context(), 10, float(s["timeout"]) + 1,
+                            bool(target.path))
+            finally:
+                console.hide_activity()
+            lines = ["سرور: %s" % server["name"],
+                     "دیتاسنتر: %s" % (trace.get("colo") or "—"),
+                     "پینگ: %s" % ("%.0f ms" % m["ping"] if m["ping"] is not None else "—"),
+                     "jitter: %.0f" % (m["jitter"] or 0),
+                     "افت: %.0f%% (%d از %d)" % (m["loss"], m["ok"], m["attempts"]),
+                     "آزمون: %s" % ("WebSocket" if target.path else "trace")]
+            if m["errors"]:
+                lines.append("خطاها: %s" % error_summary(m["errors"]))
+            if trace.get("loc") and trace["loc"] != "IR":
+                lines.append("هشدار: موقعیت %s؛ VPN روشن است؟" % trace["loc"])
+            if m["ok"] == 0:
+                alert(ip, "\n".join(lines))
+                return
+            if cid:
+                store.remember_good(cid, ip, m["ping"], trace.get("colo", ""))
+                store.save()
+            targets = [c for c in store.carriers if server["records"].get(c["id"])]
+            if not targets or alert(ip, "\n".join(lines), "اعمال روی یک اپراتور") != 1:
+                return
+            if cid is None:
+                index = pick("روی کدام اپراتور؟", [c["name"] for c in targets])
+                if index is None:
+                    return
+                cid = targets[index]["id"]
+            self._apply_manual(server["id"], cid, [ip], "manual")
+
+        def test_cloudflare(self, sid=None):
+            store = self.store
+            server = store.server(sid) if sid else store.active
+            if server is None:
+                alert("کلادفلر", "اول یک سرور بسازید.")
+                return
+            sid = server["id"]
+            token = store.token_for(sid)
+            problem = token_problem(token)
+            if problem:
+                alert("کلادفلر", problem)
+                return
+            console.show_activity()
+            lines = ["سرور: %s" % server["name"],
+                     "توکن: %s%s" % (token_fingerprint(token),
+                                     " (جدا)" if store.secrets.get(sid) else "")]
+            try:
+                try:
+                    info, via = with_api(store, sid, [], lambda api: api.verify_token())
+                    kind = "توکن حساب" if (info or {}).get("kind") == "account" else "توکن کاربر"
+                    lines.append("وضعیت: %s (%s)" % ((info or {}).get("status", "?"), kind))
+                except (CFError, NetError) as exc:
+                    lines.append("وضعیت: خطا (%s)" % exc)
+                    alert("تست کلادفلر", "\n".join(lines))
+                    return
+                rtype = "AAAA" if store.settings["ip_version"] == 6 else "A"
+                for c in store.carriers:
+                    record = server["records"].get(c["id"])
+                    if not record:
+                        lines.append("%s: زیردامنه ندارد" % c["name"])
+                        continue
+                    try:
+                        zone_name, ips, notes = inspect_record(store, sid, c["id"], rtype)
+                        line = "%s (%s): %s" % (c["name"], record,
+                                                ", ".join(ips) or "بدون رکورد %s" % rtype)
+                        if zone_name:
+                            line += "\n  دامنه: %s" % zone_name
+                        for n in notes:
+                            line += "\n  ⚠ %s" % n
+                        lines.append(line)
+                    except (CFError, NetError) as exc:
+                        lines.append("%s (%s): خطا — %s" % (c["name"], record, exc))
+                store.save()
+            finally:
+                console.hide_activity()
+            alert("تست کلادفلر", "\n".join(lines))
 
         def open_tools(self):
             items = [
                 "تاریخچهٔ تغییرات",
-                "اپراتورها و زیردامنه‌ها",
                 "تست یک IP دلخواه",
-                "تست اتصال به کلادفلر",
+                "تست اتصال به کلادفلر (سرور فعال)",
+                "بررسی دوبارهٔ اتصال اینترنت",
                 "به‌روزرسانی رنج IP کلادفلر",
                 "پاک کردن حافظهٔ IPهای بد",
-                "کپی تنظیمات (بدون توکن)",
+                "کپی همهٔ تنظیمات (بدون توکن)",
                 "وارد کردن تنظیمات از کلیپ‌بورد",
                 "کپی لاگ برای گزارش خطا",
             ]
-            choice = dialogs.list_dialog("ابزارها", items)
-            if choice is None:
-                return
-            index = items.index(choice)
+            index = pick("ابزارها", items)
             if index == 0:
                 self.push(HistoryView)
             elif index == 1:
-                self.manage_profiles()
+                ip = console.input_alert("تست یک IP", "آدرس IP کلادفلر (با سرور فعال تست می‌شود)",
+                                         "", "تست").strip()
+                self.test_ip_flow(ip)
             elif index == 2:
-                ip = console.input_alert("تست یک IP", "آدرس IP کلادفلر", "", "تست").strip()
-                self.test_ip_flow(ip, None)
-            elif index == 3:
                 self.test_cloudflare()
+            elif index == 3:
+                self.check_connection()
             elif index == 4:
                 self.refresh_ranges()
             elif index == 5:
@@ -2043,205 +2801,6 @@ if ui is not None:
             elif index == 8:
                 clipboard.set(read_log_tail(120))
                 console.hud_alert("لاگ کپی شد")
-
-        def manage_profiles(self):
-            while True:
-                profiles = self.store.profiles
-                items = ["%s — %s" % (p["name"], p["record"] or "بدون زیردامنه") for p in profiles]
-                items.append("+ افزودن اپراتور")
-                choice = dialogs.list_dialog("اپراتورها", items)
-                if choice is None:
-                    break
-                index = items.index(choice)
-                if index == len(profiles):
-                    self.edit_profile(None)
-                else:
-                    self.edit_profile(profiles[index]["id"])
-            self.main.refresh()
-
-        def edit_profile(self, pid):
-            p = self.store.profile(pid) if pid else {"name": "", "record": ""}
-            fields = [
-                {"type": "text", "key": "name", "title": "نام", "value": p["name"]},
-                {"type": "text", "key": "record", "title": "زیردامنه (ابر خاکستری)",
-                 "value": p["record"], "autocorrection": False,
-                 "autocapitalization": ui.AUTOCAPITALIZE_NONE},
-            ]
-            if pid:
-                fields.append({"type": "switch", "key": "delete", "title": "حذف این اپراتور",
-                               "value": False})
-            values = dialogs.form_dialog("ویرایش اپراتور" if pid else "اپراتور جدید", fields,
-                                         done_button_title="ذخیره")
-            if values is None:
-                return
-            if pid and values.get("delete"):
-                if alert("حذف", "«%s» حذف شود؟ رکورد DNS دست نمی‌خورد." % p["name"], "حذف") == 1:
-                    self.store.delete_profile(pid)
-                return
-            if pid:
-                self.store.edit_profile(pid, values["name"], values["record"])
-            else:
-                self.store.add_profile(values["name"], values["record"])
-
-        def profile_menu(self, pid):
-            p = self.store.profile(pid)
-            items = [
-                "فقط بررسی IP فعلی",
-                "اسکن کامل (حتی اگر سالم است)",
-                "تنظیم IP دستی",
-                "برگرداندن IP قبلی",
-                "IPهای خوب ذخیره‌شده",
-                "تاریخچهٔ این اپراتور",
-                "ویرایش نام و زیردامنه",
-            ]
-            choice = dialogs.list_dialog(p["name"], items)
-            if choice is None:
-                return
-            index = items.index(choice)
-            if index == 0:
-                self.start_scan(pid, "check")
-            elif index == 1:
-                self.start_scan(pid, "force")
-            elif index == 2:
-                text = console.input_alert("IP دستی", "یک یا چند IP، با کاما جدا کنید", "", "اعمال")
-                ips = [x.strip() for x in text.replace(" ", ",").split(",") if x.strip()]
-                self._apply_manual(pid, ips, "manual")
-            elif index == 3:
-                old = self.store.previous_ips(pid)
-                if not old:
-                    alert("برگرداندن", "IP قبلی برای این اپراتور ثبت نشده.")
-                elif alert("برگرداندن", "رکورد به %s برگردد؟" % ", ".join(old), "برگردان") == 1:
-                    self._apply_manual(pid, old, "rollback")
-            elif index == 4:
-                self.good_list(pid)
-            elif index == 5:
-                self.push(HistoryView, pid)
-            elif index == 6:
-                self.edit_profile(pid)
-                self.main.refresh()
-
-        def _apply_manual(self, pid, ips, kind):
-            try:
-                for ip in ips:
-                    ipaddress.ip_address(ip)
-            except ValueError:
-                alert("IP نامعتبر", ", ".join(ips))
-                return
-            if not ips:
-                return
-            console.show_activity()
-            try:
-                apply_ips(self.store, pid, ips, kind=kind)
-            except (CFError, NetError) as exc:
-                alert("اعمال نشد", str(exc))
-                return
-            finally:
-                console.hide_activity()
-            self.main.refresh()
-            console.hud_alert("اعمال شد")
-
-        def good_list(self, pid):
-            good = sorted(self.store.state(pid)["good"].items(), key=lambda kv: -kv[1].get("ts", 0))
-            if not good:
-                alert("IPهای خوب", "هنوز IP خوبی برای این اپراتور ذخیره نشده.")
-                return
-            items = ["%s  %sms  %s  %s" % (ip, "%.0f" % g["ping"] if g.get("ping") else "?",
-                                            g.get("colo", ""), ago(g.get("ts")))
-                     for ip, g in good[:60]]
-            choice = dialogs.list_dialog("IPهای خوب", items)
-            if choice is None:
-                return
-            ip = good[items.index(choice)][0]
-            if alert(ip, "این IP دوباره تست شود یا مستقیم اعمال شود؟",
-                     "تست", "اعمال مستقیم") == 2:
-                self._apply_manual(pid, [ip], "manual")
-            else:
-                self.test_ip_flow(ip, pid)
-
-        def test_ip_flow(self, ip, pid):
-            try:
-                ipaddress.ip_address(ip)
-            except ValueError:
-                alert("IP نامعتبر", ip)
-                return
-            s = self.store.settings
-            target = Target.from_settings(s)
-            if not target.sni:
-                alert("تنظیمات", "اول دامنهٔ CDN را در تنظیمات وارد کنید.")
-                return
-            console.show_activity()
-            try:
-                trace = trace_probe(ip, target, make_context(), float(s["timeout"]) + 1)
-                m = measure(ip, target, make_context(), 10, float(s["timeout"]) + 1,
-                            bool(target.path))
-            finally:
-                console.hide_activity()
-            lines = ["دیتاسنتر: %s" % (trace.get("colo") or "—"),
-                     "پینگ: %s" % ("%.0f ms" % m["ping"] if m["ping"] is not None else "—"),
-                     "jitter: %.0f" % (m["jitter"] or 0),
-                     "افت: %.0f%% (%d از %d)" % (m["loss"], m["ok"], m["attempts"]),
-                     "آزمون: %s" % ("WebSocket" if target.path else "trace")]
-            if m["errors"]:
-                lines.append("خطاها: %s" % error_summary(m["errors"]))
-            if trace.get("loc") and trace["loc"] != "IR":
-                lines.append("هشدار: موقعیت %s؛ VPN روشن است؟" % trace["loc"])
-            if m["ok"] == 0:
-                alert(ip, "\n".join(lines))
-                return
-            if pid:
-                self.store.remember_good(pid, ip, m["ping"], trace.get("colo", ""))
-                self.store.save()
-            names = [p["name"] for p in self.store.profiles if p["record"]]
-            if not names:
-                alert(ip, "\n".join(lines))
-                return
-            if alert(ip, "\n".join(lines), "اعمال روی یک اپراتور") != 1:
-                return
-            target_pid = pid
-            if target_pid is None:
-                choice = dialogs.list_dialog("روی کدام اپراتور؟", names)
-                if choice is None:
-                    return
-                target_pid = [p["id"] for p in self.store.profiles if p["name"] == choice][0]
-            self._apply_manual(target_pid, [ip], "manual")
-
-        def test_cloudflare(self):
-            token = sanitize_token(self.store.secrets.get())
-            problem = token_problem(token)
-            if problem:
-                alert("کلادفلر", problem)
-                return
-            console.show_activity()
-            lines = ["توکن ذخیره‌شده: %s" % token_fingerprint(token)]
-            try:
-                try:
-                    info, via = with_api(self.store, [], lambda api: api.verify_token())
-                    kind = "توکن حساب" if (info or {}).get("kind") == "account" else "توکن کاربر"
-                    lines.append("وضعیت: %s (%s)" % ((info or {}).get("status", "?"), kind))
-                except (CFError, NetError) as exc:
-                    lines.append("توکن: خطا (%s)" % exc)
-                    alert("تست کلادفلر", "\n".join(lines))
-                    return
-                rtype = "AAAA" if self.store.settings["ip_version"] == 6 else "A"
-                for p in self.store.profiles:
-                    if not p["record"]:
-                        lines.append("%s: زیردامنه ندارد" % p["name"])
-                        continue
-                    try:
-                        zone_name, ips, notes = inspect_record(self.store, p, rtype)
-                        line = "%s (%s): %s" % (p["name"], p["record"],
-                                                ", ".join(ips) or "بدون رکورد %s" % rtype)
-                        if zone_name:
-                            line += "\n  دامنه: %s" % zone_name
-                        for n in notes:
-                            line += "\n  ⚠ %s" % n
-                        lines.append(line)
-                    except (CFError, NetError) as exc:
-                        lines.append("%s (%s): خطا — %s" % (p["name"], p["record"], exc))
-                self.store.save()
-            finally:
-                console.hide_activity()
-            alert("تست کلادفلر", "\n".join(lines))
 
         def refresh_ranges(self):
             console.show_activity()
