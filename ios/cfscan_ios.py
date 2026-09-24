@@ -221,7 +221,13 @@ def normalise_data(raw):
 
 
 def normalise_host(value):
-    return str(value or "").strip().strip(".").lower()
+    """A bare hostname from a pasted value (``https://A.b.com/x`` -> ``a.b.com``)."""
+    host = re.sub(r"[\s\u200b-\u200f\u2060\ufeff]", "", str(value or ""))
+    host = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", host)
+    host = host.split("/", 1)[0].split("?", 1)[0]
+    if host.count(":") == 1:  # a port, not an IPv6 address
+        host = host.split(":", 1)[0]
+    return host.strip(".").lower()
 
 
 def normalise_path(value):
@@ -712,6 +718,8 @@ CF_ERROR_HINTS = {
     6111: "هدر احراز هویت نامعتبر است؛ احتمالاً Global API Key وارد شده، نه API Token",
     9109: "توکن محدودیت IP دارد و از این اینترنت اجازه ندارد (Client IP Address Filtering)",
     10000: "توکن دسترسی لازم را ندارد (Zone → DNS → Edit)",
+    7000: "Zone ID اشتباه است؛ از صفحهٔ Overview دامنه «Zone ID» (نه Account ID) را کپی کنید یا خالی بگذارید",
+    7003: "Zone ID اشتباه است؛ از صفحهٔ Overview دامنه «Zone ID» (نه Account ID) را کپی کنید یا خالی بگذارید",
 }
 
 
@@ -869,14 +877,55 @@ class CloudflareAPI:
         result = self.call("GET", "/ips")
         return list(result.get("ipv4_cidrs") or []), list(result.get("ipv6_cidrs") or [])
 
+    def zones(self):
+        return self.call("GET", "/zones", {"per_page": 50}) or []
+
     def find_zone(self, record):
-        labels = normalise_host(record).split(".")
+        """The id of the zone ``record`` lives in (``mtn.cdn.example.com`` ->
+        ``example.com``), or a Persian explanation of why there is none."""
+        record = normalise_host(record)
+        labels = record.split(".")
         for i in range(len(labels) - 1):
-            name = ".".join(labels[i:])
-            result = self.call("GET", "/zones", {"name": name})
+            result = self.call("GET", "/zones", {"name": ".".join(labels[i:])})
             if result:
                 return result[0]["id"]
-        raise CFError("zone for %s not found (token needs Zone:Read, or set the Zone ID)" % record)
+        visible = self.zones()
+        for z in sorted(visible, key=lambda z: -len(z.get("name", ""))):
+            name = z.get("name", "")
+            if record == name or record.endswith("." + name):
+                return z["id"]
+        if not visible:
+            raise CFError("توکن اجازهٔ دیدن دامنه‌ها را ندارد. یا دسترسی Zone → Zone → Read "
+                          "را به توکن اضافه کنید، یا Zone ID دامنه را در تنظیمات وارد کنید.")
+        names = ", ".join(z.get("name", "") for z in visible[:5])
+        raise CFError("%s زیر هیچ‌کدام از دامنه‌های این توکن (%s) نیست؛ آدرس کامل را "
+                      "در «اپراتورها و زیردامنه‌ها» وارد کنید." % (record, names))
+
+    def zone_name(self, zone):
+        return (self.call("GET", "/zones/%s" % zone) or {}).get("name", "")
+
+    def inspect_record(self, zone, name, rtype):
+        """The addresses on ``name`` and Persian notes on anything wrong."""
+        records = self.call("GET", "/zones/%s/dns_records" % zone,
+                            {"name": name, "per_page": 100}) or []
+        ips = [r.get("content") for r in records if r.get("type") == rtype]
+        notes = []
+        other = sorted({str(r.get("type")) for r in records if r.get("type") != rtype})
+        if other:
+            notes.append("رکورد %s هم دارد؛ باید فقط %s باشد" % ("/".join(other), rtype))
+        if any(r.get("proxied") for r in records if r.get("type") == rtype):
+            notes.append("ابر نارنجی است؛ باید خاکستری (DNS only) باشد")
+        if not records:
+            first = name.split(".")[0]
+            similar = self.call("GET", "/zones/%s/dns_records" % zone,
+                                {"type": rtype, "per_page": 100}) or []
+            close = sorted({r.get("name", "") for r in similar
+                            if r.get("name", "").split(".")[0] == first})
+            note = "رکوردی با این نام در کلادفلر نیست"
+            if close:
+                note += "؛ شاید منظورتان %s است" % ", ".join(close[:3])
+            notes.append(note)
+        return ips, notes
 
     def list_records(self, zone, name, rtype):
         return self.call("GET", "/zones/%s/dns_records" % zone,
@@ -925,21 +974,58 @@ def with_api(store, via_ips, fn, api_factory=CloudflareAPI):
     raise last or NetError("unreachable")
 
 
-def _zone(store, api, record):
-    zone = store.settings["zone_id"].strip() or store.zone_for(record)
-    if not zone:
-        zone = api.find_zone(record)
-        store.remember_zone(record, zone)
-    return zone
+#: Codes Cloudflare gives for a zone id that does not exist.
+_BAD_ZONE_CODES = (7000, 7003, 1001)
+
+
+def with_zone(store, api, record, fn):
+    """``fn(zone_id)`` for the zone ``record`` is in.
+
+    The Zone ID from the settings, else the one remembered for this record,
+    else a lookup. A wrong Zone ID in the settings (an Account ID pasted by
+    mistake) or a stale remembered one falls back to the lookup.
+    """
+    configured = store.settings["zone_id"].strip()
+    zone = configured or store.zone_for(record)
+    if zone:
+        try:
+            return fn(zone)
+        except CFError as exc:
+            if configured and not set(exc.codes) & set(_BAD_ZONE_CODES):
+                raise
+            log("zone %s failed for %s (%s); looking it up" % (zone, record, exc))
+            with store.lock:
+                store.data["zones"].pop(record, None)
+    zone = api.find_zone(record)
+    store.remember_zone(record, zone)
+    return fn(zone)
 
 
 def read_record_ips(store, profile, rtype, via_ips=(), api_factory=CloudflareAPI):
     record = profile["record"]
 
     def fn(api):
-        return [r["content"] for r in api.list_records(_zone(store, api, record), record, rtype)]
+        return with_zone(store, api, record,
+                         lambda zone: [r["content"] for r in api.list_records(zone, record, rtype)])
 
     return with_api(store, via_ips, fn, api_factory)[0]
+
+
+def inspect_record(store, profile, rtype, api_factory=CloudflareAPI):
+    """(zone name, addresses, notes) for the settings check."""
+    record = profile["record"]
+
+    def fn(api):
+        def look(zone):
+            ips, notes = api.inspect_record(zone, record, rtype)
+            try:
+                zone_name = api.zone_name(zone)
+            except CFError:
+                zone_name = ""
+            return zone_name, ips, notes
+        return with_zone(store, api, record, look)
+
+    return with_api(store, [], fn, api_factory)[0]
 
 
 def apply_ips(store, pid, ips, via_ips=(), kind="apply", note="", api_factory=CloudflareAPI):
@@ -954,7 +1040,8 @@ def apply_ips(store, pid, ips, via_ips=(), kind="apply", note="", api_factory=Cl
     ttl = int(store.settings["ttl"])
 
     def fn(api):
-        return api.sync_records(_zone(store, api, record), record, ips, rtype, ttl)
+        return with_zone(store, api, record,
+                         lambda zone: api.sync_records(zone, record, ips, rtype, ttl))
 
     ops, via = with_api(store, via_ips, fn, api_factory)
     with store.lock:
@@ -2141,10 +2228,16 @@ if ui is not None:
                         lines.append("%s: زیردامنه ندارد" % p["name"])
                         continue
                     try:
-                        ips = read_record_ips(self.store, p, rtype)
-                        lines.append("%s: %s" % (p["name"], ", ".join(ips) or "رکورد %s ندارد" % rtype))
+                        zone_name, ips, notes = inspect_record(self.store, p, rtype)
+                        line = "%s (%s): %s" % (p["name"], p["record"],
+                                                ", ".join(ips) or "بدون رکورد %s" % rtype)
+                        if zone_name:
+                            line += "\n  دامنه: %s" % zone_name
+                        for n in notes:
+                            line += "\n  ⚠ %s" % n
+                        lines.append(line)
                     except (CFError, NetError) as exc:
-                        lines.append("%s: خطا (%s)" % (p["name"], exc))
+                        lines.append("%s (%s): خطا — %s" % (p["name"], p["record"], exc))
                 self.store.save()
             finally:
                 console.hide_activity()

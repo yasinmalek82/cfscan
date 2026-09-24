@@ -220,6 +220,87 @@ class TokenTests(unittest.TestCase):
         self.assertEqual(ctx.exception.codes, (9109,))
 
 
+class ZoneTests(unittest.TestCase):
+    """Zone lookup for records like mtn.cdn.example.com."""
+
+    ZONES = [{"id": "z-ex", "name": "example.com", "account": {"id": "a1"}}]
+    RECORDS = {"z-ex": [
+        {"type": "A", "name": "mtn.cdn.example.com", "content": "1.1.1.1", "proxied": False},
+        {"type": "A", "name": "mci.cdn.example.com", "content": "2.2.2.2", "proxied": True},
+        {"type": "CNAME", "name": "mci.cdn.example.com", "content": "x.example.com"},
+    ]}
+
+    def api(self, name_filter=True, visible=True):
+        test = self
+
+        class API(app.CloudflareAPI):
+            def call(self, method, path, query=None, body=None):
+                query = query or {}
+                if path == "/zones":
+                    zones = test.ZONES if visible else []
+                    if "name" in query:
+                        return [z for z in zones if name_filter and z["name"] == query["name"]]
+                    return zones
+                if path.startswith("/zones/") and path.endswith("/dns_records"):
+                    zone = path.split("/")[2]
+                    if zone not in test.RECORDS:
+                        raise app.CFError("Could not route (7003)", [7003])
+                    out = test.RECORDS[zone]
+                    if "name" in query:
+                        out = [r for r in out if r["name"] == query["name"]]
+                    if "type" in query:
+                        out = [r for r in out if r["type"] == query["type"]]
+                    return out
+                if path.startswith("/zones/"):
+                    return {"name": "example.com"}
+                raise AssertionError(path)
+
+        return API("t")
+
+    def test_a_two_level_subdomain_finds_its_zone(self):
+        self.assertEqual(self.api().find_zone("mtn.cdn.example.com"), "z-ex")
+
+    def test_the_visible_zone_list_is_the_fallback(self):
+        self.assertEqual(self.api(name_filter=False).find_zone("mtn.cdn.example.com"), "z-ex")
+
+    def test_no_visible_zone_explains_the_missing_permission(self):
+        with self.assertRaises(app.CFError) as ctx:
+            self.api(visible=False).find_zone("mtn.cdn.example.com")
+        self.assertIn("Zone ID", str(ctx.exception))
+
+    def test_a_record_outside_every_zone_names_the_zones(self):
+        with self.assertRaises(app.CFError) as ctx:
+            self.api().find_zone("mtn.cdn")
+        self.assertIn("example.com", str(ctx.exception))
+
+    def test_a_wrong_zone_id_in_the_settings_falls_back_to_the_lookup(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        store = make_store(tmp, zone_id="0123456789abcdef0123456789abcdef")
+        api = self.api()
+        ips = app.with_zone(store, api, "mtn.cdn.example.com",
+                            lambda zone: [r["content"] for r in
+                                          api.list_records(zone, "mtn.cdn.example.com", "A")])
+        self.assertEqual(ips, ["1.1.1.1"])
+        self.assertEqual(store.zone_for("mtn.cdn.example.com"), "z-ex")
+
+    def test_inspect_record_names_the_problems(self):
+        api = self.api()
+        self.assertEqual(api.inspect_record("z-ex", "mtn.cdn.example.com", "A"), (["1.1.1.1"], []))
+        ips, notes = api.inspect_record("z-ex", "mci.cdn.example.com", "A")
+        self.assertEqual(ips, ["2.2.2.2"])
+        self.assertTrue(any("CNAME" in n for n in notes))
+        self.assertTrue(any("نارنجی" in n for n in notes))
+        ips, notes = api.inspect_record("z-ex", "mtn.example.com", "A")
+        self.assertEqual(ips, [])
+        self.assertIn("mtn.cdn.example.com", notes[0])
+
+    def test_pasted_hostnames_are_cleaned(self):
+        self.assertEqual(app.normalise_host(" https://MTN.cdn.Example.com:443/ws?x=1 "),
+                         "mtn.cdn.example.com")
+        self.assertEqual(app.normalise_host("mci.cdn.example.com.\u200f"), "mci.cdn.example.com")
+
+
 # ------------------------------------------------------------------ real sockets
 
 class _TLSServer:
