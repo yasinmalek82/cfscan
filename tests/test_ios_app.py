@@ -8,6 +8,7 @@ scripted fakes. Nothing here contacts a public network.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import random
 import shutil
@@ -16,6 +17,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -693,6 +695,216 @@ class ProbeSocketTests(unittest.TestCase):
                             self.client_ctx(), 2)
         self.assertFalse(r["ok"])
         self.assertEqual(r["error"], "refused")
+
+
+# ------------------------------------------------------------------ robustness
+
+class RobustnessTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_a_dead_address_is_given_up_quickly(self):
+        calls = []
+
+        def dead(ip, target, ctx, timeout):
+            calls.append(ip)
+            return {"ip": ip, "ok": False, "tcp": None, "total": None, "error": "timeout"}
+
+        m = app.measure("1.2.3.4", None, None, 6, 1, True, pause=0, warmup=True, probe_ws=dead)
+        self.assertEqual(len(calls), 2)  # the warm-up and one attempt
+        self.assertEqual((m["ok"], m["loss"], m["delay"]), (0, 100.0, None))
+
+    def test_a_flaky_start_is_not_given_up(self):
+        answers = iter([False, True, True, True])
+
+        def flaky(ip, target, ctx, timeout):
+            ok = next(answers)
+            return {"ip": ip, "ok": ok, "tcp": 10.0 if ok else None,
+                    "total": 30.0 if ok else None, "colo": "", "error": "" if ok else "reset"}
+
+        m = app.measure("1.2.3.4", None, None, 3, 1, True, pause=0, warmup=True, probe_ws=flaky)
+        self.assertEqual((m["ok"], m["attempts"]), (3, 4))
+
+    def test_a_probe_that_raises_is_one_failure(self):
+        def broken(ip, target, ctx, timeout):
+            raise ValueError("bug")
+
+        m = app.measure("1.2.3.4", None, None, 3, 1, False, pause=0, probe_trace=broken)
+        self.assertEqual(m["errors"], ["ValueError", "ValueError"])
+
+    def test_a_scan_survives_a_probe_that_raises(self):
+        store = make_store(self.tmp)
+
+        def probe(ip, target, ctx, timeout):
+            if ip == "1.0.0.9":
+                raise RuntimeError("bug")
+            return scripted_probe({"1.0.0.2": (True, 100.0, "")})(ip, target, ctx, timeout)
+
+        FakeAPI.records = {}
+        FakeAPI.unreachable_direct = False
+        job = app.ScanJob(store, "s1", "mci", context_factory=lambda: None, api_factory=FakeAPI,
+                          candidates=["1.0.0.9", "1.0.0.2"], probe_trace=probe, probe_ws=probe)
+        self.assertEqual(job.run()["kind"], "applied")
+
+    def test_garbage_data_never_breaks_loading(self):
+        rng = random.Random(7)
+        atoms = [None, 0, -1, 3.5, "", "x", "1.1.1.1", True, [], {}, [1, "a"], {"a": 1}]
+
+        def junk(depth=0):
+            kind = rng.random()
+            if depth > 3 or kind < 0.4:
+                return rng.choice(atoms)
+            if kind < 0.7:
+                return [junk(depth + 1) for _ in range(rng.randrange(4))]
+            keys = ["version", "settings", "servers", "networks", "matrix", "records", "history",
+                    "bad", "profiles", "carriers", "state", "memory", "id", "sni", "record",
+                    "ips", "ok", "asns", "group", "name", "zones", "ranges", "server", "network"]
+            return {rng.choice(keys): junk(depth + 1) for _ in range(rng.randrange(6))}
+
+        for _ in range(600):
+            raw = junk()
+            if isinstance(raw, dict) and rng.random() < 0.5:
+                raw["version"] = rng.choice([1, 2, 3, 4, 5, "5", None])
+            try:
+                data = app.normalise_data(raw)
+            except Exception as exc:  # the Store catches this, but it should not happen
+                self.fail("normalise_data(%r) raised %r" % (raw, exc))
+            self.assertEqual(data["version"], 5)
+            json.dumps(data)
+
+    def test_choice_rules_hold_for_random_tables(self):
+        rng = random.Random(11)
+        nets = ["mci", "mtn"]
+        for _ in range(2000):
+            cells = {}
+            for i in range(rng.randrange(8)):
+                ip = "10.0.0.%d" % i
+                for n in nets:
+                    if rng.random() < 0.7:
+                        age = rng.choice([0, 30, 3600, 5 * DAY])
+                        cells.setdefault(ip, {})[n] = cell(rng.random() < 0.6,
+                                                           rng.choice([None, 80, 300, 900]), age)
+            current = [ip for ip in cells if rng.random() < 0.3]
+            count = rng.randrange(1, 4)
+            mode = rng.choice(["auto", "force"])
+            choice = app.choose_for_record(cells, "mci", nets, NOW, DAY, count, current, mode,
+                                           20, since=RUN)
+            here = [ip for ip in cells
+                    if app.cell_status(cells[ip].get("mci"), NOW, DAY, RUN) == "ok"]
+            failed_there = [ip for ip in cells
+                            if app.cell_status(cells[ip].get("mtn"), NOW, DAY) == "fail"]
+            self.assertLessEqual(len(choice["ips"]), count)
+            self.assertEqual(len(set(choice["ips"])), len(choice["ips"]))
+            for ip in choice["ips"]:
+                self.assertIn(ip, here)
+                self.assertNotIn(ip, failed_there)
+            if choice["kind"] == "conflict":
+                self.assertEqual(choice["ips"], [])
+                self.assertTrue(set(choice["conflict"]) <= set(failed_there) & set(here))
+            if choice["kind"] == "none":
+                self.assertEqual([ip for ip in here if ip not in failed_there], [])
+            if mode == "auto":
+                kept = [ip for ip in current if ip in here and ip not in failed_there]
+                self.assertEqual(choice["ips"][:len(kept)], kept[:count])
+
+    def test_many_threads_write_while_saving(self):
+        store = make_store(self.tmp)
+        errors = []
+
+        def writer(k):
+            try:
+                for i in range(200):
+                    store.record_result("s1", "10.%d.0.%d" % (k, i), "mci", i % 2 == 0, i)
+                    store.remember_bad("mtn", ["10.%d.1.%d" % (k, i)])
+                    if i % 20 == 0:
+                        store.save()
+                        store.cells_copy("s1")
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(k,)) for k in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        again = app.Store(store.path, secrets=MemorySecrets())
+        self.assertLessEqual(len(again.cells("s1")), app.MATRIX_LIMIT)
+
+    def test_a_record_change_survives_a_restart(self):
+        store = make_store(self.tmp)
+        FakeAPI.records = {}
+        FakeAPI.unreachable_direct = False
+        job = app.ScanJob(store, "s1", "mci", context_factory=lambda: None, api_factory=FakeAPI,
+                          candidates=["1.0.0.2"],
+                          probe_trace=scripted_probe({"1.0.0.2": (True, 100.0, "")}),
+                          probe_ws=scripted_probe({"1.0.0.2": (True, 100.0, "")}))
+        job.run()
+        again = app.Store(store.path, secrets=MemorySecrets())
+        self.assertEqual(again.record_ips("s1:mobile"), ["1.0.0.2"])
+        self.assertEqual(again.history()[0]["new"], ["1.0.0.2"])
+        self.assertEqual(again.cells("s1")["1.0.0.2"]["mci"]["delay"], 100.0)
+
+    def test_the_fast_pass_is_fast(self):
+        store = make_store(self.tmp, candidates=2000, stop_after=0)
+        table = {"10.%d.%d.1" % (i // 250, i % 250): (i % 7 == 0, 100.0 + i % 50, "")
+                 for i in range(2000)}
+        FakeAPI.records = {}
+        FakeAPI.unreachable_direct = False
+        job = app.ScanJob(store, "s1", "mci", context_factory=lambda: None, api_factory=FakeAPI,
+                          candidates=list(table), probe_trace=scripted_probe(table),
+                          probe_ws=scripted_probe(table))
+        started = time.time()
+        result = job.run()
+        self.assertEqual(result["scanned"], 2000)
+        self.assertLess(time.time() - started, 5.0)
+
+
+class FrameTests(unittest.TestCase):
+    class Sock:
+        def __init__(self, chunks):
+            self.chunks = list(chunks)
+
+        def recv(self, n):
+            return self.chunks.pop(0) if self.chunks else b""
+
+    def test_long_and_split_frames(self):
+        payload = bytes(range(256)) * 2
+        frame = bytes([0x82, 126]) + len(payload).to_bytes(2, "big") + payload
+        reader = app._WSReader(self.Sock([frame[:3], frame[3:100], frame[100:]]), b"")
+        self.assertEqual(reader.frame(), (0x2, payload))
+        big = b"x" * 70000
+        frame = bytes([0x82, 127]) + len(big).to_bytes(8, "big") + big
+        self.assertEqual(app._WSReader(self.Sock([frame]), b"").frame(), (0x2, big))
+
+    def test_a_closed_connection_raises(self):
+        with self.assertRaises(ConnectionResetError):
+            app._WSReader(self.Sock([b"\x82"]), b"").frame()
+
+    def test_vless_answer_split_across_frames(self):
+        head = b"\x00\x02ab"  # version, 2 bytes of addons
+        body = b"HTTP/1.1 204 No Content\r\n\r\n"
+        frames = [bytes([0x82, 1]) + head[:1], bytes([0x80, 3]) + head[1:],
+                  bytes([0x80, len(body)]) + body]
+
+        class Sock(self.Sock):
+            def sendall(self, data):
+                pass
+
+        target = app.Target("x.example", "/ws", 443, True, uuid=VLESS_UUID)
+        self.assertEqual(app._vless_exchange(Sock(frames), b"", target), 204)
+        closed = [bytes([0x88, 0])]
+        with self.assertRaises(ConnectionResetError):
+            app._vless_exchange(Sock(closed), b"", target)
+
+    def test_client_frames_are_masked_and_sized(self):
+        for n in (0, 125, 126, 65535, 65536):
+            frame = app.ws_frame(b"a" * n)
+            self.assertEqual(frame[0], 0x82)
+            self.assertTrue(frame[1] & 0x80)
+            header = {True: 2, False: 4 if n < 65536 else 10}[n < 126]
+            self.assertEqual(len(frame), header + 4 + n)
 
 
 # ------------------------------------------------------------------ the scan

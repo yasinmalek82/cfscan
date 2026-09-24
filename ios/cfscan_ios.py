@@ -69,7 +69,7 @@ except ImportError:
         return fn
 
 APP_NAME = "CF Scanner"
-APP_VERSION = "5.0"
+APP_VERSION = "5.1"
 
 try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -194,11 +194,23 @@ def log(message):
             pass
 
 
+_CRASH_FILE = []
+
+
 def enable_crash_trace():
+    """Native crashes (a dead app, no traceback) are written to the log too."""
     try:
-        faulthandler.enable(file=open(LOG_PATH, "a", encoding="utf-8"), all_threads=True)
+        handle = open(LOG_PATH, "a", encoding="utf-8")
+        faulthandler.enable(file=handle, all_threads=True)
     except Exception as exc:
         log("faulthandler unavailable: %r" % (exc,))
+        return
+    while _CRASH_FILE:  # the previous run's handle, now unused
+        try:
+            _CRASH_FILE.pop().close()
+        except OSError:
+            pass
+    _CRASH_FILE.append(handle)
 
 
 def read_log_tail(lines=60):
@@ -298,8 +310,21 @@ def _network(raw):
 def _cell(raw):
     raw = raw if isinstance(raw, dict) else {}
     delay = raw.get("delay", raw.get("ping"))
-    return {"ok": bool(raw.get("ok")), "delay": delay, "colo": raw.get("colo", "") or "",
-            "ts": raw.get("ts", 0) or 0}
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)) or delay < 0:
+        delay = None
+    ts = raw.get("ts", 0)
+    colo = raw.get("colo", "")
+    return {"ok": bool(raw.get("ok")), "delay": delay,
+            "colo": colo if isinstance(colo, str) else "",
+            "ts": ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0}
+
+
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value):
+    return value if isinstance(value, list) else []
 
 
 def normalise_data(raw):
@@ -317,8 +342,12 @@ def normalise_data(raw):
     through that server), keeping whether each address worked.
     """
     raw = raw if isinstance(raw, dict) else {}
-    version = raw.get("version") or (1 if "profiles" in raw else 5)
-    raw_settings = raw.get("settings") if isinstance(raw.get("settings"), dict) else {}
+    try:
+        version = int(raw.get("version") or (1 if "profiles" in raw else 5))
+    except (TypeError, ValueError):
+        version = 5
+    version = min(max(version, 1), 5)
+    raw_settings = _as_dict(raw.get("settings"))
 
     settings = dict(DEFAULT_SETTINGS)
     for key, value in raw_settings.items():
@@ -330,7 +359,7 @@ def normalise_data(raw):
     if version < 4 and raw_settings.get("max_ping_ms") in (800, "800"):
         settings["max_ping_ms"] = DEFAULT_SETTINGS["max_ping_ms"]  # was a TCP ping limit
     if version == 2 and not settings["zone_id"]:
-        zones = [s.get("zone_id") for s in raw.get("servers") or []
+        zones = [s.get("zone_id") for s in _as_list(raw.get("servers"))
                  if isinstance(s, dict) and s.get("zone_id")]
         settings["zone_id"] = str(zones[0]).strip() if zones else ""
 
@@ -338,7 +367,7 @@ def normalise_data(raw):
     if version == 1:
         server_list = [dict(raw_settings, id="s1")] if raw_settings.get("sni") else []
     else:
-        server_list = [dict(s) for s in raw.get("servers") or [] if isinstance(s, dict)]
+        server_list = [dict(s) for s in _as_list(raw.get("servers")) if isinstance(s, dict)]
     for s in server_list:
         if version == 4:
             s.setdefault("record_mobile", s.get("record", ""))
@@ -357,7 +386,7 @@ def normalise_data(raw):
     # networks
     net_list = {1: raw.get("profiles"), 2: raw.get("carriers")}.get(version, raw.get("networks"))
     networks, seen = [], set()
-    for n in net_list or copy.deepcopy(DEFAULT_NETWORKS):
+    for n in _as_list(net_list) or copy.deepcopy(DEFAULT_NETWORKS):
         if isinstance(n, dict) and n.get("id") and str(n["id"]) not in seen:
             seen.add(str(n["id"]))
             networks.append(_network(n))
@@ -367,33 +396,36 @@ def normalise_data(raw):
     # coverage: server -> address -> network -> cell
     matrix = {}
     if version >= 5:
-        for sid, table in (raw.get("matrix") or {}).items():
+        for sid, table in _as_dict(raw.get("matrix")).items():
             if sid in ids and isinstance(table, dict):
-                matrix[sid] = {ip: {nid: _cell(c) for nid, c in cells.items()}
+                matrix[sid] = {ip: {nid: _cell(c) for nid, c in cells.items()
+                                    if isinstance(c, dict)}
                                for ip, cells in table.items() if isinstance(cells, dict)}
     else:
         flat = {}
         if version in (3, 4):
-            flat = {ip: cells for ip, cells in (raw.get("matrix") or {}).items()
+            flat = {ip: cells for ip, cells in _as_dict(raw.get("matrix")).items()
                     if isinstance(cells, dict)}
-        memory = {1: raw.get("state"), 2: raw.get("memory")}.get(version) or {}
+        memory = _as_dict({1: raw.get("state"), 2: raw.get("memory")}.get(version))
         for nid, mem in memory.items():
-            for ip, g in ((mem or {}).get("good") or {}).items() if isinstance(mem, dict) else ():
+            for ip, g in _as_dict(_as_dict(mem).get("good")).items():
                 g = g if isinstance(g, dict) else {}
                 flat.setdefault(ip, {})[nid] = {"ok": True, "ts": g.get("ts", 0),
                                                 "colo": g.get("colo", "")}
         for sid in ids:
-            matrix[sid] = {ip: {nid: dict(_cell(c), delay=None) for nid, c in cells.items()}
+            matrix[sid] = {ip: {nid: dict(_cell(c), delay=None) for nid, c in cells.items()
+                                if isinstance(c, dict)}
                            for ip, cells in flat.items()}
 
     bad = {}
-    for nid, ips in (raw.get("bad") or {}).items():
+    for nid, ips in _as_dict(raw.get("bad")).items():
         if isinstance(ips, dict):
-            bad[nid] = dict(ips)
-    memory = {1: raw.get("state"), 2: raw.get("memory")}.get(version) or {}
+            bad[nid] = {ip: ts for ip, ts in ips.items() if isinstance(ts, (int, float))}
+    memory = _as_dict({1: raw.get("state"), 2: raw.get("memory")}.get(version))
     for nid, mem in memory.items():
         if isinstance(mem, dict) and isinstance(mem.get("bad"), dict):
-            bad.setdefault(nid, {}).update(mem["bad"])
+            bad.setdefault(nid, {}).update(
+                {ip: ts for ip, ts in mem["bad"].items() if isinstance(ts, (int, float))})
 
     # what the records point at, and the history of changes
     def new_key(key):
@@ -407,18 +439,28 @@ def normalise_data(raw):
         return None
 
     records = {}
-    for key, entry in (raw.get("records") or {}).items():
+    for key, entry in _as_dict(raw.get("records")).items():
         target = new_key(key)
         if target and isinstance(entry, dict):
-            records[target] = {"ips": list(entry.get("ips") or []), "ts": entry.get("ts", 0)}
+            ts = entry.get("ts", 0)
+            records[target] = {"ips": [str(ip) for ip in _as_list(entry.get("ips"))
+                                       if isinstance(ip, str) and ip],
+                               "ts": ts if isinstance(ts, (int, float)) else 0}
     history = []
-    for h in raw.get("history") or []:
+    for h in _as_list(raw.get("history")):
         if not isinstance(h, dict):
             continue
-        h = dict(h)
+        ts = h.get("ts", 0)
+        entry = {"ts": ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0,
+                 "record": str(h.get("record") or ""),
+                 "kind": str(h.get("kind") or "apply"),
+                 "network": str(h.get("network") or ""),
+                 "old": [str(ip) for ip in _as_list(h.get("old"))],
+                 "new": [str(ip) for ip in _as_list(h.get("new"))],
+                 "note": str(h.get("note") or "")}
         if version < 5:
-            h["record"] = new_key(h.get("record")) or ""
-        history.append(h)
+            entry["record"] = new_key(h.get("record")) or ""
+        history.append(entry)
 
     net_ids = [n["id"] for n in networks]
     return {
@@ -426,8 +468,8 @@ def normalise_data(raw):
         "settings": settings,
         "servers": servers,
         "networks": networks,
-        "server": raw.get("server") if raw.get("server") in ids else first,
-        "network": raw.get("network") if raw.get("network") in net_ids else net_ids[0],
+        "server": raw.get("server") if str(raw.get("server")) in ids else first,
+        "network": raw.get("network") if str(raw.get("network")) in net_ids else net_ids[0],
         "matrix": matrix,
         "bad": bad,
         "records": records,
@@ -479,12 +521,26 @@ class Store:
         self.path = path
         self.secrets = secrets or Secrets()
         self.lock = threading.RLock()
+        self.recovered = ""
+        raw = {}
         try:
             with open(path, encoding="utf-8") as fh:
                 raw = json.load(fh)
-        except (OSError, ValueError):
-            raw = {}
-        self.data = normalise_data(raw)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            # keep the broken file for the user instead of overwriting it
+            self.recovered = "%s.broken-%d" % (path, int(time.time()))
+            try:
+                os.replace(path, self.recovered)
+            except OSError:
+                self.recovered = ""
+            log("data file unreadable (%r); kept as %s" % (exc, self.recovered))
+        try:
+            self.data = normalise_data(raw)
+        except Exception as exc:  # never lose the app to one odd stored value
+            log("data file not understood (%r); starting clean" % (exc,))
+            self.data = normalise_data({})
 
     def save(self):
         with self.lock:
@@ -678,7 +734,13 @@ class Store:
     # -- coverage per server: address x network ------------------------------
 
     def cells(self, sid):
-        return self.data["matrix"].setdefault(sid, {})
+        with self.lock:
+            return self.data["matrix"].setdefault(sid, {})
+
+    def cells_copy(self, sid):
+        """A snapshot for the screens, safe while a scan writes."""
+        with self.lock:
+            return copy.deepcopy(self.data["matrix"].get(sid) or {})
 
     def record_result(self, sid, ip, nid, ok, delay=None, colo="", ts=None):
         with self.lock:
@@ -1083,23 +1145,44 @@ def successive_jitter_ms(samples):
     return sum(gaps) / len(gaps)
 
 
+def _safe_probe(probe, ip, target, ctx, timeout):
+    """A probe that cannot raise: a bug in one probe is one failed attempt."""
+    try:
+        return probe(ip, target, ctx, timeout)
+    except Exception as exc:
+        log("probe %s raised %r" % (ip, exc))
+        r = _blank_result(ip)
+        r["error"] = describe_error(exc)
+        return r
+
+
 def measure(ip, target, ctx, attempts, timeout, use_ws, cancel=None, pause=0.15,
-            probe_trace=trace_probe, probe_ws=ws_probe, warmup=False):
+            probe_trace=trace_probe, probe_ws=ws_probe, warmup=False, fail_fast=2):
     """``attempts`` sequential probes of one address, summarised.
 
     ``delay`` is the median time of a whole probe - with a VLESS target the
     client's "real delay"; ``ping`` the median TCP connect. ``warmup``
-    first makes one untimed probe: on a phone the first packets wake the
-    radio and would count 50-200 ms that no later request pays.
+    first makes one probe whose time is not counted: on a phone the first
+    packets wake the radio and would count 50-200 ms that no later request
+    pays (a failed warm-up does count, as a failure). ``fail_fast``: an
+    address whose first attempts all fail is not waited on any longer - a
+    dead address would otherwise cost every attempt's full timeout.
     """
+    probe = probe_ws if use_ws else probe_trace
     tcp, total, errors = [], [], []
     colo = ""
     if warmup and not (cancel is not None and cancel.is_set()):
-        (probe_ws if use_ws else probe_trace)(ip, target, ctx, timeout)
+        r = _safe_probe(probe, ip, target, ctx, timeout)
+        if not r["ok"]:
+            errors.append(r["error"])
+        else:
+            colo = r.get("colo") or colo
     for i in range(int(attempts)):
         if cancel is not None and cancel.is_set():
             break
-        r = (probe_ws if use_ws else probe_trace)(ip, target, ctx, timeout)
+        if fail_fast and not tcp and len(errors) >= fail_fast:
+            break
+        r = _safe_probe(probe, ip, target, ctx, timeout)
         if r["ok"]:
             tcp.append(r["tcp"])
             total.append(r["total"])
@@ -1735,6 +1818,11 @@ def network_hints(store, sid, ips, nets, now, window_s):
     """
     bad_window = min(window_s, float(store.settings["bad_ttl_hours"]) * 3600 or window_s)
     hints = {}
+    with store.lock:
+        return _hints(store, sid, ips, nets, now, window_s, bad_window, hints)
+
+
+def _hints(store, sid, ips, nets, now, window_s, bad_window, hints):
     for ip in ips:
         for n in nets:
             ts = store.bad_for(n).get(ip)
@@ -1755,9 +1843,10 @@ def relevant_networks(store, group):
     would otherwise flag every address as unverified forever.
     """
     measured = set()
-    for table in store.data["matrix"].values():
-        for cells in table.values():
-            measured.update(cells)
+    with store.lock:
+        for table in store.data["matrix"].values():
+            for cells in table.values():
+                measured.update(cells)
     return [n["id"] for n in store.networks
             if n["group"] == group and (n["asns"] or n["id"] in measured)]
 
@@ -1908,7 +1997,7 @@ class ScanJob:
             for i in (1, 2, 3):
                 self.events.step(i, "skip")
             now = self.clock()
-            health = record_health(store.cells(self.sid), current, group_nets, now, window,
+            health = record_health(store.cells_copy(self.sid), current, group_nets, now, window,
                                    network_hints(store, self.sid, current, group_nets, now, window))
             result.update(kind="healthy", ips=current,
                           unverified=[n for n in group_nets if health[n] != "ok"])
@@ -1920,7 +2009,7 @@ class ScanJob:
         if self.fixed_candidates is not None:
             cands = list(self.fixed_candidates)
         else:
-            own = {ip: {"ts": c[self.nid].get("ts", 0)} for ip, c in store.cells(self.sid).items()
+            own = {ip: {"ts": c[self.nid].get("ts", 0)} for ip, c in store.cells_copy(self.sid).items()
                    if (c.get(self.nid) or {}).get("ok")}
             cands = build_candidates({"good": own, "bad": store.bad_for(self.nid)},
                                      int(s["candidates"]), version, store.ranges(version),
@@ -1969,9 +2058,10 @@ class ScanJob:
         if self.cancelled:
             return self._stopped(result)
         now = self.clock()
-        hints = network_hints(store, self.sid, list(store.cells(self.sid)),
+        mine = store.cells_copy(self.sid)
+        hints = network_hints(store, self.sid, list(mine),
                               [n for n in group_nets if n != self.nid], now, window)
-        choice = choose_for_record(store.cells(self.sid), self.nid, group_nets, now,
+        choice = choose_for_record(mine, self.nid, group_nets, now,
                                    window, count, current, self.mode,
                                    float(s["min_gain_pct"]), since=run_started, hints=hints)
         result.update(ips=choice["ips"], unverified=choice["unverified"],
@@ -2042,7 +2132,7 @@ class ScanJob:
         not measured here for this server lately.
         """
         now = self.clock()
-        mine = self.store.cells(self.sid)
+        mine = self.store.cells_copy(self.sid)
         out = []
 
         def fresh_here(ip):
@@ -2055,13 +2145,14 @@ class ScanJob:
             if oks and not fresh_here(ip) and ip not in current:
                 ranked.append((max(c.get("delay") or 0 for c in oks), ip))
         out += [ip for _, ip in sorted(ranked)]
-        for sid, table in self.store.data["matrix"].items():
-            if sid == self.sid:
-                continue
-            for ip, cells in table.items():
-                if (cell_status(cells.get(self.nid), now, window) == "ok"
-                        and ip not in out and not fresh_here(ip) and ip not in current):
-                    out.append(ip)
+        with self.store.lock:
+            for sid, table in self.store.data["matrix"].items():
+                if sid == self.sid:
+                    continue
+                for ip, cells in table.items():
+                    if (cell_status(cells.get(self.nid), now, window) == "ok"
+                            and ip not in out and not fresh_here(ip) and ip not in current):
+                        out.append(ip)
         return out[:60]
 
     def _ok(self, m):
@@ -2089,7 +2180,7 @@ class ScanJob:
                     if not queue or (stop_after and len(answered) >= stop_after):
                         return
                     ip = queue.pop(0)
-                r = self.probe_trace(ip, target, ctx, timeout)
+                r = _safe_probe(self.probe_trace, ip, target, ctx, timeout)
                 with lock:
                     counters["done"] += 1
                     if r["ok"] and (not colos or r["colo"] in colos):
@@ -2232,21 +2323,48 @@ def format_trace_row(r):
 # ======================================================================= UI
 # Everything below runs only inside Pythonista.
 
-BG = "#F3F1EC"
-CARD = "#FFFFFF"
-INK = "#17181C"
-MUTED = "#5B5E66"
-LINE = "#E2DED6"
-BORDER = "#C9C4B8"
-ACCENT = "#1F4FD1"
-GOOD = "#17663F"
-GOOD_BG = "#E3F2EA"
-BAD = "#A3261C"
-BAD_BG = "#FBE7E4"
-NEUTRAL = "#4A4D55"
-NEUTRAL_BG = "#ECEAE4"
-WARN = "#5C4400"
-WARN_BG = "#FFF4D6"
+PALETTES = {
+    "light": {"BG": "#F3F1EC", "CARD": "#FFFFFF", "INK": "#17181C", "MUTED": "#5B5E66",
+              "LINE": "#E2DED6", "BORDER": "#C9C4B8", "TRACK": "#E7E3DA",
+              "ACCENT": "#1F4FD1", "ON_ACCENT": "#FFFFFF",
+              "GOOD": "#17663F", "GOOD_BG": "#E3F2EA", "BAD": "#A3261C", "BAD_BG": "#FBE7E4",
+              "NEUTRAL": "#4A4D55", "NEUTRAL_BG": "#ECEAE4",
+              "WARN": "#5C4400", "WARN_BG": "#FFF4D6"},
+    # same meanings, contrast kept for text on the tinted backgrounds
+    "dark": {"BG": "#111214", "CARD": "#1C1D21", "INK": "#F2F1ED", "MUTED": "#A5A8B0",
+             "LINE": "#2C2E33", "BORDER": "#3D4047", "TRACK": "#2C2E33",
+             "ACCENT": "#6E95FF", "ON_ACCENT": "#0B1020",
+             "GOOD": "#7FD9A4", "GOOD_BG": "#15301F", "BAD": "#FF9A8F", "BAD_BG": "#3A1714",
+             "NEUTRAL": "#C4C6CC", "NEUTRAL_BG": "#26282D",
+             "WARN": "#FFD66B", "WARN_BG": "#352A0B"},
+}
+THEME = "light"
+BG = CARD = INK = MUTED = LINE = BORDER = TRACK = ACCENT = ON_ACCENT = ""
+GOOD = GOOD_BG = BAD = BAD_BG = NEUTRAL = NEUTRAL_BG = WARN = WARN_BG = ""
+STATE_COLORS = {}
+STEP_ICONS = {}
+
+
+def apply_theme(name):
+    """Switch every colour constant to the ``light`` or ``dark`` palette.
+
+    Screens read the constants when they are built, so this runs before the
+    first screen (and a test can build screens in both themes).
+    """
+    global THEME
+    THEME = name if name in PALETTES else "light"
+    g = globals()
+    g.update(PALETTES[THEME])
+    STATE_COLORS.clear()
+    STATE_COLORS.update({"ok": (GOOD, GOOD_BG), "fail": (BAD, BAD_BG),
+                         UNKNOWN: (NEUTRAL, NEUTRAL_BG), "bad": (BAD, BAD_BG),
+                         "wait": (NEUTRAL, NEUTRAL_BG), "warn": (WARN, WARN_BG)})
+    STEP_ICONS.clear()
+    STEP_ICONS.update({"wait": ("○", MUTED), "run": ("●", ACCENT), "ok": ("✓", GOOD),
+                       "fail": ("✕", BAD), "skip": ("–", MUTED)})
+
+
+apply_theme("light")
 RLM = "‏"
 
 
@@ -2260,7 +2378,7 @@ def matrix_lines(store, sid):
     s = store.settings
     now = time.time()
     window = float(s["fresh_hours"]) * 3600
-    cells = store.cells(sid)
+    cells = store.cells_copy(sid)
     in_records = set()
     for key, _, _, _ in store.slots(sid):
         in_records.update(store.record_ips(key))
@@ -2294,6 +2412,8 @@ def history_lines(store, sid=None):
 
 def connection_text(info, network=None):
     """(text, state) for the network badge; state is ok, bad or wait."""
+    if info is None and network is not None:
+        return "✓ %s (انتخاب دستی) — برای تغییر بزنید" % network["name"], "ok"
     if info is None:
         return "در حال تشخیص اینترنت…", "wait"
     if not info["ok"]:
@@ -2326,7 +2446,7 @@ if ui is not None:
         b.action = action
         if primary:
             b.background_color = ACCENT
-            b.tint_color = "white"
+            b.tint_color = ON_ACCENT
         else:
             b.background_color = CARD
             b.tint_color = color or INK
@@ -2382,8 +2502,12 @@ if ui is not None:
         return {"type": kind, "key": key, "title": title, "value": str(value),
                 "autocorrection": False, "autocapitalization": ui.AUTOCAPITALIZE_NONE}
 
-    STATE_COLORS = {"ok": (GOOD, GOOD_BG), "fail": (BAD, BAD_BG), UNKNOWN: (NEUTRAL, NEUTRAL_BG),
-                    "bad": (BAD, BAD_BG), "wait": (NEUTRAL, NEUTRAL_BG)}
+    def system_theme():
+        """``dark`` when iOS is in dark mode (Pythonista 3.3+), else ``light``."""
+        try:
+            return "dark" if ui.get_ui_style() == "dark" else "light"
+        except Exception:
+            return "light"
 
     # ------------------------------------------------------------------ record card
 
@@ -2405,17 +2529,19 @@ if ui is not None:
             key = slot_key(sid, group)
             name = server.get("record_" + group)
             ips = store.record_ips(key) if name else []
-            cells = store.cells(sid)
+            cells = store.cells_copy(sid)
             self.background_color = CARD
             self.corner_radius = 18
             self.border_width = 1.5 if group == "mobile" and name else 1
             self.border_color = ACCENT if group == "mobile" and name else LINE
 
             self.heading = make_label(GROUP_NAMES[group], 16, bold=True)
+            self.pill = make_label("", 12, bold=True, align="center")
+            self.pill.corner_radius = 11
             self.record = make_label(name or ("تنظیم نشده — در ویرایش سرور" if group == "mobile"
                                               else "اختیاری؛ در ویرایش سرور"),
                                      12, color=MUTED, mono=bool(name))
-            for v in (self.heading, self.record):
+            for v in (self.heading, self.pill, self.record):
                 self.add_subview(v)
             self.rows = []
             for ip in ips:
@@ -2433,12 +2559,23 @@ if ui is not None:
                     self.add_subview(v)
                 self.rows.append((ip_label, chips))
             lines = []
+            if not name:
+                state = ("warn", "تنظیم نشده") if group == "mobile" else (UNKNOWN, "اختیاری")
+            elif not ips:
+                state = ("warn", "بدون IP")
+            else:
+                state = ("ok", "سالم")
             if name and ips:
                 ids = [n["id"] for n in nets]
                 health = record_health(cells, ips, ids, now, window,
                                        network_hints(store, sid, ips, ids, now, window))
                 marks = {"ok": "✓", "fail": "✕ خراب", UNKNOWN: "⚠ تأیید نشده"}
                 lines.append(" · ".join("%s %s" % (n["name"], marks[health[n["id"]]]) for n in nets))
+                values = set(health.values())
+                if "fail" in values:
+                    state = ("fail", "خراب")
+                elif UNKNOWN in values or not values:
+                    state = ("warn", "تأیید نشده")
                 changed = store.record_changed_at(key)
                 if changed:
                     lines.append("آخرین تغییر: %s" % ago(changed))
@@ -2447,6 +2584,11 @@ if ui is not None:
                              % (" یا ".join(n["name"] for n in nets) or "اینترنت " + GROUP_NAMES[group]))
             self.summary = make_label("\n".join(lines), 12, color=MUTED, lines=2)
             self.add_subview(self.summary)
+            self.state = state[0]
+            fg, bg = STATE_COLORS[state[0]]
+            self.pill.text = fa(state[1])
+            self.pill.text_color = fg
+            self.pill.background_color = bg
 
         @property
         def height_needed(self):
@@ -2454,7 +2596,9 @@ if ui is not None:
 
         def layout(self):
             w = self.width
-            self.heading.frame = (16, 12, w - 32, 22)
+            pw = 92
+            self.pill.frame = (16, 12, pw, 24)
+            self.heading.frame = (16 + pw + 8, 12, max(0, w - 40 - pw), 22)
             self.record.frame = (16, 34, w - 32, 18)
             y = 60
             for ip_label, chips in self.rows:
@@ -2482,6 +2626,7 @@ if ui is not None:
 
             self.servers = ui.SegmentedControl()
             self.servers.action = self.server_changed
+            self.server_info = make_label("", 12, color=MUTED)
             self.net_btn = ui.Button()
             self.net_btn.corner_radius = 14
             self.net_btn.font = ("<System-Bold>", 13)
@@ -2493,8 +2638,8 @@ if ui is not None:
             self.setup = make_label("", 13, color=BAD, lines=3)
             self.empty_btn = make_button("افزودن سرور (لینک vless کانفیگ CDN)",
                                          lambda s: run_bg(self.app.edit_server, None), primary=True)
-            for v in (self.servers, self.net_btn, self.scan_btn, self.force_btn, self.all_btn,
-                      self.setup, self.empty_btn):
+            for v in (self.servers, self.server_info, self.net_btn, self.scan_btn,
+                      self.force_btn, self.all_btn, self.setup, self.empty_btn):
                 self.scroll.add_subview(v)
             self.cards = []
             self.right_button_items = [
@@ -2512,7 +2657,7 @@ if ui is not None:
                 self.scroll.remove_subview(c)
             self.cards = []
             has = server is not None
-            for v in (self.servers, self.scan_btn, self.force_btn):
+            for v in (self.servers, self.server_info, self.scan_btn, self.force_btn):
                 v.hidden = not has
             self.empty_btn.hidden = has
             self.all_btn.hidden = len(store.servers) < 2
@@ -2521,6 +2666,11 @@ if ui is not None:
                 self.servers.selected_index = [s["id"] for s in store.servers].index(server["id"])
                 net = store.current_network
                 self.scan_btn.title = "اسکن «%s» روی «%s»" % (server["name"], net["name"])
+                kind = store.target(server).kind
+                self.server_info.text = fa("%s · %s%s" % (
+                    server["sni"] or "دامنه ندارد", TEST_LABEL[kind],
+                    " ✓" if kind == "vless" else " (لینک کانفیگ را اضافه کنید)"))
+                self.server_info.text_color = MUTED if kind == "vless" else WARN
                 self.cards = [RecordCard(self.app, server["id"], g) for g in GROUPS]
                 for c in self.cards:
                     self.scroll.add_subview(c)
@@ -2564,7 +2714,8 @@ if ui is not None:
             y = 14
             if not self.servers.hidden:
                 self.servers.frame = (pad, y, inner, 34)
-                y += 46
+                self.server_info.frame = (pad, y + 38, inner, 18)
+                y += 66
             self.net_btn.frame = (pad, y, inner, 38)
             y += 50
             if not self.empty_btn.hidden:
@@ -2587,9 +2738,6 @@ if ui is not None:
             self.scroll.content_size = (w, y + 24)
 
     # ------------------------------------------------------------------ scan screen
-
-    STEP_ICONS = {"wait": ("○", MUTED), "run": ("●", ACCENT), "ok": ("✓", GOOD),
-                  "fail": ("✕", BAD), "skip": ("–", MUTED)}
 
     class ScanView(ui.View):
         """Runs one job per server on one network; implements :class:`Events`."""
@@ -2627,7 +2775,7 @@ if ui is not None:
                     self.step_card.add_subview(v)
                 self.step_views.append((icon, name, detail))
             self.track = ui.View()
-            self.track.background_color = "#E7E3DA"
+            self.track.background_color = TRACK
             self.track.corner_radius = 4
             self.fill = ui.View()
             self.fill.background_color = ACCENT
@@ -2651,6 +2799,7 @@ if ui is not None:
             self.table.border_width = 1
             self.table.border_color = LINE
             self.table.row_height = 40
+            self.table.background_color = CARD
             self.ds = ui.ListDataSource([])
             self.ds.font = ("Menlo", 13)
             self.ds.text_color = INK
@@ -2855,6 +3004,9 @@ if ui is not None:
             run_bg(self._apply_flow, None, "apply")
 
         def tapped_anyway(self, sender):
+            run_bg(self._anyway_flow, sender)
+
+        def _anyway_flow(self, sender):
             r = self.result or {}
             names = [n["name"] for n in self.app.store.networks
                      if n["group"] == r.get("group") and n["id"] != self.nid]
@@ -2892,6 +3044,8 @@ if ui is not None:
             self.table = ui.TableView()
             self.ds = ui.ListDataSource(lines or [fa("هنوز چیزی ثبت نشده")])
             self.ds.font = ("<System>", 13)
+            self.ds.text_color = INK
+            self.table.background_color = CARD
             self.table.data_source = self.table.delegate = self.ds
             self.table.row_height = row_height
             self.table.allows_selection = False
@@ -2913,8 +3067,11 @@ if ui is not None:
         def run(self):
             log("=== app start v%s ===" % APP_VERSION)
             enable_crash_trace()
+            apply_theme(system_theme())
             self.main = MainView(self)
             self.nav = ui.NavigationView(self.main)
+            self.nav.background_color = BG
+            self.nav.tint_color = ACCENT
             self.nav.present("fullscreen", hide_title_bar=False)
             if not self.store.servers or not self.store.token:
                 run_bg(self.first_run)
