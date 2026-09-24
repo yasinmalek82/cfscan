@@ -533,6 +533,32 @@ class Store:
             mem.setdefault("bad", {})
             return mem
 
+    def shared_candidates(self, cid, limit=40):
+        """Addresses in use or known-good on other carriers: ``{ip: carrier name}``.
+
+        First what the other carriers' records point at on every server, then
+        their remembered good addresses, newest first.
+        """
+        out = {}
+        names = {c["id"]: c["name"] for c in self.carriers}
+        with self.lock:
+            for key, st in self.data["state"].items():
+                other = key.split("|", 1)[-1]
+                if other != cid and st.get("status") == "ok":
+                    for ip in st.get("current") or []:
+                        out.setdefault(ip, names.get(other, other))
+            good = []
+            for other, mem in self.data["memory"].items():
+                if other == cid:
+                    continue
+                for ip, g in (mem.get("good") or {}).items():
+                    good.append((g.get("ts", 0), ip, other))
+            for _, ip, other in sorted(good, reverse=True):
+                if len(out) >= limit:
+                    break
+                out.setdefault(ip, names.get(other, other))
+        return out
+
     def remember_good(self, cid, ip, ping, colo):
         with self.lock:
             mem = self.memory(cid)
@@ -859,10 +885,12 @@ def neighbours(ip, rng, count):
 
 
 def build_candidates(state, count, version, ranges, rng=random, now=None,
-                     bad_ttl_s=6 * 3600, exclude=()):
-    """The scan order: known-good, their neighbours, then random addresses.
+                     bad_ttl_s=6 * 3600, exclude=(), shared=()):
+    """The scan order: known-good, ``shared``, neighbours, then random.
 
-    Addresses that failed on this carrier within ``bad_ttl_s`` are skipped.
+    ``shared`` are addresses found for other carriers (an Irancell address is
+    sometimes the fastest on MCI too). Addresses that failed on this carrier
+    within ``bad_ttl_s`` are skipped.
     """
     now = time.time() if now is None else now
     bad = {ip for ip, ts in (state.get("bad") or {}).items() if now - ts < bad_ttl_s}
@@ -878,6 +906,8 @@ def build_candidates(state, count, version, ranges, rng=random, now=None,
     good = sorted((state.get("good") or {}).items(), key=lambda kv: -kv[1].get("ts", 0))
     good = [ip for ip, _ in good if ip not in seen]  # not excluded, not failed lately
     for ip in good:
+        add(ip)
+    for ip in shared:
         add(ip)
     for ip in good[:20]:
         for n in neighbours(ip, rng, 8):
@@ -1412,13 +1442,15 @@ class ScanJob:
         # 2. fast pass over the candidates
         self.events.step(1, "run")
         mem = self.store.memory(self.cid)
+        shared = self.store.shared_candidates(self.cid)
+        own_good = set(mem.get("good") or {})
         if self.fixed_candidates is not None:
             cands = list(self.fixed_candidates)
         else:
             cands = build_candidates(mem, int(s["candidates"]), version,
                                      self.store.ranges(version), rng=self.rng,
                                      bad_ttl_s=float(s["bad_ttl_hours"]) * 3600,
-                                     exclude=current)
+                                     exclude=current, shared=list(shared))
         started = time.time()
         answered, scanned, failed, errors = self._fast_pass(cands, target, ctx, s)
         result["scanned"], result["answered"] = scanned, len(answered)
@@ -1469,7 +1501,11 @@ class ScanJob:
             return result
         best = passing[0]
         result["best"] = best
-        self.events.step(2, "ok", "بهترین: %s  %s" % (best["ip"], self._measure_text(best)))
+        detail = "بهترین: %s  %s" % (best["ip"], self._measure_text(best))
+        if best["ip"] in shared and best["ip"] not in own_good:
+            detail += "  (IP پیداشده برای %s)" % shared[best["ip"]]
+        result["shared_from"] = shared.get(best["ip"], "")
+        self.events.step(2, "ok", detail)
 
         # 4. the DNS record
         chosen = [m["ip"] for m in passing[:int(s["ips_per_record"])]]

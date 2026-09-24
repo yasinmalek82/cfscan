@@ -715,6 +715,29 @@ class ScanJobTests(unittest.TestCase):
         self.assertIn(cands[0], ("1.0.0.2", "1.0.0.3", "1.0.0.1"))
         self.assertTrue(sid)
 
+    def test_other_carriers_addresses_are_tried_early(self):
+        store = make_store(self.tmp)
+        store.state("s1", "mtn").update(current=["1.0.0.3"], status="ok")
+        store.state("s1", "home").update(current=["5.5.5.5"], status="bad")
+        store.remember_good("home", "1.0.0.9", 90, "FRA")
+        store.remember_good("mci", "1.0.0.1", 90, "GYD")
+        shared = store.shared_candidates("mci")
+        self.assertEqual(list(shared), ["1.0.0.3", "1.0.0.9"])
+        self.assertEqual(shared["1.0.0.3"], "ایرانسل")
+        cands = app.build_candidates(store.memory("mci"), 30, 4, app.CF_RANGES_V4,
+                                     rng=random.Random(2), shared=list(shared))
+        self.assertEqual(cands[:3], ["1.0.0.1", "1.0.0.3", "1.0.0.9"])
+
+    def test_a_scan_can_pick_the_address_another_carrier_found(self):
+        store = make_store(self.tmp)
+        store.state("s1", "mtn").update(current=["1.0.0.2"], status="ok")
+        job = self.job(store)
+        job.fixed_candidates = None
+        job.store.update_settings({"candidates": 20, "stop_after": 2})
+        result = job.run()
+        self.assertEqual(result["chosen"], ["1.0.0.2"])
+        self.assertEqual(result["shared_from"], "ایرانسل")
+
     def test_connection_check_reads_the_location(self):
         class Resp:
             def __init__(self, body):
