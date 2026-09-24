@@ -820,6 +820,44 @@ class DiagnoseTests(unittest.TestCase):
         self.assertEqual(app.diagnose({"ping": None, "delay": None}), [])
 
 
+class SocketBudgetTests(unittest.TestCase):
+    class Resource:
+        RLIMIT_NOFILE = 8
+        RLIM_INFINITY = -1
+
+        def __init__(self, soft, hard, refuse=False):
+            self.limits = (soft, hard)
+            self.refuse = refuse
+
+        def getrlimit(self, which):
+            return self.limits
+
+        def setrlimit(self, which, limits):
+            if self.refuse:
+                raise ValueError("not allowed")
+            self.limits = limits
+
+    def test_the_soft_limit_is_raised_when_allowed(self):
+        r = self.Resource(256, 10240)
+        self.assertEqual(app.socket_budget(r), 1024 - 48)
+        self.assertEqual(r.limits, (1024, 10240))
+
+    def test_a_refused_raise_keeps_the_current_limit(self):
+        self.assertEqual(app.socket_budget(self.Resource(256, 10240, refuse=True)), 208)
+        self.assertEqual(app.socket_budget(self.Resource(256, 256)), 208)
+
+    def test_odd_answers_fall_back(self):
+        class Broken:
+            RLIMIT_NOFILE = 8
+
+            def getrlimit(self, which):
+                raise OSError("no")
+
+        self.assertEqual(app.socket_budget(Broken()), 200)
+        self.assertEqual(app.socket_budget(self.Resource(-1, -1)), 1024 - 48)
+        self.assertGreaterEqual(app.socket_budget(self.Resource(20, 20)), 8)
+
+
 class PortTests(unittest.TestCase):
     def test_every_cloudflare_port_is_tried_and_the_faster_one_advised(self):
         seen = []
@@ -1594,11 +1632,59 @@ class ScanJobTests(unittest.TestCase):
         data = app.normalise_data(old)
         s = data["settings"]
         self.assertEqual((s["verify_attempts"], s["workers"], s["max_ping_ms"], s["good_ping_ms"]),
-                         (20, 64, 1000, 500))  # old defaults move on; a chosen value stays
+                         (20, 128, 1000, 500))  # old defaults move on; a chosen value stays
+        self.assertEqual(app.normalise_data({"version": 6, "settings": {"workers": 64}})
+                         ["settings"]["workers"], 128)
+        self.assertEqual(app.normalise_data({"version": 6, "settings": {"workers": 90}})
+                         ["settings"]["workers"], 90)
         cell = data["matrix"]["s1"]["1.0.0.1"]["mci"]
         self.assertEqual((cell["ok"], cell["delay"]), (True, None))  # a new-connection number
         self.assertNotIn("ping", {k: v for k, v in cell.items() if v is not None})
         self.assertEqual(app.normalise_data(data)["matrix"], data["matrix"])  # stable
+
+    def test_threads_stay_within_the_socket_budget(self):
+        store = make_store(self.tmp, workers=256, full_range=False, stop_after=0)
+        self.patch_budget(20)
+        lock = threading.Lock()
+        live = {"now": 0, "most": 0}
+
+        def probe(ip, target, ctx, timeout, count=1):
+            with lock:
+                live["now"] += 1
+                live["most"] = max(live["most"], live["now"])
+            time.sleep(0.01)
+            with lock:
+                live["now"] -= 1
+            return scripted_probe({})(ip, target, ctx, timeout, count)
+
+        cands = ["1.0.%d.%d" % (i // 200, i % 200 + 1) for i in range(300)]
+        self.job(store, "mci", {}, candidates=cands, probe=probe).run()
+        self.assertLessEqual(live["most"], 20)
+        self.assertGreater(live["most"], 10)  # and it does use them
+
+    def patch_budget(self, n):
+        old = app.socket_budget
+        app.socket_budget = lambda resource_module=None: n
+        self.addCleanup(setattr, app, "socket_budget", old)
+
+    def test_the_shortlist_comes_from_a_calm_second_look(self):
+        store = make_store(self.tmp, verify_top=1, full_range=False, stop_after=0)
+        busy = {"n": 0}
+
+        def probe(ip, target, ctx, timeout, count=1):
+            """In the busy sweep .1 looks fastest; measured calmly, .2 is."""
+            busy["n"] += 1
+            first_look = busy["n"] <= 2
+            ms = {"1.0.0.1": 100.0 if first_look else 400.0,
+                  "1.0.0.2": 300.0 if first_look else 150.0}[ip]
+            return {"ip": ip, "ok": True, "tcp": 30.0, "samples": [ms] * count, "sent": count,
+                    "received": count, "total": ms, "colo": "FRA", "loc": "IR", "error": ""}
+
+        store.update_settings({"workers": 1})
+        job = self.job(store, "mci", {}, candidates=["1.0.0.1", "1.0.0.2"], probe=probe)
+        job.RERANK_WORKERS = 1
+        result = job.run()
+        self.assertEqual([m["ip"] for m in result["verified"]], ["1.0.0.2"])
 
     def test_the_sweep_covers_each_24_once(self):
         cands = app.sweep_candidates(app.CF_RANGES_V4, random.Random(2),

@@ -70,7 +70,7 @@ except ImportError:
         return fn
 
 APP_NAME = "CF Scanner"
-APP_VERSION = "5.4"
+APP_VERSION = "5.5"
 
 try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -111,7 +111,7 @@ DEFAULT_SETTINGS = {
     "fresh_hours": 48,      # how long a result counts for the other network of a group
     "full_range": True,     # fast pass: one address from every /24 of every range (IPv4)
     "candidates": 500,      # without full_range: this many addresses
-    "workers": 64,
+    "workers": 128,         # fast pass threads (capped by socket_budget())
     "timeout": 2.0,
     "reach_attempts": 4,    # fast pass: requests per address, as cfst's -t 4
     "reach_max_loss_pct": 25,  # fast pass: at most this loss (cfst -tlr 0.25)
@@ -149,7 +149,7 @@ _ALL_DEFAULTS.update(DEFAULT_SETTINGS)
 #: (minimum, maximum) for every numeric setting.
 SETTING_LIMITS = {
     "port": (1, 65535), "ttl": (60, 86400), "ips_per_record": (1, 3),
-    "fresh_hours": (1, 168), "candidates": (20, 5000), "workers": (1, 128),
+    "fresh_hours": (1, 168), "candidates": (20, 5000), "workers": (1, 256),
     "timeout": (0.5, 10.0), "stop_after": (0, 1000), "verify_top": (1, 20),
     "verify_attempts": (2, 60), "max_loss_pct": (0, 50), "max_ping_ms": (50, 5000),
     "reach_attempts": (1, 20), "reach_max_loss_pct": (0, 100), "reach_max_ms": (50, 10000),
@@ -393,9 +393,9 @@ def normalise_data(raw):
     if version < 6 and settings["verify_top"] == 6:
         settings["verify_top"] = DEFAULT_SETTINGS["verify_top"]  # the old default
     if version < 7:
-        for key, old in (("verify_attempts", 6), ("workers", 32), ("max_ping_ms", 1500),
-                         ("good_ping_ms", 700)):
-            if settings[key] == old:
+        for key, old in (("verify_attempts", (6,)), ("workers", (32, 64)),
+                         ("max_ping_ms", (1500,)), ("good_ping_ms", (700,))):
+            if settings[key] in old:
                 settings[key] = DEFAULT_SETTINGS[key]
     if version < 4 and raw_settings.get("max_ping_ms") in (800, "800"):
         settings["max_ping_ms"] = DEFAULT_SETTINGS["max_ping_ms"]  # was a TCP ping limit
@@ -1532,6 +1532,39 @@ def successive_jitter_ms(samples):
     return sum(gaps) / len(gaps)
 
 
+#: Files the app keeps open besides the probes' sockets (data, log, Pythonista).
+_RESERVED_FILES = 48
+
+
+def socket_budget(resource_module=None):
+    """How many sockets the probes may hold at once.
+
+    iOS gives an app a soft limit of about 256 open files; one probe thread
+    holds one socket. The soft limit is raised towards the hard one when
+    iOS allows it, and a margin is kept for the app's own files.
+    """
+    if resource_module is None:
+        try:
+            import resource as resource_module
+        except ImportError:
+            return 200
+    try:
+        soft, hard = resource_module.getrlimit(resource_module.RLIMIT_NOFILE)
+        want = 1024 if hard in (-1, getattr(resource_module, "RLIM_INFINITY", -1)) \
+            else min(hard, 1024)
+        if soft != -1 and soft < want:
+            try:
+                resource_module.setrlimit(resource_module.RLIMIT_NOFILE, (want, hard))
+                soft = want
+            except (ValueError, OSError):
+                pass
+        if soft == -1:
+            soft = 1024
+        return max(8, int(soft) - _RESERVED_FILES)
+    except Exception:
+        return 200
+
+
 def _safe_probe(probe, ip, target, ctx, timeout, count=1):
     """A probe that cannot raise: a bug in one probe is one failed attempt."""
     try:
@@ -2526,9 +2559,9 @@ class Events:
     def found(self, rows):
         pass
 
-    def note_scope(self, count, sweep):
-        """How many addresses the fast pass will try, and whether that is the
-        whole range."""
+    def note_scope(self, count, sweep, workers=None):
+        """How many addresses the fast pass will try (with how many threads),
+        and whether that is the whole range."""
 
     def note(self, text):
         pass
@@ -2550,7 +2583,12 @@ class ScanJob:
 
     #: Addresses measured at the same time in the careful step. More would
     #: time the phone's CPU (Python threads, TLS) instead of the network.
-    CALM_WORKERS = 3
+    CALM_WORKERS = 5
+
+    #: The best reachable addresses measured again with few threads at once,
+    #: so the shortlist does not depend on how busy the fast pass was.
+    RERANK_COUNT = 40
+    RERANK_WORKERS = 8
 
     def __init__(self, store, sid, nid, events=None, mode="auto", context_factory=make_context,
                  api_factory=CloudflareAPI, candidates=None, rng=None,
@@ -2721,7 +2759,7 @@ class ScanJob:
                                      rng=self.rng, bad_ttl_s=float(s["bad_ttl_hours"]) * 3600,
                                      exclude=current, shared=seeds)
         full = bool(s["full_range"]) and version == 4
-        self.events.note_scope(len(cands), sweep)
+        self.events.note_scope(len(cands), sweep, self._workers(len(cands), s))
         answered, scanned, failed, errors = self._fast_pass(cands, target, ctx, s,
                                                             stop_after=0 if full else None)
         if sweep and not self.cancelled and scanned == len(cands):
@@ -2761,7 +2799,8 @@ class ScanJob:
         # 3. careful measure of the shortlist, then the rules
         self.events.step(2, "run")
         verify_top = int(s["verify_top"])
-        top = sorted(answered, key=self._rank)[:verify_top]
+        answered = self._rerank(answered, target, ctx, s)
+        top = answered[:verify_top]
         seeded = [r for r in answered if r["ip"] in seeds and r not in top][:verify_top]
         colo_of = {r["ip"]: r["colo"] for r in answered}
         ms = self._measure_many([r["ip"] for r in top + seeded], target, ctx,
@@ -2855,7 +2894,7 @@ class ScanJob:
         self.events.step(1, "run")
         cands = (list(self.fixed_candidates) if self.fixed_candidates is not None
                  else multi_pool(store, session))
-        self.events.note_scope(len(cands), True)
+        self.events.note_scope(len(cands), True, self._workers(len(cands), s))
         answered, scanned, failed, errors = self._fast_pass(cands, target, ctx, s, stop_after=0)
         result["scanned"], result["answered"] = scanned, len(answered)
         result["errors"] = error_summary(errors)
@@ -2874,7 +2913,8 @@ class ScanJob:
                          % (len(answered), scanned))
 
         self.events.step(2, "run")
-        own = [r["ip"] for r in sorted(answered, key=self._rank)[:int(s["verify_top"])]]
+        answered = self._rerank(answered, target, ctx, s)
+        own = [r["ip"] for r in answered[:int(s["verify_top"])]]
         proved = [ip for ip in multi_proved(session, s) if ip not in own]
         wanted = (own + proved)[:MULTI_VERIFY_CAP]
         colo_of = {r["ip"]: r["colo"] for r in answered}
@@ -2976,6 +3016,51 @@ class ScanJob:
                                      m.get("colo", ""), ping=m.get("ping"))
 
     @staticmethod
+    def _workers(total, s):
+        return max(1, min(int(s["workers"]), socket_budget(), total or 1))
+
+    def _rerank(self, answered, target, ctx, s):
+        """The best reachable addresses again, calmly; the new order first.
+
+        With a hundred connections open at once the phone and its radio add
+        their own delay to every answer; a few at a time measure the
+        address. Addresses that no longer pass go after the rest.
+        """
+        ranked = sorted(answered, key=self._rank)
+        head, tail = ranked[:self.RERANK_COUNT], ranked[self.RERANK_COUNT:]
+        if len(head) <= 1:
+            return ranked
+        again = [None] * len(head)
+        queue = collections.deque(range(len(head)))
+        lock = threading.Lock()
+        timeout = float(s["timeout"])
+        attempts = int(s["reach_attempts"])
+
+        def worker():
+            while not self.cancelled:
+                with lock:
+                    if not queue:
+                        return
+                    i = queue.popleft()
+                again[i] = _safe_probe(self.probe_trace, head[i]["ip"], target, ctx, timeout,
+                                       attempts)
+
+        threads = [threading.Thread(target=worker, name="rerank-%d" % i, daemon=True)
+                   for i in range(min(self.RERANK_WORKERS, len(head)))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        good, dropped = [], []
+        for old, new in zip(head, again):
+            if new is not None and self._reachable(new, s):
+                new["colo"] = new.get("colo") or old.get("colo", "")
+                good.append(new)
+            else:
+                dropped.append(old)
+        return sorted(good, key=self._rank) + tail + dropped
+
+    @staticmethod
     def _rank(r):
         """Shortlist order, as cfst sorts: the loss first, then the mean round trip."""
         mean = r.get("total") if r.get("total") is not None else float("inf")
@@ -3027,7 +3112,8 @@ class ScanJob:
                     self.events.progress(done, total, found)
                     self.events.found(top)
 
-        workers = max(1, min(int(s["workers"]), total or 1))
+        workers = self._workers(total, s)
+        log("fast pass: %d addresses, %d threads" % (total, workers))
         threads = [threading.Thread(target=worker, name="scan-%d" % i, daemon=True)
                    for i in range(workers)]
         for t in threads:
@@ -4003,13 +4089,14 @@ if ui is not None:
             self.counter.text = fa(text)
 
         @on_main_thread
-        def note_scope(self, count, sweep):
+        def note_scope(self, count, sweep, workers=None):
             detail = self.step_views[1][2]
+            busy = " · %d همزمان" % workers if workers else ""
             if sweep:
-                detail.text = fa("کل رنج کلادفلر: %d IP (یکی از هر /24)؛ چند دقیقه طول می‌کشد"
-                                 % count)
+                detail.text = fa("کل رنج کلادفلر: %d IP (یکی از هر /24)%s؛ چند دقیقه طول می‌کشد"
+                                 % (count, busy))
             else:
-                detail.text = fa("%d IP" % count)
+                detail.text = fa("%d IP%s" % (count, busy))
             self.layout()
 
         @on_main_thread
@@ -5047,7 +5134,7 @@ if ui is not None:
                 text_field("verify_top", "تعداد برترها برای بررسی دقیق", s["verify_top"], "number"),
                 text_field("verify_attempts", "بررسی دقیق: دفعات هر IP (cfscan: ۲۰)",
                            s["verify_attempts"], "number"),
-                text_field("workers", "تست همزمان در اسکن سریع", s["workers"], "number"),
+                text_field("workers", "تست همزمان در اسکن سریع (۱ تا ۲۵۶)", s["workers"], "number"),
                 text_field("timeout", "مهلت هر اتصال (ثانیه)", s["timeout"], "number"),
                 text_field("candidates", "بدون اسکن کل رنج: تعداد IP", s["candidates"], "number"),
                 text_field("stop_after", "بدون اسکن کل رنج: توقف بعد از N جواب (۰=همه)",
