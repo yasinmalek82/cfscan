@@ -280,11 +280,57 @@ class ScanFlowTests(AppTestCase):
         self.assertEqual(engine.FakeAPI.records[("cdn1.germany.example.com", "A")], ["1.0.0.5"])
         self.assertTrue(view.anyway_btn.hidden)
 
+    def test_the_scan_screen_shows_each_step(self):
+        self.ready()
+        view = self.scan()
+        icons = [icon.text for icon, _, _ in view.step_views]
+        self.assertEqual(icons, ["–", "✓", "✓", "✓"])  # no record yet, scan, measure, DNS
+        details = [d.text for _, _, d in view.step_views]
+        self.assertIn("انتخاب: 1.0.0.2 (150ms)", details[2])
+        self.assertIn("cdn1.germany.example.com", details[3])
+        self.assertTrue(view.track.hidden and view.counter.hidden)  # nothing running
+        self.assertRegex(view.clock_label.text, r"^\d+:\d\d$")
+        self.assertIn("تأخیر کانفیگ", view.table_title.text)
+        self.assertFalse(view.table.hidden)
+        for i, (icon, name, detail) in enumerate(view.step_views[:-1]):
+            below = view.step_views[i + 1][1]
+            self.assertLessEqual(detail.y + detail.height, below.y)  # no overlapping text
+
+    def test_a_running_step_has_its_own_progress_bar(self):
+        self.ready()
+        view = app.ScanView(self.app, [self.store.selected["id"]], "mci", "auto")
+        view.frame = (0, 0, 390, 760)
+        view.step(1, "run")
+        view.progress(40, 200, 7)
+        self.assertFalse(view.track.hidden)
+        self.assertEqual(view.counter.text, "‏40 از 200 IP · 7 جواب داد")
+        self.assertAlmostEqual(view.fill.width, view.track.width * 0.2)
+        step_1 = view.step_views[1]
+        self.assertGreater(view.track.y, step_1[2].y)
+        self.assertLess(view.track.y, view.step_views[2][1].y)
+        view.step(1, "ok", "7 از 200 IP جواب داد")
+        self.assertTrue(view.track.hidden)
+        view.phase_state[2] = "run"
+        view.phase = 2
+        view._tick()
+        self.assertIn(view.step_views[2][0].text, app.SPINNER)
+
+    def test_stopping_marks_the_running_step(self):
+        self.ready()
+        view = app.ScanView(self.app, [self.store.selected["id"]], "mci", "auto")
+        view.frame = (0, 0, 390, 760)
+        view.step(2, "run")
+        view.finished({"kind": "stopped"})
+        self.assertEqual(view.step_views[2][0].text, "–")
+        self.assertEqual(view.step_views[2][2].text, "‏متوقف شد")
+        self.assertFalse(view.done_btn.hidden)
+
     def test_manual_approval_button(self):
         self.ready()
         self.store.update_settings({"auto_apply": False})
         view = self.scan()
         self.assertEqual(view.result["kind"], "pending")
+        self.assertEqual(view.step_views[3][0].text, "❚❚")
         self.assertFalse(view.apply_btn.hidden)
         view.tapped_apply(view.apply_btn)
         self.assertEqual(view.result["kind"], "applied")

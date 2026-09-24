@@ -263,6 +263,19 @@ class ChooseTests(unittest.TestCase):
         choice = self.choose(cells, current=["OLD", "DEAD"], count=2)
         self.assertEqual(choice["ips"], ["OLD", "NEW"])
 
+    def test_a_scan_does_not_leave_a_slow_address_behind(self):
+        cells = {"SLOW": {"mci": cell(True, 900), "mtn": cell(True, 900)},
+                 "DEAD": {"mci": cell(False)},
+                 "A": {"mci": cell(True, 100), "mtn": cell(True, 120)},
+                 "B": {"mci": cell(True, 150), "mtn": cell(True, 140)}}
+        choice = self.choose(cells, current=["SLOW", "DEAD"], count=2)
+        self.assertEqual(sorted(choice["ips"]), ["A", "B"])
+
+    def test_a_verified_address_is_not_swapped_for_an_unverified_one(self):
+        cells = {"OLD": {"mci": cell(True, 600), "mtn": cell(True, 600)},
+                 "NEW": {"mci": cell(True, 100)}}  # never tested on Irancell
+        self.assertEqual(self.choose(cells, current=["OLD"])["ips"], ["OLD"])
+
     def test_force_changes_only_for_a_clear_gain(self):
         cells = {"OLD": {"mci": cell(True, 110), "mtn": cell(True, 110)},
                  "NEW": {"mci": cell(True, 100), "mtn": cell(True, 100)}}
@@ -804,9 +817,20 @@ class RobustnessTests(unittest.TestCase):
                 self.assertTrue(set(choice["conflict"]) <= set(failed_there) & set(here))
             if choice["kind"] == "none":
                 self.assertEqual([ip for ip in here if ip not in failed_there], [])
-            if mode == "auto":
-                kept = [ip for ip in current if ip in here and ip not in failed_there]
-                self.assertEqual(choice["ips"][:len(kept)], kept[:count])
+            # a working current address leaves only for a clearly faster one
+            def worst(ip):
+                delays = [c["delay"] for n, c in cells[ip].items()
+                          if app.cell_status(c, NOW, DAY) == "ok" and c.get("delay") is not None]
+                return max(delays) if delays else float("inf")
+
+            kept = [ip for ip in current if ip in here and ip not in failed_there]
+            newcomers = [ip for ip in choice["ips"] if ip not in current]
+            dropped = [ip for ip in kept if ip not in choice["ips"]]
+            if len(kept) <= count:
+                self.assertLessEqual(len(dropped), len(newcomers))
+                for ip in dropped:
+                    self.assertTrue(any(worst(n) <= worst(ip) * 0.8 for n in newcomers),
+                                    (ip, choice, cells))
 
     def test_many_threads_write_while_saving(self):
         store = make_store(self.tmp)
@@ -959,11 +983,20 @@ def scripted_probe(table, loc="IR"):
 class RecordingEvents(app.Events):
     def __init__(self):
         self.steps = []
+        self.details = {}
         self.notes = []
+        self.progress_by_step = {}
         self.result = None
 
     def step(self, index, status, detail=""):
         self.steps.append((index, status))
+        if detail:
+            self.details[index] = detail
+
+    def progress(self, done, total, found):
+        running = [i for i, st in self.steps if st == "run"]
+        if running:
+            self.progress_by_step.setdefault(running[-1], []).append((done, total, found))
 
     def note(self, text):
         self.notes.append(text)
@@ -1137,6 +1170,24 @@ class ScanJobTests(unittest.TestCase):
         result = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")}).run()
         self.assertEqual(result["kind"], "applied")
         self.assertIn("1.0.0.2", FakeAPI.calls)
+
+    def test_every_long_step_reports_its_progress(self):
+        store = make_store(self.tmp, stop_after=2)
+        FakeAPI.records[DE] = ["1.0.0.9"]
+        table = {"1.0.0.%d" % i: (True, 100.0 + i, "") for i in range(1, 30)}
+        table["1.0.0.9"] = (False, None, "")
+        job = self.job(store, "mci", table, candidates=[ip for ip in table if ip != "1.0.0.9"])
+        job.store.update_settings({"workers": 1})
+        result = job.run()
+        self.assertEqual(result["kind"], "applied")
+        progress = job.events.progress_by_step
+        self.assertEqual(progress[0][-1], (1, 1, 0))       # the record's address, failed
+        self.assertEqual(progress[1][-1][2], 2)            # enough answers
+        done, total, good = progress[2][-1]
+        self.assertEqual((done, total), (total, total))
+        self.assertIn("کافی بود", job.events.details[1])
+        self.assertIn("ms)", job.events.details[2])
+        self.assertIn("✕", job.events.details[0])
 
     def test_cloudflare_down_keeps_the_choice_for_a_retry(self):
         store = make_store(self.tmp)

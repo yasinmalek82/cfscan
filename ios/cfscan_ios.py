@@ -1736,8 +1736,11 @@ def choose_for_record(cells, nid, group_nets, now, window_s, count, current=(),
       on another network of the group is never chosen - it would break
       those customers.
     * Inside a tier: the lower worst delay across the group wins.
-    * ``auto`` keeps current addresses that still work here and fills the
-      gaps; ``force`` changes working ones only for ``min_gain_pct`` better.
+    * Current addresses that still work are kept (fewer DNS changes) and
+      only the gaps are filled, except that a kept address gives way to a
+      new one at least ``min_gain_pct`` faster and no less verified - a scan
+      that changes the record anyway should not leave a slow address in it.
+      ``mode`` is kept for callers; both modes follow the same rule.
 
     ``hints`` (address -> network -> ok/fail) fill what this server did not
     measure: whether an address is blocked on a network does not depend on
@@ -1770,16 +1773,15 @@ def choose_for_record(cells, nid, group_nets, now, window_s, count, current=(),
     ranked = sorted(tier1, key=worst) + sorted(tier2, key=worst)
     tiers = dict([(ip, 1) for ip in tier1] + [(ip, 2) for ip in tier2])
 
-    keep = [ip for ip in current if ip in ranked]
-    if mode == "force" and keep:
-        best = ranked[:count]
-        mean = lambda ips: sum(worst(ip) for ip in ips) / float(len(ips))  # noqa: E731
-        if mean(best) <= mean(keep) * (1 - min_gain_pct / 100.0):
-            chosen = best
-        else:
-            chosen = (keep + [ip for ip in ranked if ip not in keep])[:count]
-    else:
-        chosen = (keep + [ip for ip in ranked if ip not in keep])[:count]
+    keep = [ip for ip in ranked if ip in current][:count]
+    pool = [ip for ip in ranked if ip not in keep]
+    chosen = list(keep)
+    while len(chosen) < count and pool:
+        chosen.append(pool.pop(0))
+    factor = 1 - min_gain_pct / 100.0
+    for ip in sorted(keep, key=lambda a: (tiers[a], worst(a)), reverse=True):
+        if pool and tiers[pool[0]] <= tiers[ip] and worst(pool[0]) <= worst(ip) * factor:
+            chosen[chosen.index(ip)] = pool.pop(0)
 
     if not chosen:
         conflict = sorted(blocked, key=worst)[:count]
@@ -1853,7 +1855,7 @@ def relevant_networks(store, group):
 
 # ---------------------------------------------------------------- scan engine
 
-STEP_TITLES = ("بررسی رکورد روی این اینترنت", "اسکن", "اندازه‌گیری دقیق و انتخاب",
+STEP_TITLES = ("بررسی IPهای فعلی رکورد", "اسکن سریع", "اندازه‌گیری دقیق و انتخاب",
                "به‌روزرسانی DNS")
 
 
@@ -1988,7 +1990,7 @@ class ScanJob:
             store.save()
             healthy = all(self._ok(m) for m in ms)
             self.events.step(0, "ok" if healthy else "fail",
-                             "  ".join(self._measure_text(m) for m in ms))
+                             "\n".join(self._measure_text(m) for m in ms))
         else:
             self.events.step(0, "skip", "رکورد هنوز IP ندارد")
         if self.cancelled:
@@ -2037,8 +2039,13 @@ class ScanJob:
             result["kind"] = "nothing"
             result["hint"] = self._hint(errors, version)
             return result
-        self.events.step(1, "ok" if answered else "fail",
-                         "%d از %d پاسخ داد" % (len(answered), scanned))
+        if not answered:
+            text = "هیچ‌کدام از %d IP جواب نداد؛ فقط IPهای فعلی بررسی می‌شوند" % scanned
+        elif scanned < len(cands):
+            text = "%d IP جواب داد (از %d تست‌شده) — کافی بود" % (len(answered), scanned)
+        else:
+            text = "%d از %d IP جواب داد" % (len(answered), scanned)
+        self.events.step(1, "ok" if answered else "fail", text)
 
         # 3. careful measure of the shortlist, then the rules
         self.events.step(2, "run")
@@ -2079,7 +2086,12 @@ class ScanJob:
                              % ("، ".join(others), ", ".join(choice["conflict"])))
             result["kind"] = "conflict"
             return result
-        detail = ", ".join(choice["ips"])
+        delays = {m["ip"]: m.get("delay") for m in ms}
+        delays.update({ip: (mine.get(ip) or {}).get(self.nid, {}).get("delay")
+                       for ip in choice["ips"] if delays.get(ip) is None})
+        detail = "انتخاب: " + "، ".join(
+            "%s (%.0fms)" % (ip, delays[ip]) if delays.get(ip) is not None else ip
+            for ip in choice["ips"])
         if choice["unverified"]:
             detail += "\n⚠ روی %s هنوز تأیید نشده" % "، ".join(names[n] for n in choice["unverified"])
         self.events.step(2, "ok", detail)
@@ -2095,7 +2107,7 @@ class ScanJob:
             self.events.step(3, "skip", "توکن کلادفلر تنظیم نشده")
             result["kind"] = "found"
         elif not s["auto_apply"]:
-            self.events.step(3, "wait", "منتظر تأیید شما")
+            self.events.step(3, "hold", "منتظر تأیید شما: «اعمال روی DNS» را بزنید")
             result["kind"] = "pending"
         else:
             self.apply(result)
@@ -2185,20 +2197,18 @@ class ScanJob:
                     counters["done"] += 1
                     if r["ok"] and (not colos or r["colo"] in colos):
                         answered.append(r)
-                        top = sorted(answered, key=lambda x: x["tcp"])[:8]
                     else:
-                        top = None
                         if not r["ok"]:
                             failed.append(ip)
                             errors.append(r["error"])
                     done, found = counters["done"], len(answered)
                     now = time.time()
-                    emit = top is not None or done == total or now - counters["last_emit"] > 0.15
+                    emit = now - counters["last_emit"] > 0.25
                     if emit:
                         counters["last_emit"] = now
+                        top = sorted(answered, key=lambda x: x["tcp"])[:8]
                 if emit:
                     self.events.progress(done, total, found)
-                if top is not None:
                     self.events.found(top)
 
         workers = max(1, min(int(s["workers"]), total or 1))
@@ -2209,18 +2219,33 @@ class ScanJob:
         for t in threads:
             t.join()
         self.events.progress(counters["done"], total, len(answered))
+        self.events.found(sorted(answered, key=lambda x: x["tcp"])[:8])
         return answered, counters["done"], failed, errors
 
     def _measure_many(self, ips, target, ctx, attempts, use_ws):
+        """Each address measured carefully; the screen sees every one finish."""
         out = [None] * len(ips)
         timeout = float(self.store.settings["timeout"]) + 2.0
         gate = threading.Semaphore(self.CALM_WORKERS)
+        lock = threading.Lock()
+        total = len(ips)
+        if total:
+            self.events.progress(0, total, 0)
 
         def one(i, ip):
             with gate:
-                out[i] = measure(ip, target, ctx, attempts, timeout, use_ws,
-                                 cancel=self.cancel_event, probe_trace=self.probe_trace,
-                                 probe_ws=self.probe_ws, warmup=True)
+                if self.cancelled:
+                    return
+                m = measure(ip, target, ctx, attempts, timeout, use_ws,
+                            cancel=self.cancel_event, probe_trace=self.probe_trace,
+                            probe_ws=self.probe_ws, warmup=True)
+            with lock:
+                out[i] = m
+                done = [x for x in out if x is not None]
+                good = sum(1 for x in done if self._ok(x))
+                rows = sorted(done, key=score)
+            self.events.progress(len(done), total, good)
+            self.events.found(rows)
 
         threads = [threading.Thread(target=one, args=(i, ip), name="verify-%d" % i, daemon=True)
                    for i, ip in enumerate(ips)]
@@ -2233,8 +2258,9 @@ class ScanJob:
     @staticmethod
     def _measure_text(m):
         if m.get("delay") is None:
-            return "%s: پاسخ نداد (%s)" % (m["ip"], error_summary(m.get("errors") or [], 1))
-        return "%s %.0fms loss %.0f%%" % (m["ip"], m["delay"], m["loss"])
+            return "%s ✕ پاسخ نداد (%s)" % (m["ip"], error_summary(m.get("errors") or [], 1))
+        text = "%s ✓ %.0fms" % (m["ip"], m["delay"])
+        return text + (" · افت %.0f%%" % m["loss"] if m.get("loss") else "")
 
     @staticmethod
     def _stopped(result):
@@ -2361,7 +2387,8 @@ def apply_theme(name):
                          "wait": (NEUTRAL, NEUTRAL_BG), "warn": (WARN, WARN_BG)})
     STEP_ICONS.clear()
     STEP_ICONS.update({"wait": ("○", MUTED), "run": ("●", ACCENT), "ok": ("✓", GOOD),
-                       "fail": ("✕", BAD), "skip": ("–", MUTED)})
+                       "fail": ("✕", BAD), "skip": ("–", MUTED),
+                       "hold": ("❚❚", WARN)})
 
 
 apply_theme("light")
@@ -2739,8 +2766,33 @@ if ui is not None:
 
     # ------------------------------------------------------------------ scan screen
 
+    SPINNER = ("◐", "◓", "◑", "◒")
+
+    #: What each step does, shown under it while it runs.
+    STEP_HINTS = ("IPهای فعلی رکورد چند بار روی همین اینترنت تست می‌شوند",
+                  "کدام IPها روی این اینترنت جواب می‌دهند",
+                  "بهترین جواب‌ها چند بار با همین سرور اندازه‌گیری می‌شوند",
+                  "ثبت IPها در کلادفلر")
+
+    def text_height(text, width, size):
+        """Height for ``text`` wrapped in ``width`` points at font ``size``."""
+        if not text:
+            return 0
+        per_line = max(8, int(width / (size * 0.56)))
+        lines = sum(max(1, -(-len(line) // per_line)) for line in text.split("\n"))
+        return int(lines * size * 1.35) + 4
+
+    def clock(seconds):
+        seconds = int(max(0, seconds))
+        return "%d:%02d" % (seconds // 60, seconds % 60)
+
     class ScanView(ui.View):
-        """Runs one job per server on one network; implements :class:`Events`."""
+        """Runs one job per server on one network; implements :class:`Events`.
+
+        Every step shows its state, what it is doing and, while it runs, its
+        own progress bar and counter; a clock and a spinner keep moving so a
+        slow network never looks like a frozen screen.
+        """
 
         def __init__(self, app, sids, nid, mode):
             self.app = app
@@ -2752,6 +2804,10 @@ if ui is not None:
             self.rows = []
             self.result = None
             self.job = None
+            self.phase = -1
+            self.phase_state = {}
+            self.tick_count = 0
+            self.alive = False
             self.started = time.time()
             store = app.store
             self.name = store.network(nid)["name"]
@@ -2760,9 +2816,11 @@ if ui is not None:
             self.scroll = ui.ScrollView()
             self.add_subview(self.scroll)
             self.batch_label = make_label("", 13, bold=True, color=ACCENT)
-            self.server_label = make_label("", 16, bold=True)
+            self.server_label = make_label("", 17, bold=True)
             self.record_label = make_label("", 12, color=MUTED, mono=True)
-            for v in (self.batch_label, self.server_label, self.record_label):
+            self.clock_label = make_label("0:00", 15, bold=True, color=ACCENT, align="left",
+                                          mono=True)
+            for v in (self.batch_label, self.server_label, self.record_label, self.clock_label):
                 self.scroll.add_subview(v)
             self.step_card = make_card()
             self.scroll.add_subview(self.step_card)
@@ -2770,30 +2828,31 @@ if ui is not None:
             for title in STEP_TITLES:
                 icon = make_label("○", 18, bold=True, color=MUTED, align="center")
                 name = make_label(title, 15, bold=True, color=MUTED)
-                detail = make_label("", 12, color=MUTED, lines=2)
+                detail = make_label("", 12, color=MUTED, lines=0)
                 for v in (icon, name, detail):
                     self.step_card.add_subview(v)
                 self.step_views.append((icon, name, detail))
             self.track = ui.View()
             self.track.background_color = TRACK
-            self.track.corner_radius = 4
+            self.track.corner_radius = 3
             self.fill = ui.View()
             self.fill.background_color = ACCENT
-            self.fill.corner_radius = 4
+            self.fill.corner_radius = 3
             self.track.add_subview(self.fill)
-            self.counter = make_label("", 12, color=MUTED)
+            self.counter = make_label("", 12, bold=True, color=ACCENT)
             self.step_card.add_subview(self.track)
             self.step_card.add_subview(self.counter)
+            self.track.hidden = self.counter.hidden = True
             self.fraction = 0.0
 
-            self.outcome = make_label("", 15, bold=True, lines=4, align="center")
+            self.outcome = make_label("", 15, bold=True, lines=0, align="center")
             self.outcome.corner_radius = 14
             self.outcome.hidden = True
-            self.notes = make_label("", 13, color=WARN, lines=5)
+            self.notes = make_label("", 13, color=WARN, lines=0)
             self.notes.background_color = WARN_BG
             self.notes.corner_radius = 12
             self.notes.hidden = True
-            self.table_title = make_label("جواب‌داده‌ها", 14, bold=True)
+            self.table_title = make_label("", 14, bold=True)
             self.table = ui.TableView()
             self.table.corner_radius = 16
             self.table.border_width = 1
@@ -2826,7 +2885,28 @@ if ui is not None:
 
         def start(self):
             console.set_idle_timer_disabled(True)
+            self.alive = True
+            threading.Thread(target=self._ticker, name="clock", daemon=True).start()
             self._begin(0)
+
+        def _ticker(self):
+            while self.alive:
+                time.sleep(0.5)
+                if self.alive:
+                    self._tick()
+
+        @on_main_thread
+        def _tick(self):
+            self.tick_count += 1
+            self.clock_label.text = clock(time.time() - self.started)
+            if 0 <= self.phase < len(self.step_views) and self.phase_state.get(self.phase) == "run":
+                icon = self.step_views[self.phase][0]
+                icon.text = SPINNER[self.tick_count % len(SPINNER)]
+
+        def _target_label(self):
+            store = self.app.store
+            sid = self.sids[self.index]
+            return TEST_LABEL[store.target(store.server(sid)).kind]
 
         @on_main_thread
         def _begin(self, index):
@@ -2835,7 +2915,8 @@ if ui is not None:
             store = self.app.store
             server = store.server(sid)
             group = store.network(self.nid)["group"]
-            self.server_label.text = fa("%s · %s" % (server["name"], GROUP_NAMES[group]))
+            self.server_label.text = fa("%s · %s · روی %s" % (server["name"], GROUP_NAMES[group],
+                                                              self.name))
             self.record_label.text = server.get("record_" + group) or server["sni"]
             self.batch_label.text = fa("سرور %d از %d" % (index + 1, len(self.sids))) \
                 if self.batch else ""
@@ -2843,11 +2924,14 @@ if ui is not None:
                 icon.text, icon.text_color = STEP_ICONS["wait"]
                 name.text_color = MUTED
                 detail.text = ""
+            self.phase = -1
+            self.phase_state = {}
             self.fraction = 0.0
             self.counter.text = ""
+            self.track.hidden = self.counter.hidden = True
             self.rows = []
             self.ds.items = []
-            self.table_title.text = fa("جواب‌داده‌ها")
+            self.table_title.text = ""
             self.job = ScanJob(store, sid, self.nid, events=self, mode=self.mode)
             self.layout()
             threading.Thread(target=self.job.run, name="job", daemon=True).start()
@@ -2858,36 +2942,47 @@ if ui is not None:
             inner = w - 2 * pad
             bottom = 76
             self.scroll.frame = (0, 0, w, h - bottom)
-            y = 8
+            y = 10
             if self.batch:
                 self.batch_label.frame = (pad, y, inner, 20)
                 y += 22
-            self.server_label.frame = (pad, y, inner, 22)
-            self.record_label.frame = (pad, y + 22, inner, 18)
-            y += 48
+            self.clock_label.frame = (pad, y, 64, 22)
+            self.server_label.frame = (pad + 68, y, max(0, inner - 68), 22)
+            self.record_label.frame = (pad, y + 24, inner, 18)
+            y += 50
+            text_w = max(40, inner - 64)
             row_y = 14
-            for icon, name, detail in self.step_views:
+            for i, (icon, name, detail) in enumerate(self.step_views):
                 icon.frame = (inner - 40, row_y, 28, 24)
-                name.frame = (12, row_y, inner - 56, 24)
-                detail.frame = (12, row_y + 24, inner - 56, 34)
-                row_y += 62
-            self.track.frame = (12, row_y + 2, inner - 24, 8)
-            self.fill.frame = (0, 0, (inner - 24) * self.fraction, 8)
-            self.counter.frame = (12, row_y + 14, inner - 24, 18)
-            card_h = row_y + 40
+                name.frame = (12, row_y, text_w, 24)
+                dh = text_height(detail.text, text_w, 12)
+                detail.frame = (12, row_y + 24, text_w, dh)
+                row_y += 24 + dh + 12
+                if i == self.phase and not self.track.hidden:
+                    self.track.frame = (12, row_y - 4, text_w, 6)
+                    self.fill.frame = (0, 0, text_w * self.fraction, 6)
+                    self.counter.frame = (12, row_y + 6, text_w, 18)
+                    row_y += 30
+            card_h = row_y + 4
             self.step_card.frame = (pad, y, inner, card_h)
             y += card_h + 12
             if not self.outcome.hidden:
-                self.outcome.frame = (pad, y, inner, 92)
-                y += 104
+                oh = text_height(self.outcome.text, inner - 24, 15) + 24
+                self.outcome.frame = (pad, y, inner, oh)
+                y += oh + 12
             if not self.notes.hidden:
-                self.notes.frame = (pad, y, inner, 84)
-                y += 96
-            self.table_title.frame = (pad, y, inner, 22)
-            y += 28
-            table_h = max(3, len(self.ds.items)) * self.table.row_height
-            self.table.frame = (pad, y, inner, table_h)
-            y += table_h + 20
+                nh = text_height(self.notes.text, inner - 24, 13) + 20
+                self.notes.frame = (pad, y, inner, nh)
+                y += nh + 12
+            self.table_title.hidden = not self.table_title.text
+            if self.table_title.text:
+                self.table_title.frame = (pad, y, inner, 22)
+                y += 28
+            self.table.hidden = not self.ds.items
+            if self.ds.items:
+                table_h = len(self.ds.items) * self.table.row_height
+                self.table.frame = (pad, y, inner, table_h)
+                y += table_h + 20
             self.scroll.content_size = (w, y)
             by = h - bottom + 12
             if self.stop_btn.hidden:
@@ -2910,20 +3005,39 @@ if ui is not None:
             symbol, color = STEP_ICONS.get(status, STEP_ICONS["wait"])
             icon.text = symbol
             icon.text_color = color
-            name.text_color = INK if status in ("run", "ok", "fail") else MUTED
-            if detail:
-                det.text = fa(detail)
-                det.text_color = BAD if status == "fail" else MUTED
-            if index == 2 and status == "run" and self.job is not None:
-                label = TEST_LABEL[self.app.store.target(self.app.store.server(self.job.sid)).kind]
-                self.table_title.text = fa("%s · نوسان · افت · دیتاسنتر" % label)
+            name.text_color = INK if status in ("run", "ok", "fail", "hold") else MUTED
+            self.phase_state[index] = status
+            if status == "run":
+                self.phase = index
+                self.fraction = 0.0
+                self.counter.text = ""
+                self.track.hidden = self.counter.hidden = index == 3
+                det.text = fa(detail or STEP_HINTS[index])
+                det.text_color = MUTED
+                if index in (1, 2):
+                    self.rows = []
+                    self.ds.items = []
+                self.table_title.text = fa({
+                    0: "IPهای فعلی رکورد · %s" % self._target_label(),
+                    1: "سریع‌ترین جواب‌ها (فقط دسترسی، هنوز تأخیر نه)",
+                    2: "%s · نوسان · افت · دیتاسنتر" % self._target_label(),
+                }.get(index, self.table_title.text))
+            else:
+                if index == self.phase:
+                    self.track.hidden = self.counter.hidden = True
+                det.text = fa(detail) if detail else ("" if status != "skip" else fa("لازم نشد"))
+                det.text_color = {"fail": BAD, "hold": WARN}.get(status, MUTED)
+            self.layout()
 
         @on_main_thread
         def progress(self, done, total, found):
-            self.fraction = (done / float(total)) if total else 0.0
+            self.fraction = min(1.0, (done / float(total)) if total else 0.0)
             self.fill.width = self.track.width * self.fraction
-            self.counter.text = fa("%d / %d · %d پاسخ · %d ثانیه" % (
-                done, total, found, time.time() - self.started))
+            if self.phase == 1:
+                text = "%d از %d IP · %d جواب داد" % (done, total, found)
+            else:
+                text = "%d از %d IP · %d سالم" % (done, total, found)
+            self.counter.text = fa(text)
 
         @on_main_thread
         def found(self, rows):
@@ -2947,6 +3061,16 @@ if ui is not None:
             kind = result.get("kind")
             if result.get("hint") or (kind in ("error", "apply_failed") and result.get("message")):
                 self.note(result.get("hint") or result["message"])
+            if kind == "stopped":
+                for i, (icon, name, detail) in enumerate(self.step_views):
+                    if self.phase_state.get(i) == "run":
+                        icon.text, icon.text_color = STEP_ICONS["skip"]
+                        detail.text = fa("متوقف شد")
+            if kind == "error":
+                for i, (icon, name, detail) in enumerate(self.step_views):
+                    if self.phase_state.get(i) == "run":
+                        icon.text, icon.text_color = STEP_ICONS["fail"]
+                self.track.hidden = self.counter.hidden = True
             if self.batch:
                 self.summary.append((self.sids[self.index], result))
                 if self.index + 1 < len(self.sids) and kind != "stopped":
@@ -2955,10 +3079,13 @@ if ui is not None:
             self._done()
 
         def _done(self):
+            self.alive = False
             console.set_idle_timer_disabled(False)
             store = self.app.store
             self.stop_btn.hidden = True
             self.done_btn.hidden = False
+            self.track.hidden = self.counter.hidden = True
+            self.clock_label.text = clock(time.time() - self.started)
             if self.batch:
                 lines, good = [], 0
                 for sid, r in self.summary:
@@ -2978,7 +3105,7 @@ if ui is not None:
                 self.apply_btn.hidden = kind not in ("pending", "apply_failed")
                 self.anyway_btn.hidden = kind != "conflict" or not r.get("record")
                 self._show_outcome(result_line(r, store), kind in GOOD_KINDS)
-            console.hud_alert("تمام شد · %.0f ثانیه" % (time.time() - self.started), "success", 1.2)
+            console.hud_alert("تمام شد · %s" % clock(time.time() - self.started), "success", 1.2)
             self.layout()
             self.app.main.refresh()
 
