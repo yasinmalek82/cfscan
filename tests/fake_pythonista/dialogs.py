@@ -5,6 +5,9 @@ A list answer may be the item text or an int index; None cancels.
 
 LOG = []
 ANSWERS = []
+#: True for random (monkey) testing: any answer is turned into one a person
+#: could give (an index wraps around, a wrong type cancels) instead of failing.
+LENIENT = False
 
 
 def list_dialog(title="", items=None, multiple=False):
@@ -12,6 +15,11 @@ def list_dialog(title="", items=None, multiple=False):
     if not ANSWERS:
         return None
     answer = ANSWERS.pop(0)
+    items = list(items or [])
+    if LENIENT:
+        if isinstance(answer, int) and not isinstance(answer, bool) and items:
+            return items[answer % len(items)]
+        return answer if answer in items else None
     if isinstance(answer, int) and not isinstance(answer, bool):
         return list(items)[answer]
     if answer is not None and answer not in (items or []):

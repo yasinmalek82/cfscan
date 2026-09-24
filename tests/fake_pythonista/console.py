@@ -18,13 +18,25 @@ def _answer(default):
 
 
 def alert(title, message="", *buttons, **kwargs):
+    """Like Pythonista: the pressed button (1..n); cancel raises KeyboardInterrupt."""
     LOG.append(("alert", title, message))
-    return _answer(1)
+    value = _answer(1)
+    if not isinstance(value, int) or isinstance(value, bool):
+        value = 1
+    if value <= 0:
+        if kwargs.get("hide_cancel_button"):
+            return 1
+        raise KeyboardInterrupt
+    return min(value, max(1, len(buttons)))
 
 
 def input_alert(title, message="", input="", ok_button_title="OK", hide_cancel_button=False):
+    """Like Pythonista: always text; cancel (None) raises KeyboardInterrupt."""
     LOG.append(("input", title, message))
-    return _answer(input)
+    value = _answer(input)
+    if value is None:
+        raise KeyboardInterrupt
+    return str(value)
 
 
 def hud_alert(message, icon="success", duration=1.8):

@@ -563,6 +563,7 @@ class _TLSServer:
         self.connections = 0
         self.answers = 0
         self.drop_after = None
+        self.tunnel_drop_after = None
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
@@ -647,7 +648,7 @@ class _TLSServer:
         addons = payload[17]
         rest = payload[18 + addons:]
         cmd, port = rest[0], int.from_bytes(rest[1:3], "big")
-        atyp, alen = rest[3], rest[4]
+        alen = rest[4]  # rest[3] is the address type
         host = rest[5:5 + alen].decode()
         request = rest[5 + alen:]
         self.tunnel_requests.append((bool(masked), version, str(uuid_mod.UUID(bytes=user)),
@@ -657,7 +658,10 @@ class _TLSServer:
         first = b"\x00\x00HTTP/1.1 2"
         second = b"04 No Content\r\n\r\n"
         tls.sendall(bytes([0x82, len(first)]) + first + bytes([0x80, len(second)]) + second)
+        answered = 1
         while True:  # later requests on the same tunnel
+            if self.tunnel_drop_after is not None and answered >= self.tunnel_drop_after:
+                return
             try:
                 masked, request = self._frame(tls, state)
             except OSError:
@@ -665,6 +669,7 @@ class _TLSServer:
             self.tunnel_requests.append((bool(masked), None, None, None, None, None, request))
             answer = b"HTTP/1.1 204 No Content\r\n\r\n"
             tls.sendall(bytes([0x82, len(answer)]) + answer)
+            answered += 1
 
     def close(self):
         self.sock.close()
@@ -739,15 +744,23 @@ class ProbeSocketTests(unittest.TestCase):
         self.assertEqual(self.server.connections - before, 1)
         self.assertAlmostEqual(r["total"], sum(r["samples"]) / 5)
 
-    def test_a_dropped_connection_is_opened_again_once(self):
+    def test_a_server_closing_after_answers_is_not_loss(self):
         target = app.Target("cdn.example.test", "/ws", self.server.port, True)
         self.server.drop_after = 2
         self.addCleanup(setattr, self.server, "drop_after", None)
         before = self.server.connections
         r = app.http_ping("127.0.0.1", target, self.client_ctx(), 3, 6)
-        self.assertEqual(self.server.connections - before, 2)
-        self.assertEqual((r["sent"], r["received"]), (6, 4))  # 2 + 2 answered, then given up
-        self.assertEqual(r["error"], "reset")  # why the rest were lost
+        self.assertEqual(self.server.connections - before, 3)  # 2 + 2 + 2
+        self.assertEqual((r["sent"], r["received"], r["error"]), (6, 6, ""))
+
+    def test_a_tunnel_ending_after_answers_is_not_loss(self):
+        target = app.Target("cdn.example.test", "/ws", self.server.port, True, uuid=VLESS_UUID)
+        self.server.tunnel_drop_after = 2
+        self.addCleanup(setattr, self.server, "tunnel_drop_after", None)
+        r = app.tunnel_ping("127.0.0.1", target, self.client_ctx(), 3, 5)
+        self.assertEqual((r["sent"], r["received"]), (2, 2))  # the other 3 were never asked
+        m = app.measure("127.0.0.1", target, self.client_ctx(), 10, 3, True, pause=0)
+        self.assertEqual((m["ok"], m["attempts"], m["loss"]), (10, 10, 0.0))  # still 10/10
 
     def test_tunnel_ping_times_requests_through_one_tunnel(self):
         target = app.Target("cdn.example.test", "/ws", self.server.port, True, uuid=VLESS_UUID)
@@ -964,6 +977,10 @@ class MultiCarrierTests(unittest.TestCase):
         self.assertGreater(len(pool), 5900)
         b = store.start_multi("s1", ["mci", "mtn"], seed=43)
         self.assertNotEqual(app.multi_pool(store, b), pool)
+        store.update_settings({"ip_version": 6, "candidates": 300})
+        v6 = app.multi_pool(store, a)
+        self.assertEqual((len(v6), app.multi_pool(store, a)), (300, v6))
+        self.assertTrue(all(":" in ip for ip in v6))
 
     def test_a_later_round_checks_what_earlier_rounds_proved(self):
         store = make_store(self.tmp, verify_top=1)
@@ -1632,11 +1649,14 @@ class ScanJobTests(unittest.TestCase):
         data = app.normalise_data(old)
         s = data["settings"]
         self.assertEqual((s["verify_attempts"], s["workers"], s["max_ping_ms"], s["good_ping_ms"]),
-                         (20, 128, 1000, 500))  # old defaults move on; a chosen value stays
+                         (20, 200, 1000, 500))  # old defaults move on; a chosen value stays
         self.assertEqual(app.normalise_data({"version": 6, "settings": {"workers": 64}})
-                         ["settings"]["workers"], 128)
+                         ["settings"]["workers"], 200)
         self.assertEqual(app.normalise_data({"version": 6, "settings": {"workers": 90}})
                          ["settings"]["workers"], 90)
+        v7 = {"version": 7, "settings": {"workers": 128, "max_ping_ms": 1500}}
+        self.assertEqual((app.normalise_data(v7)["settings"]["workers"],
+                          app.normalise_data(v7)["settings"]["max_ping_ms"]), (200, 1500))
         cell = data["matrix"]["s1"]["1.0.0.1"]["mci"]
         self.assertEqual((cell["ok"], cell["delay"]), (True, None))  # a new-connection number
         self.assertNotIn("ping", {k: v for k, v in cell.items() if v is not None})

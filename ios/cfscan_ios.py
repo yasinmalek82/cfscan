@@ -70,7 +70,7 @@ except ImportError:
         return fn
 
 APP_NAME = "CF Scanner"
-APP_VERSION = "5.5"
+APP_VERSION = "5.6"
 
 try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -111,7 +111,7 @@ DEFAULT_SETTINGS = {
     "fresh_hours": 48,      # how long a result counts for the other network of a group
     "full_range": True,     # fast pass: one address from every /24 of every range (IPv4)
     "candidates": 500,      # without full_range: this many addresses
-    "workers": 128,         # fast pass threads (capped by socket_budget())
+    "workers": 200,         # fast pass threads (capped by socket_budget())
     "timeout": 2.0,
     "reach_attempts": 4,    # fast pass: requests per address, as cfst's -t 4
     "reach_max_loss_pct": 25,  # fast pass: at most this loss (cfst -tlr 0.25)
@@ -392,8 +392,10 @@ def normalise_data(raw):
                 pass
     if version < 6 and settings["verify_top"] == 6:
         settings["verify_top"] = DEFAULT_SETTINGS["verify_top"]  # the old default
+    if version == 7 and raw_settings.get("workers") in (128, "128"):
+        settings["workers"] = DEFAULT_SETTINGS["workers"]  # 5.5's default, before 200
     if version < 7:
-        for key, old in (("verify_attempts", (6,)), ("workers", (32, 64)),
+        for key, old in (("verify_attempts", (6,)), ("workers", (32, 64, 128)),
                          ("max_ping_ms", (1500,)), ("good_ping_ms", (700,))):
             if settings[key] in old:
                 settings[key] = DEFAULT_SETTINGS[key]
@@ -852,7 +854,8 @@ class Store:
                 self.data["matrix"][sid] = dict(newest[:MATRIX_LIMIT])
 
     def bad_for(self, nid):
-        return self.data["bad"].setdefault(nid, {})
+        with self.lock:  # may add a key while another thread saves
+            return self.data["bad"].setdefault(nid, {})
 
     def remember_bad(self, nid, ips):
         with self.lock:
@@ -1211,7 +1214,7 @@ class _WSReader:
         while len(self.buf) < n:
             chunk = self.sock.recv(4096)
             if not chunk:
-                raise ConnectionResetError("closed")
+                raise _Closed("closed")
             self.buf += chunk
         out, self.buf = self.buf[:n], self.buf[n:]
         return out
@@ -1316,6 +1319,10 @@ def ws_probe(ip, target, ctx, timeout):
 # connection per sample costs ~4 round trips more every time.
 
 
+class _Closed(ConnectionResetError):
+    """The other side closed the connection (an end, not necessarily a loss)."""
+
+
 class _Stream:
     """Bytes arriving from ``recv()``, with what was read ahead kept."""
 
@@ -1326,7 +1333,7 @@ class _Stream:
     def _more(self):
         chunk = self.recv()
         if not chunk:
-            raise ConnectionResetError("closed")
+            raise _Closed("closed")
         self.buf += chunk
 
     def until(self, marker, limit=65536):
@@ -1403,11 +1410,9 @@ def http_ping(ip, target, ctx, timeout, count=4):
     """
     r = _ping_result(ip, count)
     request = _keepalive_request("/cdn-cgi/trace", target.host)
-    asked = 0
-    for _ in range(2):
-        if asked >= count:
-            break
-        sock = None
+    asked, retries = 0, 1
+    while asked < count:
+        sock, here, broken = None, 0, False
         try:
             sock, start, tcp = _connect(ip, target, ctx, timeout)
             if r["tcp"] is None:
@@ -1420,19 +1425,24 @@ def http_ping(ip, target, ctx, timeout, count=4):
                 status, body, reusable = read_response(stream)
                 took = _since(sent_at)
                 info = parse_trace(body) if status == 200 else {}
+                r["status"] = status
                 if info.get("colo"):
+                    here += 1
                     r["received"] += 1
                     r["samples"].append(took)
                     r["colo"], r["loc"] = info["colo"], info.get("loc", "")
                     r["client"] = info.get("ip", "")
-                    r["status"] = status
                 else:
-                    r["status"] = status
                     r["error"] = "HTTP %s" % status if status else "empty answer"
                 if not reusable:
-                    break
+                    break  # answered, and done with this connection: a new one
+        except _Closed as exc:
+            if here:
+                asked -= 1  # closed after answering: ask again on a new connection
+            else:
+                r["error"], broken = describe_error(exc), True
         except Exception as exc:
-            r["error"] = describe_error(exc)
+            r["error"], broken = describe_error(exc), True
             if r["tcp"] is None:
                 break  # it did not even connect: no second try
         finally:
@@ -1441,6 +1451,10 @@ def http_ping(ip, target, ctx, timeout, count=4):
                     sock.close()
                 except OSError:
                     pass
+        if broken:
+            if retries <= 0:
+                break
+            retries -= 1
     return _finish_ping(r)
 
 
@@ -1495,14 +1509,15 @@ def tunnel_ping(ip, target, ctx, timeout, count=5):
 
         stream = _Stream(recv)
         request = _keepalive_request(DELAY_TEST_PATH, DELAY_TEST_HOST)
-        for i in range(int(count)):
+        asking = 0
+        for asking in range(int(count)):
             sent_at = time.perf_counter()
-            payload = vless_request(target.uuid, DELAY_TEST_HOST, 80, request) if i == 0 \
+            payload = vless_request(target.uuid, DELAY_TEST_HOST, 80, request) if asking == 0 \
                 else request
             sock.sendall(ws_frame(payload))
             status, _, reusable = read_response(stream)
             took = _since(sent_at)
-            if i == 0:
+            if asking == 0:
                 r["tunnel"], r["setup"] = took, _since(start)
             if status is not None and 200 <= status < 400:
                 r["received"] += 1
@@ -1511,7 +1526,13 @@ def tunnel_ping(ip, target, ctx, timeout, count=5):
             else:
                 r["error"] = "tunnel HTTP %s" % status if status else "tunnel: no answer"
             if not reusable:
+                r["sent"] = asking + 1  # the tunnel ends with this answer; the rest go anew
                 break
+    except _Closed as exc:
+        if r["received"]:
+            r["sent"] = asking  # it ended after answering: the rest go on a new connection
+        else:
+            r["error"] = ("tunnel: " if r["status"] == 101 else "") + describe_error(exc)
     except Exception as exc:
         text = describe_error(exc)
         r["error"] = text if r["status"] != 101 or r["received"] else "tunnel: " + text
@@ -2453,8 +2474,16 @@ MULTI_VERIFY_CAP = 40
 
 
 def multi_pool(store, session):
-    """The session's candidate list: the same in every round (a stored seed)."""
-    return sweep_candidates(store.ranges(4), random.Random(session["seed"]))
+    """The session's candidate list: the same in every round (a stored seed).
+
+    IPv4: one address per /24 of every range. IPv6 has far too many blocks
+    for that, so a seeded sample of ``candidates`` addresses is used.
+    """
+    rng = random.Random(session["seed"])
+    if int(store.settings["ip_version"]) == 6:
+        return build_candidates({}, int(store.settings["candidates"]), 6, store.ranges(6),
+                                rng=rng)
+    return sweep_candidates(store.ranges(4), rng)
 
 
 def multi_proved(session, settings):
@@ -3908,9 +3937,17 @@ if ui is not None:
 
         def start(self):
             console.set_idle_timer_disabled(True)
-            self.alive = True
-            threading.Thread(target=self._ticker, name="clock", daemon=True).start()
+            self._start_clock()
             self._begin(0)
+
+        def _start_clock(self):
+            """The clock and spinner; a new thread only when the last one ended."""
+            self.alive = True
+            ticker = getattr(self, "_clock_thread", None)
+            if ticker is None or not ticker.is_alive():
+                self._clock_thread = threading.Thread(target=self._ticker, name="clock",
+                                                      daemon=True)
+                self._clock_thread.start()
 
         def _ticker(self):
             while self.alive:
@@ -4336,8 +4373,6 @@ if ui is not None:
 
         def start(self):
             console.set_idle_timer_disabled(True)
-            self.alive = True
-            threading.Thread(target=self._ticker, name="clock", daemon=True).start()
             pending = self.pending()
             here = self.app.store.current_network["id"]
             if pending and pending[0] == here:
@@ -4360,7 +4395,7 @@ if ui is not None:
             self.notes.text = ""
             self.notes.hidden = True
             self.result = None
-            self.alive = True
+            self._start_clock()
             console.set_idle_timer_disabled(True)
             self._begin(0)
 
@@ -4807,7 +4842,17 @@ if ui is not None:
             self.close()
 
         def run(self):
-            self.present("sheet", hide_close_button=True)
+            # right after a list or another form closes, iOS may still be
+            # animating it away and refuses a new sheet for a moment
+            for attempt in range(15):
+                try:
+                    self.present("sheet", hide_close_button=True)
+                    break
+                except (ValueError, RuntimeError) as exc:
+                    if attempt == 14:
+                        raise
+                    log("form %s not shown yet (%s); retrying" % (self.name, exc))
+                    time.sleep(0.2)
             self.wait_modal()
             return self.values
 
@@ -4996,8 +5041,10 @@ if ui is not None:
                     store.save_network(nid, net["name"], net["group"], asn)
             else:
                 name = console.input_alert("نام اینترنت", "", name, "ادامه").strip() or name
-                g = pick("%s موبایل است یا خانگی؟" % name,
-                         ["موبایل (همراه اول، ایرانسل…)", "خانگی (ADSL، فیبر، TD-LTE…)"])
+                labels = ["موبایل (همراه اول، ایرانسل…)", "خانگی (ADSL، فیبر، TD-LTE…)"]
+                if asn:  # what the ASN is known as
+                    labels[GROUPS.index(group)] += " ← پیشنهاد"
+                g = pick("%s موبایل است یا خانگی؟" % name, labels)
                 if g is None:
                     return None
                 nid = store.save_network(None, name, GROUPS[g], asn)

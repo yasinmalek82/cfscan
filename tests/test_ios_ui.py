@@ -12,8 +12,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import random
 import shutil
 import sys
+import threading
 import tempfile
 import time
 import unittest
@@ -131,10 +133,14 @@ class AppTestCase(unittest.TestCase):
             view.layout()
             self.assert_form_layout(view)
         answer = fake["dialogs"].ANSWERS.pop(0) if fake["dialogs"].ANSWERS else None
+        if fake["dialogs"].LENIENT and not isinstance(answer, dict):
+            answer = None
         if answer is None:
             view.cancel()
             return
         for key, value in answer.items():
+            if fake["dialogs"].LENIENT and key not in view.inputs:
+                continue
             kind, widget = view.inputs[key]  # a key the form does not have fails here
             if kind in ("switch", "check"):
                 widget.value = bool(value)
@@ -504,7 +510,7 @@ class ScanFlowTests(AppTestCase):
         slow = engine.scripted_probe(self.tables["mci"])
 
         def probe(*args):
-            time.sleep(0.05)
+            time.sleep(0.3)
             return slow(*args)
 
         real_job = app.ScanJob
@@ -618,6 +624,21 @@ class MultiCarrierFlowTests(AppTestCase):
         self.assertEqual(self.store.history(sid)[0]["kind"], "multi")
         self.assertIn("(چند اپراتوره)", app.history_lines(self.store, sid)[0])
 
+    def test_the_clock_runs_in_every_round(self):
+        self.ready()
+        view = self.start_session(["mci", "mtn"])
+        self.wait(view)
+        first = view._clock_thread
+        deadline = time.time() + 2
+        while first.is_alive() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(first.is_alive())  # stopped during the pause
+        self.conn.update(asn=44244, org="Irancell")
+        view.tapped_next(view.next_btn)
+        self.assertTrue(view._clock_thread.is_alive() or view.result is not None)
+        self.assertIsNot(view._clock_thread, first)
+        self.wait(view)
+
     def test_a_carrier_can_be_skipped_and_the_report_still_comes(self):
         sid = self.ready()
         view = self.start_session(["mci", "mtn"])
@@ -667,6 +688,107 @@ class MultiCarrierFlowTests(AppTestCase):
                 if not b.hidden:
                     self.assertGreater(b.width, 60)
                     self.assertGreaterEqual(b.x, 0)
+
+
+class MonkeyTests(AppTestCase):
+    """Hundreds of random taps and answers: no flow may fail, no thread may die."""
+
+    SEED = 20260924
+
+    ACTIONS = ("scan", "force", "all", "multi", "next", "again", "stop", "report", "tools",
+               "settings", "network", "server", "badge", "apply", "anyway", "faster", "row")
+
+    def junk(self, rng):
+        return rng.choice(["", "0", "-1", "abc", "99999", "1.5", "cdn9.germany.example.com",
+                           "vless://broken", "  ", "3", "443", "۱۲", None, True, False])
+
+    def answers(self, rng):
+        out = []
+        for _ in range(rng.randrange(0, 5)):
+            kind = rng.random()
+            if kind < 0.4:
+                out.append(rng.randrange(0, 14))
+            elif kind < 0.6:
+                out.append(None)
+            else:
+                out.append({key: self.junk(rng) for key in rng.sample(
+                    ["ttl", "timeout", "workers", "good_ping_ms", "name", "sni", "record_home",
+                     "record_mobile", "link", "port", "mci", "mtn", "home", "full_range",
+                     "verify_top", "asns", "token", "zone_id", "delete"], rng.randrange(1, 5))})
+        return out
+
+    def test_random_use_never_breaks(self):
+        rng = random.Random(self.SEED)
+        self.patch(fake["dialogs"], "LENIENT", True)
+        died = []
+        self.patch(threading, "excepthook", lambda args: died.append(args.exc_value))
+        sid = self.ready()
+        self.store.save_server(None, {"name": "ترکیه", "sni": "turkey.example.com",
+                                      "record_mobile": "cdn1.turkey.example.com"})
+        views = []
+        for step in range(300):
+            action = rng.choice(self.ACTIONS)
+            fake["dialogs"].ANSWERS[:] = []
+            for a in self.answers(rng):
+                (fake["dialogs"].ANSWERS if not isinstance(a, int) or rng.random() < 0.5
+                 else fake["console"].ANSWERS).append(a)
+            fake["console"].ANSWERS[:] = [rng.randrange(0, 4) for _ in range(4)]
+            if rng.random() < 0.2:
+                self.conn.update(asn=rng.choice([197207, 44244, 58224, None]),
+                                 country=rng.choice(["IR", "IR", "IR", "DE"]),
+                                 ok=rng.random() > 0.05, error="timeout")
+            top = self.app.nav.pushed[-1] if getattr(self.app.nav, "pushed", None) else None
+            try:
+                if action == "scan":
+                    self.app.scan_flow("auto", False)
+                elif action == "force":
+                    self.app.scan_flow("force", False)
+                elif action == "all":
+                    self.app.scan_flow("auto", True)
+                elif action == "multi":
+                    self.app.multi_flow()
+                elif action == "tools":
+                    self.app.open_tools()
+                elif action == "settings":
+                    self.app.open_settings()
+                elif action == "network":
+                    self.app.network_menu()
+                elif action == "badge":
+                    self.app.detect(rng.random() < 0.5)
+                elif action == "server" and self.store.servers:
+                    self.main.servers.selected_index = rng.randrange(len(self.store.servers))
+                    self.main.server_changed(self.main.servers)
+                elif top is not None:
+                    button = {"next": "next_btn", "again": "again_btn", "stop": "stop_btn",
+                              "report": "report_btn", "apply": "apply_btn",
+                              "anyway": "anyway_btn", "faster": "faster_btn"}.get(action)
+                    target = getattr(top, button, None) if button else None
+                    if target is not None and not target.hidden and target.enabled:
+                        target.action(target)
+                    elif action == "row" and getattr(top, "row_views", None):
+                        rows = [r for r in top.row_views if not r.hidden]
+                        if rows:
+                            rows[0].tap.action(rows[0].tap)
+            except Exception as exc:  # a flow the app runs in run_bg would log it
+                self.fail("step %d (%s) raised %r" % (step, action, exc))
+            deadline = time.time() + 5
+            while (self.app.active_scan is not None and self.app.active_scan.running
+                   and time.time() < deadline):
+                time.sleep(0.01)
+            if self.app.active_scan is not None and self.app.active_scan not in views:
+                views.append(self.app.active_scan)
+            for v in list(getattr(self.app.nav, "pushed", []))[-2:]:
+                v.frame = (0, 0, rng.choice([320, 375, 430]), 700)
+                v.layout()
+            self.main.refresh()
+            self.main.layout()
+        errors = [line for line in Path(app.LOG_PATH).read_text().splitlines()
+                  if "failed:" in line or "crashed" in line or "raised" in line]
+        self.assertEqual(errors, [])
+        self.assertEqual(died, [])
+        json.dumps(self.store.data)
+        app.normalise_data(json.loads(json.dumps(self.store.data)))
+        self.assertGreater(len(views), 3)
 
 
 class MenuTests(AppTestCase):
@@ -727,6 +849,24 @@ class MenuTests(AppTestCase):
         name = self.forms[-1].inputs["name"][1]
         self.assertEqual((name.text, name.alignment), ("آلمان", fake["ui"].ALIGN_RIGHT))
         self.assertEqual(self.forms[-1].inputs["sni"][1].alignment, fake["ui"].ALIGN_LEFT)
+
+    def test_a_form_waits_for_the_previous_sheet_to_go(self):
+        self.ready()
+        tries = []
+        real = fake["ui"].View.present
+
+        def busy(view, *a, **kw):
+            tries.append(1)
+            if len(tries) < 3:
+                raise ValueError("View is already being presented or animation is in progress")
+            return real(view, *a, **kw)
+
+        self.patch(fake["ui"].View, "present", busy)
+        self.patch(app.time, "sleep", lambda s: None)
+        self.answer({"ttl": "120"})
+        self.app.edit_advanced()
+        self.assertEqual(len(tries), 3)
+        self.assertEqual(self.store.settings["ttl"], 120)
 
     def test_the_form_moves_above_the_keyboard(self):
         self.ready()
