@@ -32,27 +32,24 @@ TEST_TOKEN = "Ab3dEf6hIj9lMn2pQr5tUv8xYz1bCd4fGh7jKl0n"
 
 
 class MemorySecrets:
-    """Tokens by server id; ``None`` is the main token."""
-
     def __init__(self, token=TEST_TOKEN):
-        self.tokens = {None: token}
+        self.token = token
 
     def get(self, sid=None):
-        return self.tokens.get(sid, "")
+        return self.token
 
     def set(self, token, sid=None):
-        self.tokens[sid] = token
+        self.token = token
 
 
 def make_store(tmp, token=TEST_TOKEN, sni="cdn.example.test", path="/ws", **settings):
-    """A store with one server ``s1`` whose MCI record is mci.example.test."""
+    """One CDN server; ip1 becomes ip1.example.test; networks mci, mtn, home."""
     store = app.Store(os.path.join(tmp, "data.json"), secrets=MemorySecrets(token))
-    base = {"auto_apply": True, "verify_attempts": 3, "verify_top": 3, "stop_after": 0,
-            "timeout": 0.5}
+    base = {"auto_apply": True, "verify_attempts": 3, "verify_top": 4, "stop_after": 0,
+            "timeout": 0.5, "ips_per_record": 1}
     base.update(settings)
     store.update_settings(base)
-    store.save_server(None, {"name": "DE", "sni": sni, "path": path},
-                      {"mci": "mci.example.test"})
+    store.save_server(None, {"name": "DE", "sni": sni, "path": path})
     return store
 
 
@@ -65,101 +62,53 @@ class StoreTests(unittest.TestCase):
 
     def test_defaults_fill_a_missing_file(self):
         store = app.Store(os.path.join(self.tmp, "none.json"), secrets=MemorySecrets())
-        self.assertEqual(store.settings["ttl"], 60)
         self.assertEqual(store.servers, [])
-        self.assertIsNone(store.active)
-        self.assertEqual([c["id"] for c in store.carriers], ["mci", "mtn", "home"])
+        self.assertEqual([n["id"] for n in store.networks], ["mci", "mtn", "home"])
+        self.assertEqual(store.current_network["id"], "mci")
+        self.assertEqual(store.settings["ip1"], "")
+
+    def test_the_first_server_suggests_ip1(self):
+        store = make_store(self.tmp)
+        self.assertEqual(store.settings["ip1"], "ip1.example.test")
+        self.assertEqual(app.suggest_record("de.example.com"), "ip1.example.com")
+        self.assertEqual(app.suggest_record("example.com", "ip2"), "ip2.example.com")
+        self.assertEqual(app.suggest_record("localhost"), "")
 
     def test_settings_round_trip_and_bad_values_change_nothing(self):
-        store = make_store(self.tmp, workers="16", colos="fra, ams")
+        store = make_store(self.tmp, workers="16", ip2="https://IP2.example.test/")
         again = app.Store(store.path, secrets=MemorySecrets())
         self.assertEqual(again.settings["workers"], 16)
-        self.assertEqual(again.server("s1")["path"], "/ws")
+        self.assertEqual(again.settings["ip2"], "ip2.example.test")
         with self.assertRaises(ValueError):
             again.update_settings({"workers": "8", "ttl": "5"})
         self.assertEqual(again.settings["workers"], 16)
         with self.assertRaises(ValueError):
             again.save_server("s1", {"port": "70000"})
-        self.assertEqual(again.server("s1")["port"], 443)
 
-    def test_version_one_data_becomes_one_server(self):
-        v1 = {"settings": {"sni": "CDN.Example.com", "path": "ws", "port": 2053, "ttl": 120,
-                           "zone_id": "z"},
-              "profiles": [{"id": "mci", "name": "MCI", "record": "mci.cdn.example.com"},
-                           {"id": "mtn", "name": "MTN", "record": "mtn.cdn.example.com"}],
-              "state": {"mci": {"current": ["1.1.1.1"], "status": "ok",
-                                "good": {"1.1.1.1": {"ts": 5}}, "bad": {"9.9.9.9": 6}}},
-              "history": [{"ts": 1, "profile": "mci", "kind": "apply", "old": [], "new": ["1.1.1.1"]}]}
-        data = app.normalise_data(v1)
-        self.assertEqual(data["version"], 2)
-        server = data["servers"][0]
-        self.assertEqual((server["id"], server["sni"], server["path"], server["port"],
-                          server["zone_id"]), ("s1", "cdn.example.com", "/ws", 2053, "z"))
-        self.assertEqual(server["records"], {"mci": "mci.cdn.example.com",
-                                             "mtn": "mtn.cdn.example.com"})
-        self.assertEqual(data["settings"]["ttl"], 120)
-        self.assertEqual(data["state"]["s1|mci"]["current"], ["1.1.1.1"])
-        self.assertIn("1.1.1.1", data["memory"]["mci"]["good"])
-        self.assertEqual(data["history"][0]["server"], "s1")
-        self.assertEqual(data["history"][0]["carrier"], "mci")
-        self.assertEqual(data["active_server"], "s1")
-        self.assertEqual([c["prefix"] for c in data["carriers"]], ["mci", "mtn"])
-
-    def test_stored_garbage_is_ignored(self):
-        data = app.normalise_data({"settings": {"ttl": 5, "workers": "x"},
-                                   "servers": [{"id": "a", "port": "x", "sni": "A.B."},
-                                               {"id": "a"}, "junk"],
-                                   "carriers": [{"id": "c", "prefix": "R T!"}, {"id": "c"}]})
-        self.assertEqual(data["settings"]["ttl"], 60)
-        self.assertEqual(data["settings"]["workers"], 32)
-        self.assertEqual([s["id"] for s in data["servers"]], ["a", "s3"])
-        self.assertEqual((data["servers"][0]["port"], data["servers"][0]["sni"]), (443, "a.b"))
-        self.assertEqual(data["carriers"], [{"id": "c", "name": "c", "prefix": "rt"}])
-
-    def test_servers_are_added_suggested_switched_and_deleted(self):
+    def test_networks_are_added_renamed_and_removed_with_their_results(self):
         store = make_store(self.tmp)
-        sid = store.save_server(None, {"name": "NL", "sni": "https://cdn2.example.org/"})
-        self.assertEqual(sid, "s2")
-        self.assertEqual(store.server(sid)["sni"], "cdn2.example.org")
-        self.assertEqual(store.suggest_record(sid, "mtn"), "mtn.cdn2.example.org")
-        self.assertEqual(store.active["id"], "s1")
-        store.set_active(sid)
-        self.assertEqual(store.active["id"], "s2")
-        store.state(sid, "mci")["current"] = ["1.1.1.1"]
-        store.secrets.set("per-server", sid)
-        store.delete_server(sid)
-        self.assertEqual(store.active["id"], "s1")
-        self.assertNotIn("s2|mci", store.data["state"])
-        self.assertEqual(store.secrets.get(sid), "")
+        nid = store.save_network(None, "رایتل")
+        store.record_result("1.1.1.1", nid, True, 50)
+        store.set_network(nid)
+        store.save_network(nid, "Rightel")
+        self.assertEqual(store.current_network["name"], "Rightel")
+        store.delete_network(nid)
+        self.assertNotIn(nid, store.matrix["1.1.1.1"])
+        self.assertEqual(store.current_network["id"], "mci")
+        for n in list(store.networks)[1:]:
+            store.delete_network(n["id"])
+        with self.assertRaises(ValueError):
+            store.delete_network("mci")
 
-    def test_changing_a_record_forgets_its_state(self):
+    def test_results_are_kept_per_address_and_network(self):
         store = make_store(self.tmp)
-        store.state("s1", "mci").update(current=["1.1.1.1"], status="ok")
-        store.save_server("s1", {}, {"mci": "mci.example.test"})
-        self.assertEqual(store.state("s1", "mci")["current"], ["1.1.1.1"])
-        store.save_server("s1", {}, {"mci": "new.example.test"})
-        self.assertEqual(store.state("s1", "mci")["current"], [])
-        store.save_server("s1", {}, {"mci": ""})
-        self.assertEqual(store.record("s1", "mci"), "")
-
-    def test_carriers_can_be_added_and_removed_everywhere(self):
-        store = make_store(self.tmp)
-        cid = store.save_carrier(None, "رایتل", "RTL")
-        self.assertEqual((cid, store.carrier(cid)["prefix"]), ("rtl", "rtl"))
-        self.assertEqual(store.suggest_record("s1", cid), "rtl.cdn.example.test")
-        store.save_server("s1", {}, {cid: "rtl.example.test"})
-        store.remember_good(cid, "1.1.1.1", 50, "FRA")
-        store.delete_carrier(cid)
-        self.assertNotIn(cid, store.server("s1")["records"])
-        self.assertNotIn(cid, store.data["memory"])
-
-    def test_a_server_token_overrides_the_main_one(self):
-        store = make_store(self.tmp)
-        sid = store.save_server(None, {"sni": "cdn.other.test"})
-        self.assertEqual(store.token_for(sid), TEST_TOKEN)
-        store.secrets.set(" Bearer " + "Z" * 40 + " ", sid)
-        self.assertEqual(store.token_for(sid), "Z" * 40)
-        self.assertEqual(store.token_for("s1"), TEST_TOKEN)
+        store.remember_bad("mci", ["1.1.1.1"])
+        store.record_result("1.1.1.1", "mci", True, 50, "FRA", ts=10)
+        store.record_result("1.1.1.1", "mtn", False, ts=11)
+        self.assertEqual(store.matrix["1.1.1.1"]["mci"],
+                         {"ok": True, "ping": 50, "colo": "FRA", "ts": 10})
+        self.assertFalse(store.matrix["1.1.1.1"]["mtn"]["ok"])
+        self.assertNotIn("1.1.1.1", store.bad_for("mci"))
 
     def test_the_token_is_never_written_to_the_data_file(self):
         store = make_store(self.tmp, token="secret-token-123")
@@ -167,38 +116,122 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("secret-token-123", Path(store.path).read_text(encoding="utf-8"))
         self.assertNotIn("secret-token-123", store.export_json())
 
-    def test_export_import_keeps_servers_carriers_and_settings(self):
+    def test_export_import_keeps_servers_networks_and_settings(self):
         store = make_store(self.tmp, workers="20")
-        store.save_server(None, {"sni": "cdn2.example.test"}, {"mtn": "mtn.cdn2.example.test"})
+        store.save_network(None, "شاتل")
         other = app.Store(os.path.join(self.tmp, "other.json"), secrets=MemorySecrets())
         other.import_json(store.export_json())
-        self.assertEqual([s["sni"] for s in other.servers], ["cdn.example.test", "cdn2.example.test"])
-        self.assertEqual(other.record("s2", "mtn"), "mtn.cdn2.example.test")
+        self.assertEqual(other.servers[0]["sni"], "cdn.example.test")
         self.assertEqual(other.settings["workers"], 20)
+        self.assertEqual(other.networks[-1]["name"], "شاتل")
         with self.assertRaises(ValueError):
             other.import_json('{"hello": 1}')
 
-    def test_a_version_one_export_still_imports(self):
-        other = app.Store(os.path.join(self.tmp, "other.json"), secrets=MemorySecrets())
-        other.import_json('{"app": "cfscan_ios", "settings": {"sni": "cdn.x.test"}, '
-                          '"profiles": [{"id": "mci", "name": "MCI", "record": "mci.x.test"}]}')
-        self.assertEqual(other.record("s1", "mci"), "mci.x.test")
+    def test_version_one_data_is_migrated(self):
+        v1 = {"version": 1,
+              "settings": {"sni": "cdn.example.com", "path": "ws", "ttl": 120},
+              "profiles": [{"id": "mci", "name": "MCI", "record": "mci.cdn.example.com"}],
+              "state": {"mci": {"good": {"1.1.1.1": {"ts": 5, "ping": 40, "colo": "FRA"}},
+                                "bad": {"9.9.9.9": 6}}}}
+        data = app.normalise_data(v1)
+        self.assertEqual(data["version"], 3)
+        self.assertEqual((data["servers"][0]["sni"], data["servers"][0]["path"]),
+                         ("cdn.example.com", "/ws"))
+        self.assertEqual(data["networks"], [{"id": "mci", "name": "MCI"}])
+        self.assertEqual(data["matrix"]["1.1.1.1"]["mci"],
+                         {"ok": True, "ping": 40, "colo": "FRA", "ts": 5})
+        self.assertEqual(data["bad"]["mci"], {"9.9.9.9": 6})
+        self.assertEqual(data["settings"]["ttl"], 120)
+        self.assertEqual(data["settings"]["ip1"], "ip1.example.com")
 
-    def test_previous_ips_and_history_filters(self):
-        store = make_store(self.tmp)
-        store.add_history("s1", "mci", "apply", ["1.1.1.1"], ["2.2.2.2"])
-        store.add_history("s1", "mci", "check", ["2.2.2.2"], ["2.2.2.2"])
-        store.add_history("s2", "mci", "apply", ["7.7.7.7"], ["8.8.8.8"])
-        self.assertEqual(store.previous_ips("s1", "mci"), ["1.1.1.1"])
-        self.assertEqual(len(store.history("s1")), 2)
-        self.assertEqual(len(store.history(cid="mci")), 3)
+    def test_version_two_data_is_migrated(self):
+        v2 = {"version": 2, "settings": {"workers": 20},
+              "servers": [{"id": "s1", "name": "DE", "sni": "de.example.com", "path": "/a",
+                           "zone_id": "z1", "records": {"mci": "mci.de.example.com"}},
+                          {"id": "s2", "name": "TR", "sni": "tr.example.com"}],
+              "carriers": [{"id": "mci", "name": "همراه اول", "prefix": "mci"},
+                           {"id": "rtl", "name": "رایتل", "prefix": "rtl"}],
+              "memory": {"rtl": {"good": {"2.2.2.2": {"ts": 7, "ping": 60}}}}}
+        data = app.normalise_data(v2)
+        self.assertEqual([s["sni"] for s in data["servers"]], ["de.example.com", "tr.example.com"])
+        self.assertNotIn("records", data["servers"][0])
+        self.assertEqual([n["id"] for n in data["networks"]], ["mci", "rtl"])
+        self.assertTrue(data["matrix"]["2.2.2.2"]["rtl"]["ok"])
+        self.assertEqual(data["settings"]["zone_id"], "z1")
+        self.assertEqual(data["settings"]["workers"], 20)
 
-    def test_memory_is_shared_by_servers_of_a_carrier(self):
+    def test_previous_ips_come_from_the_record_history(self):
         store = make_store(self.tmp)
-        store.remember_good("mci", "1.1.1.1", 50, "FRA")
-        store.remember_bad("mci", ["1.1.1.1"], forget_good=True)
-        self.assertNotIn("1.1.1.1", store.memory("mci")["good"])
-        self.assertIn("1.1.1.1", store.memory("mci")["bad"])
+        store.add_history("ip1", ["1.1.1.1"], ["2.2.2.2"], "mci")
+        store.add_history("ip2", ["7.7.7.7"], ["8.8.8.8"], "home")
+        self.assertEqual(store.previous_ips("ip1"), ["1.1.1.1"])
+        self.assertEqual(store.previous_ips("ip2"), ["7.7.7.7"])
+
+
+# ------------------------------------------------------------------ coverage
+
+NOW = 1000000.0
+DAY = 86400.0
+
+
+def cell(ok, ping=None, age=0):
+    return {"ok": ok, "ping": ping, "colo": "", "ts": NOW - age}
+
+
+class CoverageTests(unittest.TestCase):
+    NETS = ["mci", "mtn", "home"]
+
+    def test_an_address_working_everywhere_wins_by_its_worst_ping(self):
+        matrix = {"A": {"mci": cell(True, 40), "mtn": cell(True, 200), "home": cell(True, 50)},
+                  "B": {"mci": cell(True, 90), "mtn": cell(True, 100), "home": cell(True, 95)},
+                  "C": {"mci": cell(True, 10), "mtn": cell(False)}}
+        choice = app.choose_addresses(matrix, self.NETS, NOW, DAY, 2)
+        self.assertEqual(choice["ip1"], ["B", "A"])
+        self.assertEqual(choice["uncovered"], [])
+        self.assertEqual(choice["ip2"], [])
+
+    def test_a_network_no_common_address_reaches_goes_to_ip2(self):
+        matrix = {"A": {"mci": cell(True, 40), "mtn": cell(True, 60), "home": cell(False)},
+                  "H": {"mci": cell(False), "mtn": cell(False), "home": cell(True, 30)}}
+        for scanned_on in ("mci", "home"):
+            choice = app.choose_addresses(matrix, self.NETS, NOW, DAY, 2, must_work_on=scanned_on)
+            self.assertEqual(choice["ip1"], ["A"])
+            self.assertEqual(choice["covered"], ["mci", "mtn"])
+            self.assertEqual(choice["uncovered"], ["home"])
+            self.assertEqual(choice["ip2"], ["H"])
+
+    def test_old_results_do_not_count(self):
+        matrix = {"A": {"mci": cell(True, 40), "mtn": cell(False, age=3 * DAY)}}
+        active = app.active_networks(matrix, self.NETS, NOW, DAY)
+        self.assertEqual(active, ["mci"])
+        self.assertEqual(app.choose_addresses(matrix, active, NOW, DAY, 1)["ip1"], ["A"])
+        self.assertEqual(app.cell_text(matrix["A"]["mtn"], NOW, DAY), "؟")
+        self.assertEqual(app.cell_text(matrix["A"]["mci"], NOW, DAY), "40")
+
+    def test_equal_coverage_prefers_the_network_just_scanned(self):
+        matrix = {"M": {"mci": cell(True, 10)}, "T": {"mtn": cell(True, 90)}}
+        choice = app.choose_addresses(matrix, ["mci", "mtn"], NOW, DAY, 1, must_work_on="mtn")
+        self.assertEqual(choice["ip1"], ["T"])
+        self.assertEqual(choice["ip2"], ["M"])
+
+    def test_seeds_are_addresses_working_elsewhere_not_yet_tried_here(self):
+        matrix = {"A": {"mci": cell(True, 40)},
+                  "B": {"mci": cell(True, 30), "mtn": cell(False)},
+                  "C": {"mci": cell(False)}}
+        self.assertEqual(app.seeds_for(matrix, "mtn", self.NETS, NOW, DAY), ["A"])
+
+    def test_without_ip2_the_gaps_join_ip1(self):
+        matrix = {"A": {"mci": cell(True, 40), "mtn": cell(True, 60), "home": cell(False)},
+                  "B": {"mci": cell(True, 50), "mtn": cell(True, 70)},
+                  "H": {"home": cell(True, 30)}}
+        choice = app.choose_addresses(matrix, self.NETS, NOW, DAY, 2, merge_gaps=True)
+        self.assertEqual(choice["ip1"], ["A", "H"])
+        self.assertTrue(choice["merged"])
+        self.assertEqual(choice["covered"], self.NETS)
+        self.assertEqual(choice["ip2"], [])
+
+    def test_nothing_measured_chooses_nothing(self):
+        self.assertEqual(app.choose_addresses({}, self.NETS, NOW, DAY, 2)["ip1"], [])
 
 
 # ------------------------------------------------------------------ pure helpers
@@ -375,10 +408,9 @@ class ZoneTests(unittest.TestCase):
     def test_a_wrong_zone_id_in_the_settings_falls_back_to_the_lookup(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
-        store = make_store(tmp)
-        store.save_server("s1", {"zone_id": "0123456789abcdef0123456789abcdef"})
+        store = make_store(tmp, zone_id="0123456789abcdef0123456789abcdef")
         api = self.api()
-        ips = app.with_zone(store, api, store.server("s1"), "mtn.cdn.example.com",
+        ips = app.with_zone(store, api, "mtn.cdn.example.com",
                             lambda zone: [r["content"] for r in
                                           api.list_records(zone, "mtn.cdn.example.com", "A")])
         self.assertEqual(ips, ["1.1.1.1"])
@@ -573,170 +605,187 @@ class RecordingEvents(app.Events):
         self.result = result
 
 
+IP1 = ("ip1.example.test", "A")
+IP2 = ("ip2.example.test", "A")
+
+
 class ScanJobTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp)
-        FakeAPI.records = {("mci.example.test", "A"): ["9.9.9.9"]}
+        FakeAPI.records = {}
         FakeAPI.unreachable_direct = False
         FakeAPI.calls = []
-        self.table = {
-            "9.9.9.9": (False, None, ""),       # the current, now blocked
-            "1.0.0.1": (True, 400.0, "GYD"),
-            "1.0.0.2": (True, 150.0, "FRA"),
-            "1.0.0.3": (True, 250.0, "AMS"),
-            "1.0.0.4": (False, None, ""),
-        }
 
-    def job(self, store, mode="auto", table=None, loc="IR"):
-        probe = scripted_probe(self.table if table is None else table, loc)
-        return app.ScanJob(store, "s1", "mci", events=RecordingEvents(), mode=mode,
+    def job(self, store, nid, table, mode="auto", loc="IR", candidates=None, probe=None):
+        probe = probe or scripted_probe(table, loc)
+        return app.ScanJob(store, nid, events=RecordingEvents(), mode=mode,
                            context_factory=lambda: None, api_factory=FakeAPI,
-                           candidates=["1.0.0.1", "1.0.0.2", "1.0.0.3", "1.0.0.4"],
+                           candidates=list(table) if candidates is None else candidates,
                            probe_trace=probe, probe_ws=probe)
 
-    def test_a_broken_record_is_replaced_by_the_best_verified_address(self):
+    def test_the_first_scan_fills_ip1_and_the_coverage_table(self):
         store = make_store(self.tmp)
-        job = self.job(store)
+        table = {"1.0.0.1": (True, 400.0, "GYD"), "1.0.0.2": (True, 150.0, "FRA"),
+                 "1.0.0.3": (False, None, "")}
+        job = self.job(store, "mci", table)
         result = job.run()
         self.assertEqual(result["kind"], "applied")
-        self.assertEqual(result["chosen"], ["1.0.0.2"])
-        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["1.0.0.2"])
-        st = store.state("s1", "mci")
-        self.assertEqual((st["status"], st["current"]), ("ok", ["1.0.0.2"]))
-        mem = store.memory("mci")
-        self.assertIn("1.0.0.2", mem["good"])
-        self.assertIn("1.0.0.4", mem["bad"])
-        self.assertIn("9.9.9.9", mem["bad"])
-        self.assertEqual(store.previous_ips("s1", "mci"), ["9.9.9.9"])
-        self.assertEqual(st["last_scan"]["scanned"], 4)
-        self.assertIn("1.0.0.2", app.result_line(result))
+        self.assertEqual(FakeAPI.records[IP1], ["1.0.0.2"])
+        self.assertEqual(store.record_ips("ip1"), ["1.0.0.2"])
+        self.assertTrue(store.matrix["1.0.0.2"]["mci"]["ok"])
+        self.assertIn("1.0.0.3", store.bad_for("mci"))
+        self.assertEqual(store.history()[0]["record"], "ip1")
+        self.assertEqual(store.history()[0]["network"], "mci")
+        self.assertEqual(job.events.steps[0], (0, "run"))
         self.assertEqual(job.events.steps[-1], (3, "ok"))
-        self.assertIs(job.events.result, result)
+        self.assertIn("1.0.0.2", app.result_line(result))
 
-    def test_a_healthy_record_is_left_alone(self):
+    def test_ip1_working_here_is_left_alone(self):
         store = make_store(self.tmp)
-        FakeAPI.records[("mci.example.test", "A")] = ["1.0.0.3"]
-        result = self.job(store).run()
+        FakeAPI.records[IP1] = ["1.0.0.2"]
+        result = self.job(store, "mtn", {"1.0.0.2": (True, 90.0, "FRA")}, candidates=[]).run()
         self.assertEqual(result["kind"], "healthy")
-        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["1.0.0.3"])
         self.assertEqual(result["scanned"], 0)
+        self.assertTrue(store.matrix["1.0.0.2"]["mtn"]["ok"])
 
-    def test_force_scans_even_when_healthy_and_can_find_the_same_address(self):
+    def test_a_second_network_keeps_the_address_that_works_on_both(self):
         store = make_store(self.tmp)
-        FakeAPI.records[("mci.example.test", "A")] = ["1.0.0.2"]
-        job = self.job(store, mode="force")
-        job.fixed_candidates = ["1.0.0.2", "1.0.0.1"]
-        result = job.run()
-        self.assertEqual(result["kind"], "unchanged")
+        self.job(store, "mci", {"1.0.0.1": (True, 300.0, "GYD"),
+                                "1.0.0.2": (True, 150.0, "FRA")}).run()
+        self.assertEqual(FakeAPI.records[IP1], ["1.0.0.2"])
+        # on Irancell the MCI winner fails, the slower MCI address works
+        mtn = {"1.0.0.1": (True, 200.0, "FRA"), "1.0.0.2": (False, None, ""),
+               "1.0.0.9": (True, 90.0, "FRA")}
+        seen = []
 
-    def test_two_addresses_per_record_and_manual_approval(self):
-        store = make_store(self.tmp, ips_per_record=2, auto_apply=False)
-        job = self.job(store)
+        def probe(ip, target, ctx, timeout):
+            seen.append(ip)
+            return scripted_probe(mtn)(ip, target, ctx, timeout)
+
+        store.update_settings({"candidates": 20, "stop_after": 3})
+        job = app.ScanJob(store, "mtn", events=RecordingEvents(), context_factory=lambda: None,
+                          api_factory=FakeAPI, rng=random.Random(4),
+                          probe_trace=probe, probe_ws=probe)
+        job.fixed_candidates = None
+        result = job.run()
+        self.assertEqual(result["kind"], "applied")
+        self.assertEqual(FakeAPI.records[IP1], ["1.0.0.1"])
+        self.assertEqual(result["covered"], ["mci", "mtn"])
+        scanned = [ip for ip in seen if ip != "1.0.0.2"]
+        self.assertEqual(scanned[0], "1.0.0.1")  # the address from MCI came first
+        self.assertFalse(store.matrix["1.0.0.2"]["mtn"]["ok"])
+
+    def test_home_without_a_common_address_fills_ip2(self):
+        store = make_store(self.tmp, ip2="ip2.example.test")
+        store.record_result("1.0.0.1", "mci", True, 80)
+        store.record_result("1.0.0.1", "mtn", True, 90)
+        store.set_record_ips("ip1", ["1.0.0.1"])
+        FakeAPI.records[IP1] = ["1.0.0.1"]
+        home = {"1.0.0.1": (False, None, ""), "1.0.0.7": (True, 60.0, "FRA")}
+        result = self.job(store, "home", home).run()
+        self.assertEqual(result["kind"], "applied")
+        self.assertEqual(FakeAPI.records[IP1], ["1.0.0.1"])
+        self.assertEqual(FakeAPI.records[IP2], ["1.0.0.7"])
+        self.assertEqual(result["uncovered"], ["home"])
+
+    def test_the_next_home_scan_sees_ip2_as_healthy(self):
+        store = make_store(self.tmp, ip2="ip2.example.test")
+        FakeAPI.records[IP1] = ["1.0.0.1"]
+        FakeAPI.records[IP2] = ["1.0.0.7"]
+        home = {"1.0.0.1": (False, None, ""), "1.0.0.7": (True, 60.0, "FRA")}
+        self.assertEqual(self.job(store, "home", home, candidates=[]).run()["kind"], "healthy")
+
+    def test_without_ip2_each_network_gets_its_own_address_in_ip1(self):
+        store = make_store(self.tmp)
+        store.record_result("1.0.0.1", "mci", True, 80)
+        store.set_record_ips("ip1", ["1.0.0.1"])
+        FakeAPI.records[IP1] = ["1.0.0.1"]
+        job = self.job(store, "home", {"1.0.0.1": (False, None, ""), "1.0.0.7": (True, 60.0, "")})
+        result = job.run()
+        self.assertEqual(result["kind"], "applied")
+        self.assertEqual(sorted(FakeAPI.records[IP1]), ["1.0.0.1", "1.0.0.7"])
+        self.assertEqual(result["covered"], ["mci", "home"])
+        self.assertTrue(any("ip2" in n for n in job.events.notes))
+
+    def test_one_dead_address_in_a_shared_ip1_triggers_a_scan(self):
+        store = make_store(self.tmp, ips_per_record=2)
+        FakeAPI.records[IP1] = ["1.0.0.1", "1.0.0.2"]
+        mtn = {"1.0.0.1": (True, 90.0, ""), "1.0.0.2": (False, None, "")}
+        result = self.job(store, "mtn", mtn).run()
+        self.assertNotEqual(result["kind"], "healthy")
+        self.assertEqual(FakeAPI.records[IP1], ["1.0.0.1"])
+
+    def test_a_merged_ip1_is_healthy_when_this_networks_address_works(self):
+        store = make_store(self.tmp)
+        store.record_result("1.0.0.1", "mci", True, 80)
+        store.set_record_ips("ip1", ["1.0.0.1"])
+        FakeAPI.records[IP1] = ["1.0.0.1"]
+        home = {"1.0.0.1": (False, None, ""), "1.0.0.7": (True, 60.0, "")}
+        self.assertTrue(self.job(store, "home", home).run()["merged"])
+        self.assertTrue(store.record_merged("ip1"))
+        again = self.job(store, "home", home, candidates=[]).run()
+        self.assertEqual(again["kind"], "healthy")
+
+    def test_an_address_another_server_refuses_is_skipped(self):
+        store = make_store(self.tmp)
+        store.save_server(None, {"name": "TR", "sni": "tr.example.test", "path": "/tr"})
+        table = {"1.0.0.1": (True, 300.0, ""), "1.0.0.2": (True, 100.0, "")}
+
+        def probe(ip, target, ctx, timeout):
+            if target.sni == "tr.example.test" and ip == "1.0.0.2":
+                return scripted_probe({})(ip, target, ctx, timeout)
+            return scripted_probe(table)(ip, target, ctx, timeout)
+
+        job = self.job(store, "mci", table, probe=probe)
+        result = job.run()
+        self.assertEqual(FakeAPI.records[IP1], ["1.0.0.1"])
+        self.assertTrue(any("1.0.0.2" in n for n in job.events.notes))
+
+    def test_manual_approval(self):
+        store = make_store(self.tmp, auto_apply=False, ips_per_record=2)
+        job = self.job(store, "mci", {"1.0.0.1": (True, 300.0, ""), "1.0.0.2": (True, 100.0, "")})
         result = job.run()
         self.assertEqual(result["kind"], "pending")
-        self.assertEqual(result["chosen"], ["1.0.0.2", "1.0.0.3"])
-        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["9.9.9.9"])
-        self.assertTrue(job.apply(result["chosen"], result))
-        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["1.0.0.2", "1.0.0.3"])
+        self.assertNotIn(IP1, FakeAPI.records)
+        self.assertTrue(job.apply(result))
+        self.assertEqual(FakeAPI.records[IP1], ["1.0.0.2", "1.0.0.1"])
 
     def test_a_blocked_api_is_reached_through_a_clean_address(self):
         store = make_store(self.tmp)
         FakeAPI.unreachable_direct = True
-        result = self.job(store).run()
+        result = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")}).run()
         self.assertEqual(result["kind"], "applied")
-        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["1.0.0.2"])
         self.assertIn("1.0.0.2", FakeAPI.calls)
-
-    def test_colour_filter_keeps_only_the_named_datacentres(self):
-        store = make_store(self.tmp, colos="AMS")
-        result = self.job(store).run()
-        self.assertEqual(result["chosen"], ["1.0.0.3"])
 
     def test_nothing_answering_gives_a_hint_and_marks_nothing_bad(self):
         store = make_store(self.tmp)
-        result = self.job(store, table={}).run()
+        result = self.job(store, "mci", {}, candidates=["1.0.0.4"]).run()
         self.assertEqual(result["kind"], "nothing")
         self.assertIn("timeout", result["hint"])
-        self.assertNotIn("1.0.0.4", store.memory("mci")["bad"])
+        self.assertNotIn("1.0.0.4", store.bad_for("mci"))
 
     def test_a_foreign_location_warns_about_the_vpn(self):
         store = make_store(self.tmp)
-        job = self.job(store, loc="DE")
-        result = job.run()
-        self.assertIn("VPN", result["warning"])
-        self.assertTrue(job.events.notes)
+        job = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")}, loc="DE")
+        self.assertIn("VPN", job.run()["warning"])
 
-    def test_missing_cdn_domain_is_a_clear_error(self):
-        store = make_store(self.tmp)
-        store.data["servers"][0]["sni"] = ""
-        result = self.job(store).run()
+    def test_no_server_is_a_clear_error(self):
+        store = app.Store(os.path.join(self.tmp, "d.json"), secrets=MemorySecrets())
+        result = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")}).run()
         self.assertEqual(result["kind"], "error")
         self.assertIn("CDN", result["message"])
 
     def test_without_a_token_the_scan_still_finds_addresses(self):
         store = make_store(self.tmp, token="")
-        result = self.job(store).run()
-        self.assertEqual(result["kind"], "found")
-        self.assertEqual(result["chosen"], ["1.0.0.2"])
+        result = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")}).run()
+        self.assertEqual((result["kind"], result["ip1"]), ("found", ["1.0.0.2"]))
 
-    def test_each_server_is_probed_with_its_own_domain_and_token(self):
+    def test_cancel_stops_the_run(self):
         store = make_store(self.tmp)
-        sid = store.save_server(None, {"name": "NL", "sni": "cdn2.example.test", "path": "/x"},
-                                {"mci": "mci.cdn2.example.test"})
-        store.secrets.set("Q" * 40, sid)
-        FakeAPI.records[("mci.cdn2.example.test", "A")] = ["9.9.9.9"]
-        seen, tokens = [], []
-
-        def probe(ip, target, ctx, timeout):
-            seen.append((target.sni, target.path))
-            return scripted_probe(self.table)(ip, target, ctx, timeout)
-
-        class TokenAPI(FakeAPI):
-            def __init__(self, token="", via_ip=None, **kw):
-                tokens.append(token)
-                super().__init__(token, via_ip)
-
-        job = app.ScanJob(store, sid, "mci", events=RecordingEvents(),
-                          context_factory=lambda: None, api_factory=TokenAPI,
-                          candidates=["1.0.0.2"], probe_trace=probe, probe_ws=probe)
-        self.assertEqual(job.run()["kind"], "applied")
-        self.assertEqual(set(seen), {("cdn2.example.test", "/x")})
-        self.assertEqual(set(tokens), {"Q" * 40})
-        self.assertEqual(FakeAPI.records[("mci.cdn2.example.test", "A")], ["1.0.0.2"])
-        self.assertEqual(FakeAPI.records[("mci.example.test", "A")], ["9.9.9.9"])
-
-    def test_a_second_server_starts_from_what_the_first_found(self):
-        store = make_store(self.tmp)
-        self.job(store).run()
-        sid = store.save_server(None, {"sni": "cdn2.example.test"}, {"mci": "mci.cdn2.example.test"})
-        cands = app.build_candidates(store.memory("mci"), 10, 4, app.CF_RANGES_V4,
-                                     rng=random.Random(1))
-        self.assertIn(cands[0], ("1.0.0.2", "1.0.0.3", "1.0.0.1"))
-        self.assertTrue(sid)
-
-    def test_other_carriers_addresses_are_tried_early(self):
-        store = make_store(self.tmp)
-        store.state("s1", "mtn").update(current=["1.0.0.3"], status="ok")
-        store.state("s1", "home").update(current=["5.5.5.5"], status="bad")
-        store.remember_good("home", "1.0.0.9", 90, "FRA")
-        store.remember_good("mci", "1.0.0.1", 90, "GYD")
-        shared = store.shared_candidates("mci")
-        self.assertEqual(list(shared), ["1.0.0.3", "1.0.0.9"])
-        self.assertEqual(shared["1.0.0.3"], "ایرانسل")
-        cands = app.build_candidates(store.memory("mci"), 30, 4, app.CF_RANGES_V4,
-                                     rng=random.Random(2), shared=list(shared))
-        self.assertEqual(cands[:3], ["1.0.0.1", "1.0.0.3", "1.0.0.9"])
-
-    def test_a_scan_can_pick_the_address_another_carrier_found(self):
-        store = make_store(self.tmp)
-        store.state("s1", "mtn").update(current=["1.0.0.2"], status="ok")
-        job = self.job(store)
-        job.fixed_candidates = None
-        job.store.update_settings({"candidates": 20, "stop_after": 2})
-        result = job.run()
-        self.assertEqual(result["chosen"], ["1.0.0.2"])
-        self.assertEqual(result["shared_from"], "ایرانسل")
+        job = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")})
+        job.cancel()
+        self.assertEqual(job.run()["kind"], "stopped")
 
     def test_connection_check_reads_the_location(self):
         class Resp:
@@ -765,12 +814,6 @@ class ScanJobTests(unittest.TestCase):
             self.assertEqual(app.connection_check()["error"], "timeout")
         finally:
             app.urllib.request.urlopen = original
-
-    def test_cancel_stops_the_run(self):
-        store = make_store(self.tmp)
-        job = self.job(store)
-        job.cancel()
-        self.assertEqual(job.run()["kind"], "stopped")
 
 
 if __name__ == "__main__":
