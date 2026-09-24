@@ -8,6 +8,7 @@ scripted fakes. Nothing here contacts a public network.
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import json
 import os
 import random
@@ -176,7 +177,7 @@ class StoreTests(unittest.TestCase):
               "records": {"s1": {"ips": ["1.1.1.1"], "ts": 5}, "s1:2": {"ips": ["2.2.2.2"]}},
               "history": [{"ts": 1, "record": "s1:2", "old": [], "new": ["2.2.2.2"]}]}
         data = app.normalise_data(v4)
-        self.assertEqual(data["version"], 5)
+        self.assertEqual(data["version"], app.DATA_VERSION)
         de = data["servers"][0]
         self.assertEqual((de["record_mobile"], de["record_home"]),
                          ("cdn1.germany.example.com", "cdn2.germany.example.com"))
@@ -783,7 +784,7 @@ class RobustnessTests(unittest.TestCase):
                 data = app.normalise_data(raw)
             except Exception as exc:  # the Store catches this, but it should not happen
                 self.fail("normalise_data(%r) raised %r" % (raw, exc))
-            self.assertEqual(data["version"], 5)
+            self.assertEqual(data["version"], app.DATA_VERSION)
             json.dumps(data)
 
     def test_choice_rules_hold_for_random_tables(self):
@@ -1201,8 +1202,64 @@ class ScanJobTests(unittest.TestCase):
             job = self.job(store, "mtn", {"1.0.0.9": (True, 900.0, "")}, candidates=[])
             self.assertEqual(job.run()["kind"], kind, good_ms)
 
+    def test_the_whole_range_is_swept_then_the_top_ten_tested_for_real(self):
+        store = make_store(self.tmp, verify_top=10)
+        answered_by = {}
+
+        def probe(ip, target, ctx, timeout):
+            """Only 104.16.0.0/16 answers; lower third octet = faster."""
+            parts = ip.split(".")
+            ok = parts[:2] == ["104", "16"]
+            total = 100.0 + int(parts[2]) if ok else None
+            if ok:
+                answered_by[ip] = total
+            return {"ip": ip, "ok": ok, "tcp": 30.0 if ok else None, "total": total,
+                    "status": 200 if ok else None, "colo": "FRA" if ok else "",
+                    "loc": "IR" if ok else "", "client": "", "error": "" if ok else "timeout"}
+
+        job = app.ScanJob(store, "s1", "mci", events=RecordingEvents(), mode="auto",
+                          context_factory=lambda: None, api_factory=FakeAPI,
+                          rng=random.Random(4), probe_trace=probe, probe_ws=probe)
+        result = job.run()
+        self.assertEqual(result["kind"], "applied")
+        self.assertGreater(result["scanned"], 5900)                 # every /24 of every range
+        self.assertEqual(result["answered"], 256)                   # all of 104.16.0.0/16
+        self.assertEqual(len(result["verified"]), 10)               # the ten fastest answers
+        self.assertEqual({m["ip"].split(".")[2] for m in result["verified"]},
+                         {str(i) for i in range(10)})
+        self.assertTrue(FakeAPI.records[DE][0].startswith("104.16.0."))
+        self.assertEqual(job.events.progress_by_step[1][-1][:2], (result["scanned"],) * 2)
+
+        # a second server on the same network minutes later: only the answers
+        add_turkey(store)
+        job2 = app.ScanJob(store, "s2", "mci", events=RecordingEvents(), mode="auto",
+                           context_factory=lambda: None, api_factory=FakeAPI,
+                           rng=random.Random(5), probe_trace=probe, probe_ws=probe)
+        result2 = job2.run()
+        self.assertEqual(result2["kind"], "applied")
+        self.assertLessEqual(result2["scanned"], 256)
+        self.assertTrue(any("کل رنج" in n for n in job2.events.notes))
+
+    def test_the_sweep_covers_each_24_once(self):
+        cands = app.sweep_candidates(app.CF_RANGES_V4, random.Random(2),
+                                     first=["104.16.9.9", "2606:4700::1"], exclude=["1.1.1.1"])
+        prefixes = [ip.rsplit(".", 1)[0] for ip in cands]
+        self.assertEqual(cands[0], "104.16.9.9")
+        self.assertEqual(len(prefixes), len(set(prefixes)))
+        self.assertEqual(len(cands), 5956)
+        for ip in cands:
+            self.assertTrue(any(ipaddress.ip_address(ip) in ipaddress.ip_network(r)
+                                for r in app.CF_RANGES_V4), ip)
+            self.assertNotIn(ip.rsplit(".", 1)[1], ("0", "255"))
+
+    def test_old_data_gets_the_new_shortlist(self):
+        data = app.normalise_data({"version": 5, "settings": {"verify_top": 6, "workers": 20}})
+        self.assertEqual((data["settings"]["verify_top"], data["settings"]["workers"]), (10, 20))
+        data = app.normalise_data({"version": 6, "settings": {"verify_top": 6}})
+        self.assertEqual(data["settings"]["verify_top"], 6)  # chosen, not the old default
+
     def test_every_long_step_reports_its_progress(self):
-        store = make_store(self.tmp, stop_after=2)
+        store = make_store(self.tmp, stop_after=2, full_range=False)
         FakeAPI.records[DE] = ["1.0.0.9"]
         table = {"1.0.0.%d" % i: (True, 100.0 + i, "") for i in range(1, 30)}
         table["1.0.0.9"] = (False, None, "")

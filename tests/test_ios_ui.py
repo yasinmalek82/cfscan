@@ -83,6 +83,8 @@ class AppTestCase(unittest.TestCase):
                                "1.0.0.9": (True, 90.0, "FRA")},
                        "home": {"1.0.0.7": (True, 60.0, "FRA")}}
         self.patch(app, "run_bg", lambda fn, *a: fn(*a))
+        self.forms = []
+        self.patch(fake["ui"], "MODAL_HOOK", self.fill_form)
         self.patch(app, "detect_connection", lambda timeout=6.0: dict(self.conn))
         fake_api = engine.FakeAPI
         fake_api.verify_token = lambda api: {"status": "active", "kind": "account"}
@@ -114,6 +116,50 @@ class AppTestCase(unittest.TestCase):
         self.addCleanup(setattr, obj, name, old)
 
     # helpers ---------------------------------------------------------------
+
+    def fill_form(self, view):
+        """Answer a :class:`FormView` like a person: type the scripted values
+        into its inputs and press save (or cancel for None)."""
+        self.forms.append(view)
+        fake["dialogs"].LOG.append(("form", view.name, None, view.sections))
+        for width in (320, 375, 430):  # readable on every phone, as it is shown
+            view.frame = (0, 0, width, 700)
+            view.layout()
+            self.assert_form_layout(view)
+        answer = fake["dialogs"].ANSWERS.pop(0) if fake["dialogs"].ANSWERS else None
+        if answer is None:
+            view.cancel()
+            return
+        for key, value in answer.items():
+            kind, widget = view.inputs[key]  # a key the form does not have fails here
+            if kind in ("switch", "check"):
+                widget.value = bool(value)
+            else:
+                widget.text = str(value)
+        view.submit()
+        self.assertTrue(view.closed)
+
+    def assert_form_layout(self, view):
+        width = view.width
+        for kind, item in view.blocks:
+            if kind != "card":
+                self.assertLessEqual(item.x + item.width, width)
+                continue
+            card, rows = item
+            self.assertLessEqual(card.x + card.width, width + 0.5)
+            bottom = 0
+            for field_kind, title, widget in rows:
+                self.assertGreaterEqual(title.y, bottom - 0.5, title.text)  # below the row above
+                self.assertGreater(title.height, 0, title.text)
+                if field_kind in ("switch", "check"):
+                    # beside its title, never on top of it
+                    self.assertLessEqual(widget.x + widget.width, title.x, title.text)
+                else:
+                    self.assertGreaterEqual(widget.y, title.y + title.height, title.text)
+                    self.assertGreaterEqual(widget.width, 200, title.text)
+                bottom = max(title.y + title.height, widget.y + widget.height)
+                self.assertLessEqual(bottom, card.height, title.text)
+                self.assertLessEqual(widget.x + widget.width, card.width, title.text)
 
     def answer(self, *dialog_answers, alerts=()):
         fake["dialogs"].ANSWERS[:] = list(dialog_answers)
@@ -291,7 +337,7 @@ class ScanFlowTests(AppTestCase):
         self.assertTrue(view.track.hidden and view.counter.hidden)  # nothing running
         self.assertRegex(view.clock_label.text, r"^\d+:\d\d$")
         self.assertIn("تأخیر کانفیگ", view.table_title.text)
-        self.assertFalse(view.table.hidden)
+        self.assertFalse(view.list_card.hidden)
         for i, (icon, name, detail) in enumerate(view.step_views[:-1]):
             below = view.step_views[i + 1][1]
             self.assertLessEqual(detail.y + detail.height, below.y)  # no overlapping text
@@ -348,6 +394,57 @@ class ScanFlowTests(AppTestCase):
         self.assertEqual(chips[1].text_color, app.WARN)   # Irancell 480
         self.assertIn("ایرانسل ✓ کُند", card.summary.text)
 
+    def test_the_list_shows_waiting_measuring_and_measured_addresses(self):
+        self.ready()
+        self.store.update_settings({"good_ping_ms": 400})
+        view = app.ScanView(self.app, [self.store.selected["id"]], "mci", "auto")
+        view.frame = (0, 0, 375, 760)
+        view.step(2, "run")
+        view.found([
+            {"ip": "104.16.0.1", "attempts": 6, "ok": 6, "delay": 212.0, "jitter": 9.0,
+             "loss": 0.0, "colo": "FRA", "errors": []},
+            {"ip": "104.16.0.2", "attempts": 6, "ok": 6, "delay": 640.0, "jitter": 30.0,
+             "loss": 0.0, "colo": "AMS", "errors": []},
+            {"ip": "104.16.0.3", "attempts": 2, "ok": 0, "delay": None, "loss": 100.0,
+             "colo": "", "errors": ["timeout", "timeout"]},
+            {"ip": "104.16.0.4", "pending": "run"},
+            {"ip": "104.16.0.5", "pending": "wait"},
+        ])
+        rows = [r for r in view.row_views if not r.hidden]
+        self.assertEqual([r.left.text for r in rows],
+                         ["104.16.0.%d" % i for i in range(1, 6)])
+        self.assertEqual([r.right.text.replace("‏", "") for r in rows],
+                         ["212ms", "640ms", "✕ جواب نداد", "در حال تست…", "در صف"])
+        self.assertEqual([r.right.text_color for r in rows[:4]],
+                         [app.GOOD, app.WARN, app.BAD, app.ACCENT])
+        self.assertIn("نوسان ±9 · افت 0% · FRA", rows[0].detail.text)
+        self.assertIn("timeout", rows[2].detail.text)
+        self.assertIn("تست اصلی", view.table_title.text)
+        for i, r in enumerate(rows):  # stacked, inside the card, nothing overlapping
+            self.assertEqual(r.y, i * view.row_height)
+            self.assertLessEqual(r.left.x + r.left.width, r.right.x + 0.5)
+            self.assertLessEqual(r.detail.y + r.detail.height, r.height)
+            self.assertLessEqual(r.right.x + r.right.width, view.list_card.width)
+        # a waiting row does nothing when tapped; fewer rows hide the rest
+        view.tapped_row(rows[4].tap)
+        view.found([{"ip": "104.16.0.1", "pending": "wait"}])
+        self.assertEqual(len([r for r in view.row_views if not r.hidden]), 1)
+
+    def test_the_fast_pass_list_says_it_is_only_reachability(self):
+        self.ready()
+        view = app.ScanView(self.app, [self.store.selected["id"]], "mci", "auto")
+        view.frame = (0, 0, 375, 760)
+        view.step(1, "run")
+        view.note_scope(5957, True)
+        self.assertIn("کل رنج کلادفلر: 5957 IP", view.step_views[1][2].text)
+        view.found([{"ip": "104.16.0.1", "ok": True, "tcp": 30.0, "total": 180.0, "colo": "FRA"}])
+        row = view.row_views[0]
+        self.assertEqual(row.right.text, "‏✓ FRA")
+        self.assertIn("فقط دسترسی · پاسخ در 180ms", row.detail.text)
+        view.phase_started = time.time() - 60
+        view.progress(1000, 5957, 40)
+        self.assertIn("1000 از 5957 IP · 40 جواب داد · حدود 5 دقیقه مانده", view.counter.text)
+
     def test_stopping_marks_the_running_step(self):
         self.ready()
         view = app.ScanView(self.app, [self.store.selected["id"]], "mci", "auto")
@@ -391,7 +488,8 @@ class ScanFlowTests(AppTestCase):
         view = self.scan(every=True)
         self.assertEqual([r["kind"] for _, r in view.summary], ["applied", "applied"])
         self.assertIn("2 از 2", view.outcome.text)
-        self.assertEqual(len(view.ds.items), 2)
+        self.assertEqual(len(view.rows), 2)
+        self.assertEqual([r.right.text for r in view.row_views if not r.hidden], ["‏✓", "‏✓"])
 
     def test_stop_in_the_middle_changes_nothing(self):
         self.ready()
@@ -430,9 +528,8 @@ class ScanFlowTests(AppTestCase):
     def test_tapping_a_result_row(self):
         self.ready()
         view = self.scan()
-        view.ds.selected_row = 0
         self.answer("کپی IP")
-        view.row_tapped(view.ds)
+        view.tapped_row(view.row_views[0].tap)
         self.assertEqual(fake["clipboard"].DATA[0], view.rows[0]["ip"])
 
 
@@ -460,12 +557,56 @@ class MenuTests(AppTestCase):
             self.answer(index, None, None)
             self.app.open_settings()
         self.assertEqual(self.store.servers[0]["name"], "آلمان")
+        # every form is ours (titles above inputs), none is Pythonista's form_dialog
+        self.assertEqual([f.name for f in self.forms],
+                         ["سرور CDN", "کلادفلر", "پیشرفته"])  # the lists were cancelled
+        self.assertFalse([e for e in fake["dialogs"].LOG if e[0] == "form" and e[2] is not None])
+
+    def test_advanced_settings_are_saved_from_the_form(self):
+        self.ready()
+        self.answer({"good_ping_ms": "450", "full_range": False, "verify_top": "12"})
+        self.app.edit_advanced()
+        s = self.store.settings
+        self.assertEqual((s["good_ping_ms"], s["full_range"], s["verify_top"]), (450, False, 12))
+        self.assertEqual(s["timeout"], 2.0)  # untouched fields keep their value
+        form = self.forms[-1]
+        self.assertEqual(form.inputs["good_ping_ms"][1].keyboard_type, fake["ui"].KEYBOARD_DECIMAL_PAD)
+        self.assertEqual(form.inputs["full_range"][0], "switch")
+
+    def test_a_bad_value_brings_the_form_back_with_a_reason(self):
+        self.ready()
+        self.answer({"timeout": "99"}, None)
+        self.app.edit_advanced()
+        self.assertEqual(self.alerts()[-1][1], "مقدار نامعتبر")
+        self.assertEqual(len(self.forms), 2)  # shown again, then cancelled
+        self.assertEqual(self.store.settings["timeout"], 2.0)
+
+    def test_the_token_field_is_hidden_and_the_name_is_right_to_left(self):
+        sid = self.ready()
+        self.answer(None)
+        self.app.edit_token()
+        self.assertTrue(self.forms[-1].inputs["token"][1].secure)
+        self.answer(None)
+        self.app.edit_server(sid)
+        name = self.forms[-1].inputs["name"][1]
+        self.assertEqual((name.text, name.alignment), ("آلمان", fake["ui"].ALIGN_RIGHT))
+        self.assertEqual(self.forms[-1].inputs["sni"][1].alignment, fake["ui"].ALIGN_LEFT)
+
+    def test_the_form_moves_above_the_keyboard(self):
+        self.ready()
+        form = app.FormView("پیشرفته", [("اسکن", [app.text_field("ttl", "TTL", 60, "number")])])
+        form.frame = (0, 0, 390, 844)
+        form.keyboard_frame_did_change((0, 500, 390, 344))
+        self.assertEqual(form.scroll.height, 500)
+        form.keyboard_frame_did_change((0, 844, 390, 344))  # hidden again
+        self.assertEqual(form.scroll.height, 844)
 
     def test_networks_can_be_edited(self):
         self.ready()
         self.answer(2, {"name": "خانگی", "home": True, "asns": "58224, 31549", "delete": False}, None)
         self.app.manage_networks()
         self.assertEqual(self.store.network("home")["asns"], [58224, 31549])
+        self.assertEqual(self.forms[-1].name, "خانگی")
 
     def test_server_edit_keeps_records_apart(self):
         sid = self.ready()

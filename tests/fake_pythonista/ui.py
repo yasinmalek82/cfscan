@@ -6,6 +6,11 @@ is drawn. Only what the app uses exists, so a typo in the app fails here.
 
 ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT = 0, 1, 2
 AUTOCAPITALIZE_NONE = 0
+KEYBOARD_DEFAULT, KEYBOARD_URL, KEYBOARD_DECIMAL_PAD = 0, 3, 8
+
+#: Called with a view when it waits as a modal (a form); a test fills it in
+#: and presses a button there. Without one, the form is cancelled.
+MODAL_HOOK = None
 
 
 class View:
@@ -47,6 +52,14 @@ class View:
 
     def present(self, *args, **kwargs):
         self.presented = True
+        self.presented_with = (args, kwargs)
+
+    def close(self):
+        self.closed = True
+
+    def wait_modal(self):
+        if MODAL_HOOK is not None:
+            MODAL_HOOK(self)
 
 
 class Label(View):
@@ -60,6 +73,11 @@ class Button(View):
 
 class TextField(View):
     text = ""
+
+
+class Switch(View):
+    value = False
+    enabled = True
 
 
 class TextView(View):
@@ -113,3 +131,7 @@ def delay(fn, seconds):
 
 def get_ui_style():
     return "light"
+
+
+def get_screen_size():
+    return (390.0, 844.0)

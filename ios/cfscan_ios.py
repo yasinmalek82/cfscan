@@ -37,6 +37,7 @@ so it is unit tested on a computer (``tests/test_ios_app.py``).
 
 from __future__ import annotations
 import base64
+import collections
 import copy
 import faulthandler
 import http.client
@@ -108,11 +109,12 @@ DEFAULT_SETTINGS = {
     "ips_per_record": 2,
     "auto_apply": True,
     "fresh_hours": 48,      # how long a result counts for the other network of a group
-    "candidates": 500,
+    "full_range": True,     # fast pass: one address from every /24 of every range (IPv4)
+    "candidates": 500,      # without full_range: this many addresses
     "workers": 32,
     "timeout": 2.0,
-    "stop_after": 25,       # stop the fast pass after this many answers (0 = all)
-    "verify_top": 6,
+    "stop_after": 25,       # without full_range: stop after this many answers (0 = all)
+    "verify_top": 10,       # the fastest answers measured for real, with the config
     "verify_attempts": 6,
     "max_loss_pct": 0,
     "max_ping_ms": 1500,    # slowest config delay that still counts as healthy
@@ -329,6 +331,13 @@ def _as_list(value):
     return value if isinstance(value, list) else []
 
 
+#: A full sweep of a network is reused (its answering addresses only) this long.
+SWEEP_REUSE_S = 20 * 60
+
+#: The data file layout; see :func:`normalise_data`.
+DATA_VERSION = 6
+
+
 def normalise_data(raw):
     """A complete version-5 document from whatever was stored.
 
@@ -337,7 +346,8 @@ def normalise_data(raw):
     * 1: one CDN domain in the settings, carriers as ``profiles``;
     * 2: servers with a record per carrier, per-carrier good/bad memory;
     * 3: one app-wide ``ip1``/``ip2`` record, one coverage table;
-    * 4: ``record``/``record2`` per server, one coverage table.
+    * 4: ``record``/``record2`` per server, one coverage table;
+    * 5: like 6, with the old shortlist of 6 (now 10) addresses.
 
     Records become ``record_mobile``/``record_home``; the one coverage table
     is copied to every server without its numbers (they were not taken
@@ -348,7 +358,7 @@ def normalise_data(raw):
         version = int(raw.get("version") or (1 if "profiles" in raw else 5))
     except (TypeError, ValueError):
         version = 5
-    version = min(max(version, 1), 5)
+    version = min(max(version, 1), DATA_VERSION)
     raw_settings = _as_dict(raw.get("settings"))
 
     settings = dict(DEFAULT_SETTINGS)
@@ -358,6 +368,8 @@ def normalise_data(raw):
                 settings[key] = _coerce(key, value)
             except (TypeError, ValueError):
                 pass
+    if version < 6 and settings["verify_top"] == 6:
+        settings["verify_top"] = DEFAULT_SETTINGS["verify_top"]  # the old default
     if version < 4 and raw_settings.get("max_ping_ms") in (800, "800"):
         settings["max_ping_ms"] = DEFAULT_SETTINGS["max_ping_ms"]  # was a TCP ping limit
     if version == 2 and not settings["zone_id"]:
@@ -466,7 +478,7 @@ def normalise_data(raw):
 
     net_ids = [n["id"] for n in networks]
     return {
-        "version": 5,
+        "version": DATA_VERSION,
         "settings": settings,
         "servers": servers,
         "networks": networks,
@@ -524,6 +536,7 @@ class Store:
         self.secrets = secrets or Secrets()
         self.lock = threading.RLock()
         self.recovered = ""
+        self._sweeps = {}
         raw = {}
         try:
             with open(path, encoding="utf-8") as fh:
@@ -767,6 +780,17 @@ class Store:
                 bad[ip] = now
             if len(bad) > BAD_LIMIT:
                 self.data["bad"][nid] = dict(sorted(bad.items(), key=lambda kv: -kv[1])[:BAD_LIMIT])
+
+    def recent_sweep(self, nid, max_age_s):
+        """``(when, reachable addresses)`` of this network's last full sweep,
+        if it is recent; kept in memory only."""
+        entry = self._sweeps.get(nid)
+        if entry and time.time() - entry[0] < max_age_s and entry[1]:
+            return entry
+        return None
+
+    def remember_sweep(self, nid, reachable):
+        self._sweeps[nid] = (time.time(), list(reachable))
 
     def clear_bad(self):
         with self.lock:
@@ -1252,6 +1276,47 @@ def neighbours(ip, rng, count):
         if addr != ip and addr not in picks:
             picks.append(addr)
     return picks
+
+
+def sweep_candidates(ranges, rng=random, first=(), exclude=(), bad=()):
+    """``first``, then one random address from every /24 of the IPv4 ``ranges``.
+
+    Whether Cloudflare answers from an address depends mostly on its /24,
+    so this covers the whole range in about 6000 tries. The /24s come in a
+    random order so a stopped sweep still saw every range.
+    """
+    seen = set(exclude)
+    out = []
+    for ip in first:
+        if ip not in seen and ":" not in ip:
+            seen.add(ip)
+            out.append(ip)
+    covered = {ip.rsplit(".", 1)[0] for ip in out}
+    blocks = []
+    for r in ranges:
+        net = ipaddress.ip_network(r, strict=False)
+        if net.version != 4:
+            continue
+        if net.prefixlen >= 24:
+            blocks.append(net.supernet(new_prefix=24) if net.prefixlen > 24 else net)
+        else:
+            blocks.extend(net.subnets(new_prefix=24))
+    rng.shuffle(blocks)
+    bad = set(bad)
+    for block in blocks:
+        prefix = str(block.network_address).rsplit(".", 1)[0]
+        if prefix in covered:
+            continue
+        covered.add(prefix)
+        for _ in range(3):
+            ip = "%s.%d" % (prefix, rng.randrange(1, 255))
+            if ip not in seen and ip not in bad:
+                break
+        if ip in seen:
+            continue
+        seen.add(ip)
+        out.append(ip)
+    return out
 
 
 def build_candidates(state, count, version, ranges, rng=random, now=None,
@@ -1873,6 +1938,10 @@ class Events:
     def found(self, rows):
         pass
 
+    def note_scope(self, count, sweep):
+        """How many addresses the fast pass will try, and whether that is the
+        whole range."""
+
     def note(self, text):
         pass
 
@@ -2023,16 +2092,38 @@ class ScanJob:
         # 2. scan: what works for this server on the group's other network first
         self.events.step(1, "run")
         seeds = self._seeds(group_nets, window, current)
+        sweep = bool(s["full_range"]) and version == 4
+        own = {ip: {"ts": c[self.nid].get("ts", 0)} for ip, c in store.cells_copy(self.sid).items()
+               if (c.get(self.nid) or {}).get("ok")}
         if self.fixed_candidates is not None:
             cands = list(self.fixed_candidates)
+        elif sweep and store.recent_sweep(self.nid, SWEEP_REUSE_S):
+            # the whole range was swept here minutes ago: which /24s answer
+            # does not depend on the server, so only those answers are retried
+            known = [ip for ip, _ in sorted(own.items(), key=lambda kv: -kv[1]["ts"])]
+            when, reachable = store.recent_sweep(self.nid, SWEEP_REUSE_S)
+            cands = [ip for ip in dict.fromkeys(known + seeds + reachable) if ip not in current]
+            self.events.note("کل رنج %s روی همین اینترنت اسکن شده بود؛ فقط %d IP جواب‌داده "
+                             "دوباره تست می‌شوند." % (ago(when), len(reachable)))
+            sweep = False
+        elif sweep:
+            known = [ip for ip, _ in sorted(own.items(), key=lambda kv: -kv[1]["ts"])]
+            now = self.clock()
+            bad_ttl = float(s["bad_ttl_hours"]) * 3600
+            recent_bad = [ip for ip, ts in store.bad_for(self.nid).items() if now - ts < bad_ttl]
+            cands = sweep_candidates(store.ranges(4), self.rng, first=known + seeds,
+                                     exclude=current, bad=recent_bad)
         else:
-            own = {ip: {"ts": c[self.nid].get("ts", 0)} for ip, c in store.cells_copy(self.sid).items()
-                   if (c.get(self.nid) or {}).get("ok")}
             cands = build_candidates({"good": own, "bad": store.bad_for(self.nid)},
                                      int(s["candidates"]), version, store.ranges(version),
                                      rng=self.rng, bad_ttl_s=float(s["bad_ttl_hours"]) * 3600,
                                      exclude=current, shared=seeds)
-        answered, scanned, failed, errors = self._fast_pass(cands, target, ctx, s)
+        full = bool(s["full_range"]) and version == 4
+        self.events.note_scope(len(cands), sweep)
+        answered, scanned, failed, errors = self._fast_pass(cands, target, ctx, s,
+                                                            stop_after=0 if full else None)
+        if sweep and not self.cancelled and scanned == len(cands):
+            store.remember_sweep(self.nid, [r["ip"] for r in answered])
         result["scanned"], result["answered"] = scanned, len(answered)
         result["errors"] = error_summary(errors)
         locs = {r["loc"] for r in answered if r.get("loc")}
@@ -2065,7 +2156,7 @@ class ScanJob:
         # 3. careful measure of the shortlist, then the rules
         self.events.step(2, "run")
         verify_top = int(s["verify_top"])
-        top = sorted(answered, key=lambda r: r["tcp"])[:verify_top]
+        top = sorted(answered, key=self._rank)[:verify_top]
         seeded = [r for r in answered if r["ip"] in seeds and r not in top][:verify_top]
         colo_of = {r["ip"]: r["colo"] for r in answered}
         ms = self._measure_many([r["ip"] for r in top + seeded], target, ctx,
@@ -2199,14 +2290,21 @@ class ScanJob:
             self.store.record_result(self.sid, m["ip"], self.nid, self._ok(m), m.get("delay"),
                                      m.get("colo", ""))
 
-    def _fast_pass(self, cands, target, ctx, s):
-        queue = list(cands)
+    @staticmethod
+    def _rank(r):
+        """Shortlist order: the whole answer (TCP, TLS through any filter, the
+        request), which says more than the TCP connect alone."""
+        return r.get("total") if r.get("total") is not None else (r.get("tcp") or 0) * 3
+
+    def _fast_pass(self, cands, target, ctx, s, stop_after=None):
+        queue = collections.deque(cands)
         total = len(queue)
         lock = threading.Lock()
         answered, failed, errors = [], [], []
         counters = {"done": 0, "last_emit": 0.0}
         colos = parse_colos(s["colos"])
-        stop_after = int(s["stop_after"])
+        stop_after = int(s["stop_after"]) if stop_after is None else stop_after
+        shown = max(8, int(s["verify_top"]))
         timeout = float(s["timeout"])
 
         def worker():
@@ -2214,7 +2312,7 @@ class ScanJob:
                 with lock:
                     if not queue or (stop_after and len(answered) >= stop_after):
                         return
-                    ip = queue.pop(0)
+                    ip = queue.popleft()
                 r = _safe_probe(self.probe_trace, ip, target, ctx, timeout)
                 with lock:
                     counters["done"] += 1
@@ -2229,7 +2327,7 @@ class ScanJob:
                     emit = now - counters["last_emit"] > 0.25
                     if emit:
                         counters["last_emit"] = now
-                        top = sorted(answered, key=lambda x: x["tcp"])[:8]
+                        top = sorted(answered, key=self._rank)[:shown]
                 if emit:
                     self.events.progress(done, total, found)
                     self.events.found(top)
@@ -2242,7 +2340,7 @@ class ScanJob:
         for t in threads:
             t.join()
         self.events.progress(counters["done"], total, len(answered))
-        self.events.found(sorted(answered, key=lambda x: x["tcp"])[:8])
+        self.events.found(sorted(answered, key=self._rank)[:shown])
         return answered, counters["done"], failed, errors
 
     def _measure_many(self, ips, target, ctx, attempts, use_ws):
@@ -2252,23 +2350,38 @@ class ScanJob:
         gate = threading.Semaphore(self.CALM_WORKERS)
         lock = threading.Lock()
         total = len(ips)
+        states = ["wait"] * total
+
+        def rows():
+            """Finished ones best first, then the ones measuring, then waiting."""
+            done = sorted((x for x in out if x is not None), key=score)
+            busy = [{"ip": ip, "pending": st} for ip, st in zip(ips, states) if st == "run"]
+            wait = [{"ip": ip, "pending": st} for ip, st in zip(ips, states) if st == "wait"]
+            return done + busy + wait
+
         if total:
             self.events.progress(0, total, 0)
+            self.events.found(rows())
 
         def one(i, ip):
             with gate:
                 if self.cancelled:
                     return
+                with lock:
+                    states[i] = "run"
+                    snapshot = rows()
+                self.events.found(snapshot)
                 m = measure(ip, target, ctx, attempts, timeout, use_ws,
                             cancel=self.cancel_event, probe_trace=self.probe_trace,
                             probe_ws=self.probe_ws, warmup=True)
             with lock:
                 out[i] = m
+                states[i] = "done"
                 done = [x for x in out if x is not None]
                 good = sum(1 for x in done if self._ok(x))
-                rows = sorted(done, key=score)
+                snapshot = rows()
             self.events.progress(len(done), total, good)
-            self.events.found(rows)
+            self.events.found(snapshot)
 
         threads = [threading.Thread(target=one, args=(i, ip), name="verify-%d" % i, daemon=True)
                    for i, ip in enumerate(ips)]
@@ -2829,6 +2942,63 @@ if ui is not None:
         seconds = int(max(0, seconds))
         return "%d:%02d" % (seconds // 60, seconds % 60)
 
+    def row_parts(row, settings):
+        """``(left, right, right colour, detail)`` for one line of the scan list."""
+        good_ms = float(settings.get("good_ping_ms") or 0)
+        ip = row.get("ip", "")
+        if row.get("summary"):
+            return (row["title"], "✓" if row["good"] else "✕", GOOD if row["good"] else BAD,
+                    row["text"])
+        if row.get("pending") == "run":
+            return ip, "در حال تست…", ACCENT, "چند بار، با همین سرور"
+        if row.get("pending"):
+            return ip, "در صف", MUTED, ""
+        if "attempts" in row:
+            if row.get("delay") is None:
+                return ip, "✕ جواب نداد", BAD, error_summary(row.get("errors") or [], 1)
+            healthy = is_healthy(row, settings["max_loss_pct"], settings["max_ping_ms"])
+            colour = BAD if not healthy else (
+                WARN if good_ms and row["delay"] > good_ms else GOOD)
+            detail = "نوسان ±%.0f · افت %.0f%%" % (row.get("jitter") or 0, row.get("loss") or 0)
+            if row.get("colo"):
+                detail += " · " + row["colo"]
+            return ip, "%.0fms" % row["delay"], colour, detail
+        detail = "فقط دسترسی"
+        if row.get("total") is not None:
+            detail += " · پاسخ در %.0fms" % row["total"]
+        return ip, "✓ %s" % (row.get("colo") or ""), NEUTRAL, detail
+
+    class ResultRow(ui.View):
+        """One line of the scan list; reused, only its texts change."""
+
+        def __init__(self, on_tap):
+            self.left = make_label("", 15, mono=True, align="left")
+            self.right = make_label("", 14, bold=True, align="right")
+            self.detail = make_label("", 11, color=MUTED, align="right", lines=2)
+            self.line = ui.View()
+            self.line.background_color = LINE
+            self.tap = ui.Button()
+            self.tap.action = on_tap
+            for v in (self.left, self.right, self.detail, self.line, self.tap):
+                self.add_subview(v)
+
+        def show(self, parts, index, summary=False):
+            left, right, colour, detail = parts
+            self.left.text = left if not summary else fa(left)
+            self.left.font = ("<System-Bold>", 14) if summary else ("Menlo", 15)
+            self.right.text = fa(right)
+            self.right.text_color = colour
+            self.detail.text = fa(detail) if detail else ""
+            self.tap.name = str(index)
+
+        def layout(self):
+            w, h = self.width, self.height
+            self.left.frame = (14, 6, w * 0.58, 22)
+            self.right.frame = (w * 0.58 + 14, 6, max(0, w * 0.42 - 28), 22)
+            self.detail.frame = (14, 28, max(0, w - 28), h - 32)
+            self.line.frame = (14, h - 1, max(0, w - 28), 1)
+            self.tap.frame = (0, 0, w, h)
+
     class ScanView(ui.View):
         """Runs one job per server on one network; implements :class:`Events`.
 
@@ -2896,18 +3066,10 @@ if ui is not None:
             self.notes.corner_radius = 12
             self.notes.hidden = True
             self.table_title = make_label("", 14, bold=True)
-            self.table = ui.TableView()
-            self.table.corner_radius = 16
-            self.table.border_width = 1
-            self.table.border_color = LINE
-            self.table.row_height = 40
-            self.table.background_color = CARD
-            self.ds = ui.ListDataSource([])
-            self.ds.font = ("Menlo", 13)
-            self.ds.text_color = INK
-            self.ds.action = self.row_tapped
-            self.table.data_source = self.table.delegate = self.ds
-            for v in (self.outcome, self.notes, self.table_title, self.table):
+            self.list_card = make_card()
+            self.row_views = []
+            self.row_height = 50
+            for v in (self.outcome, self.notes, self.table_title, self.list_card):
                 self.scroll.add_subview(v)
 
             self.stop_btn = make_button("توقف", self.tapped_stop, color=BAD)
@@ -2972,12 +3134,12 @@ if ui is not None:
                 detail.text = ""
             self.phase = -1
             self.phase_state = {}
+            self.phase_started = time.time()
             self.fraction = 0.0
             self.counter.text = ""
             self.track.hidden = self.counter.hidden = True
-            self.rows = []
-            self.ds.items = []
             self.table_title.text = ""
+            self._show_rows([])
             self.job = ScanJob(store, sid, self.nid, events=self, mode=self.mode)
             self.layout()
             threading.Thread(target=self.job.run, name="job", daemon=True).start()
@@ -3024,11 +3186,15 @@ if ui is not None:
             if self.table_title.text:
                 self.table_title.frame = (pad, y, inner, 22)
                 y += 28
-            self.table.hidden = not self.ds.items
-            if self.ds.items:
-                table_h = len(self.ds.items) * self.table.row_height
-                self.table.frame = (pad, y, inner, table_h)
-                y += table_h + 20
+            shown = [r for r in self.row_views if not r.hidden]
+            self.list_card.hidden = not shown
+            if shown:
+                list_h = len(shown) * self.row_height
+                self.list_card.frame = (pad, y, inner, list_h)
+                for i, r in enumerate(shown):
+                    r.frame = (0, i * self.row_height, inner, self.row_height)
+                    r.layout()
+                y += list_h + 20
             self.scroll.content_size = (w, y)
             by = h - bottom + 12
             if self.stop_btn.hidden:
@@ -3060,13 +3226,13 @@ if ui is not None:
                 self.track.hidden = self.counter.hidden = index == 3
                 det.text = fa(detail or STEP_HINTS[index])
                 det.text_color = MUTED
+                self.phase_started = time.time()
                 if index in (1, 2):
-                    self.rows = []
-                    self.ds.items = []
+                    self._show_rows([])
                 self.table_title.text = fa({
                     0: "IPهای فعلی رکورد · %s" % self._target_label(),
-                    1: "سریع‌ترین جواب‌ها (فقط دسترسی، هنوز تأخیر نه)",
-                    2: "%s · نوسان · افت · دیتاسنتر" % self._target_label(),
+                    1: "سریع‌ترین جواب‌ها تا الان (فقط دسترسی، هنوز تأخیر کانفیگ نه)",
+                    2: "تست اصلی: %s" % self._target_label(),
                 }.get(index, self.table_title.text))
             else:
                 if index == self.phase:
@@ -3081,16 +3247,42 @@ if ui is not None:
             self.fill.width = self.track.width * self.fraction
             if self.phase == 1:
                 text = "%d از %d IP · %d جواب داد" % (done, total, found)
+                spent = time.time() - self.phase_started
+                if 0 < done < total and spent > 5:
+                    left = (total - done) * spent / done
+                    text += " · حدود %s مانده" % (
+                        "%d دقیقه" % round(left / 60) if left >= 90 else "%d ثانیه" % left)
             else:
                 text = "%d از %d IP · %d سالم" % (done, total, found)
             self.counter.text = fa(text)
 
         @on_main_thread
-        def found(self, rows):
-            self.rows = list(rows)
-            self.ds.items = [format_measure_row(r) if "attempts" in r else format_trace_row(r)
-                             for r in rows]
+        def note_scope(self, count, sweep):
+            detail = self.step_views[1][2]
+            if sweep:
+                detail.text = fa("کل رنج کلادفلر: %d IP (یکی از هر /24)؛ چند دقیقه طول می‌کشد"
+                                 % count)
+            else:
+                detail.text = fa("%d IP" % count)
             self.layout()
+
+        @on_main_thread
+        def found(self, rows):
+            self._show_rows(rows)
+            self.layout()
+
+        def _show_rows(self, rows, summary=False):
+            """Fill the list, reusing the row views."""
+            self.rows = list(rows)
+            settings = self.app.store.settings
+            while len(self.row_views) < len(self.rows):
+                row = ResultRow(self.tapped_row)
+                self.row_views.append(row)
+                self.list_card.add_subview(row)
+            for i, view in enumerate(self.row_views):
+                view.hidden = i >= len(self.rows)
+                if not view.hidden:
+                    view.show(row_parts(self.rows[i], settings), i, summary)
 
         @on_main_thread
         def note(self, text):
@@ -3107,6 +3299,8 @@ if ui is not None:
             kind = result.get("kind")
             if result.get("hint") or (kind in ("error", "apply_failed") and result.get("message")):
                 self.note(result.get("hint") or result["message"])
+            if kind in ("stopped", "error"):
+                self._show_rows([r for r in self.rows if not r.get("pending")])
             if kind == "stopped":
                 for i, (icon, name, detail) in enumerate(self.step_views):
                     if self.phase_state.get(i) == "run":
@@ -3135,13 +3329,13 @@ if ui is not None:
             if self.batch:
                 lines, good = [], 0
                 for sid, r in self.summary:
-                    good += r.get("kind") in GOOD_KINDS
-                    lines.append(fa("%s: %s" % (store.server(sid)["name"],
-                                                result_line(r, store).replace("\n", " · "))))
-                self.rows = []
-                self.ds.items = lines
-                self.ds.font = ("<System>", 13)
-                self.table.row_height = 60
+                    ok = r.get("kind") in GOOD_KINDS
+                    good += ok
+                    lines.append({"summary": True, "title": store.server(sid)["name"],
+                                  "good": ok,
+                                  "text": result_line(r, store).replace("\n", " · ")})
+                self.row_height = 64
+                self._show_rows(lines, summary=True)
                 self.table_title.text = fa("نتیجهٔ همهٔ سرورها")
                 self._show_outcome("%d از %d سرور درست است" % (good, len(self.summary)),
                                    good == len(self.summary))
@@ -3223,11 +3417,17 @@ if ui is not None:
             self.layout()
             self.app.main.refresh()
 
-        def row_tapped(self, ds):
-            index = ds.selected_row
-            if self.running or self.batch or index < 0 or index >= len(self.rows):
+        def tapped_row(self, sender):
+            try:
+                index = int(sender.name)
+            except (TypeError, ValueError):
                 return
-            run_bg(self.app.address_menu, self.rows[index]["ip"], self.sids[0])
+            if self.running or self.batch or not 0 <= index < len(self.rows):
+                return
+            row = self.rows[index]
+            if row.get("pending") or not row.get("ip"):
+                return
+            run_bg(self.app.address_menu, row["ip"], self.sids[0])
 
     class ListView(ui.View):
         """A titled, read-only list of lines."""
@@ -3247,6 +3447,142 @@ if ui is not None:
 
         def layout(self):
             self.table.frame = (0, 0, self.width, self.height)
+
+    # ------------------------------------------------------------------ forms
+
+    class FormView(ui.View):
+        """A settings form: every title on its own line, its input under it.
+
+        Pythonista's ``dialogs.form_dialog`` puts each input beside its title,
+        measured for left-to-right text; on a phone set to Persian the title
+        sits on the right and the typed value ends up under it. This form
+        stacks them, so nothing can overlap, whatever the language or width.
+
+        ``sections``: ``(header, fields[, footer])`` like ``form_dialog``;
+        field types ``text``, ``number``, ``password``, ``url`` and
+        ``switch``. :meth:`run` blocks (call it off the main thread) and
+        returns ``{key: text or bool}``, or None when cancelled.
+        """
+
+        PAD = 16
+
+        def __init__(self, title, sections, done_title="ذخیره"):
+            self.name = title
+            self.background_color = BG
+            self.sections = sections
+            self.values = None
+            self.keyboard = 0
+            self.inputs = {}
+            self.blocks = []  # (kind, views) in order, for layout
+            self.scroll = ui.ScrollView()
+            self.scroll.always_bounce_vertical = True
+            self.add_subview(self.scroll)
+            for section in sections:
+                header, fields = section[0], section[1]
+                footer = section[2] if len(section) > 2 else ""
+                if header:
+                    label = make_label(header, 13, bold=True, color=MUTED, lines=0)
+                    self.scroll.add_subview(label)
+                    self.blocks.append(("head", label))
+                card = make_card()
+                self.scroll.add_subview(card)
+                rows = []
+                for f in fields:
+                    kind = f.get("type", "text")
+                    title = make_label(f.get("title", ""), 14, color=INK, lines=0)
+                    card.add_subview(title)
+                    if kind in ("switch", "check"):
+                        widget = ui.Switch()
+                        widget.value = bool(f.get("value"))
+                    else:
+                        widget = ui.TextField()
+                        widget.text = "" if f.get("value") is None else str(f.get("value"))
+                        widget.secure = kind == "password"
+                        widget.keyboard_type = {"number": ui.KEYBOARD_DECIMAL_PAD,
+                                                "url": ui.KEYBOARD_URL}.get(kind,
+                                                                           ui.KEYBOARD_DEFAULT)
+                        widget.autocorrection_type = False
+                        widget.spellchecking_type = False
+                        widget.autocapitalization_type = ui.AUTOCAPITALIZE_NONE
+                        widget.clear_button_mode = "while_editing"
+                        widget.bordered = False
+                        widget.background_color = BG
+                        widget.corner_radius = 10
+                        widget.text_color = INK
+                        widget.font = ("<System>", 16)
+                        widget.alignment = ui.ALIGN_RIGHT if f.get("rtl") else ui.ALIGN_LEFT
+                    card.add_subview(widget)
+                    self.inputs[f["key"]] = (kind, widget)
+                    rows.append((kind, title, widget))
+                self.blocks.append(("card", (card, rows)))
+                if footer:
+                    label = make_label(footer, 12, color=MUTED, lines=0)
+                    self.scroll.add_subview(label)
+                    self.blocks.append(("foot", label))
+            self.left_button_items = [ui.ButtonItem(title="انصراف", action=self.cancel)]
+            self.right_button_items = [ui.ButtonItem(title=done_title, action=self.submit)]
+
+        def layout(self):
+            w = self.width
+            pad = self.PAD
+            inner = w - 2 * pad
+            self.scroll.frame = (0, 0, w, max(0, self.height - self.keyboard))
+            y = 14
+            for index, (kind, item) in enumerate(self.blocks):
+                if kind in ("head", "foot"):
+                    h = text_height(item.text, inner - 8, 13 if kind == "head" else 12)
+                    item.frame = (pad + 4, y, inner - 8, h)
+                    y += h + (6 if kind == "head" else 18)
+                    continue
+                card, rows = item
+                cy = 12
+                for i, (field_kind, title, widget) in enumerate(rows):
+                    if field_kind in ("switch", "check"):
+                        tw = inner - 24 - 51 - 12
+                        th = max(31, text_height(title.text, tw, 14))
+                        title.frame = (12 + 51 + 12, cy, tw, th)
+                        widget.frame = (12, cy + (th - 31) / 2.0, 51, 31)
+                        cy += th + 14
+                    else:
+                        th = text_height(title.text, inner - 24, 14)
+                        title.frame = (12, cy, inner - 24, th)
+                        widget.frame = (12, cy + th + 4, inner - 24, 40)
+                        cy += th + 4 + 40 + 14
+                card.frame = (pad, y, inner, cy)
+                footer_next = index + 1 < len(self.blocks) and self.blocks[index + 1][0] == "foot"
+                y += cy + (8 if footer_next else 22)
+            self.scroll.content_size = (w, y + 24)
+
+        def keyboard_frame_did_change(self, frame):
+            """Keep the field being typed in above the keyboard."""
+            try:
+                screen_h = ui.get_screen_size()[1]
+            except Exception:
+                screen_h = frame[1] + frame[3]
+            self.keyboard = frame[3] if frame[3] > 0 and frame[1] < screen_h else 0
+            self.layout()
+
+        def collect(self):
+            return {key: (widget.value if kind in ("switch", "check") else widget.text or "")
+                    for key, (kind, widget) in self.inputs.items()}
+
+        def submit(self, sender=None):
+            self.values = self.collect()
+            self.close()
+
+        def cancel(self, sender=None):
+            self.values = None
+            self.close()
+
+        def run(self):
+            self.present("sheet", hide_close_button=True)
+            self.wait_modal()
+            return self.values
+
+    def ask_form(title, sections, done_title="ذخیره"):
+        """A :class:`FormView`; blocks until saved (the values) or cancelled (None)."""
+        return FormView(title, [s if isinstance(s, tuple) else tuple(s) for s in sections],
+                        done_title).run()
 
     # ------------------------------------------------------------------ the app
 
@@ -3434,7 +3770,7 @@ if ui is not None:
                 text_field("ips_per_record", "تعداد IP در هر رکورد (۱ تا ۳)", s["ips_per_record"], "number"),
                 {"type": "switch", "key": "auto_apply", "title": "اعمال خودکار", "value": s["auto_apply"]},
             ], "هر IP رکورد باید روی اینترنت‌های همان گروه سالم باشد؛ کلاینت هر کدام را ممکن است بردارد.")]
-            values = dialogs.form_dialog("کلادفلر", sections=sections, done_button_title="ذخیره")
+            values = ask_form("کلادفلر", sections)
             if values is None:
                 return
             raw = (values.pop("token", "") or "").strip()
@@ -3467,19 +3803,24 @@ if ui is not None:
                 text_field("min_gain_pct", "حداقل بهبود برای تعویض IP سالم (٪)", s["min_gain_pct"], "number"),
                 text_field("fresh_hours", "اعتبار نتیجهٔ هر اینترنت (ساعت)", s["fresh_hours"], "number"),
                 text_field("ttl", "TTL رکورد (ثانیه)", s["ttl"], "number"),
-                text_field("candidates", "تعداد کاندید", s["candidates"], "number"),
-                text_field("workers", "تست همزمان (اسکن سریع)", s["workers"], "number"),
+                {"type": "switch", "key": "full_range",
+                 "title": "اسکن کل رنج کلادفلر (یکی از هر /24، حدود ۶۰۰۰ IP)",
+                 "value": s["full_range"]},
+                text_field("verify_top", "تعداد برترها برای تست اصلی (تأخیر کانفیگ)",
+                           s["verify_top"], "number"),
+                text_field("verify_attempts", "دفعات تست اصلی برای هر IP", s["verify_attempts"], "number"),
+                text_field("workers", "تست همزمان در اسکن سریع", s["workers"], "number"),
                 text_field("timeout", "مهلت هر اتصال (ثانیه)", s["timeout"], "number"),
-                text_field("stop_after", "توقف بعد از N پاسخ (۰=همه)", s["stop_after"], "number"),
-                text_field("verify_top", "تعداد IP برای اندازه‌گیری دقیق", s["verify_top"], "number"),
-                text_field("verify_attempts", "تلاش برای هر IP", s["verify_attempts"], "number"),
+                text_field("candidates", "بدون اسکن کل رنج: تعداد IP", s["candidates"], "number"),
+                text_field("stop_after", "بدون اسکن کل رنج: توقف بعد از N جواب (۰=همه)",
+                           s["stop_after"], "number"),
                 text_field("colos", "فقط این دیتاسنترها (مثلاً FRA,AMS)", s["colos"]),
                 {"type": "switch", "key": "ip_version", "title": "IPv6 به جای IPv4",
                  "value": s["ip_version"] == 6},
                 text_field("bad_ttl_hours", "نادیده گرفتن IPهای بد (ساعت)", s["bad_ttl_hours"], "number"),
             ]
-            values = dialogs.form_dialog("پیشرفته", sections=[("اسکن", fields,
-                "پیش‌فرض‌ها برای بیشتر وقت‌ها مناسب‌اند.")], done_button_title="ذخیره")
+            values = ask_form("پیشرفته", [("اسکن", fields,
+                "پیش‌فرض‌ها برای بیشتر وقت‌ها مناسب‌اند.")])
             if values is None:
                 return
             values["ip_version"] = 6 if values.get("ip_version") else 4
@@ -3509,7 +3850,7 @@ if ui is not None:
                  "می‌شوند و تست دقیقاً مثل «real delay» کلاینت‌ها انجام می‌شود. فقط UUID در "
                  "Keychain ذخیره می‌شود. خالی = بدون تغییر، «-» = حذف."),
                 ("سرور", [
-                    text_field("name", "نام (مثلاً آلمان)", server["name"]),
+                    dict(text_field("name", "نام (مثلاً آلمان)", server["name"]), rtl=True),
                     text_field("sni", "دامنهٔ CDN (SNI)", server["sni"]),
                     text_field("path", "WebSocket path", server["path"]),
                     text_field("port", "پورت", server["port"], "number"),
@@ -3525,7 +3866,7 @@ if ui is not None:
             if sid:
                 sections.append(("", [{"type": "switch", "key": "delete", "title": "حذف این سرور",
                                        "value": False}]))
-            values = dialogs.form_dialog("سرور CDN", sections=sections, done_button_title="ذخیره")
+            values = ask_form("سرور CDN", sections)
             if values is None:
                 return
             if sid and values.get("delete"):
@@ -3599,13 +3940,13 @@ if ui is not None:
                 if index is None:
                     break
                 n = networks[index]
-                values = dialogs.form_dialog(n["name"], [
-                    text_field("name", "نام", n["name"]),
+                values = ask_form(n["name"], [("", [
+                    dict(text_field("name", "نام", n["name"]), rtl=True),
                     {"type": "switch", "key": "home", "title": "خانگی (نه موبایل)",
                      "value": n["group"] == "home"},
                     text_field("asns", "ASNها (با کاما)", ", ".join(str(a) for a in n["asns"])),
                     {"type": "switch", "key": "delete", "title": "حذف این اینترنت", "value": False},
-                ], done_button_title="ذخیره")
+                ])])
                 if values is None:
                     continue
                 if values.get("delete"):
