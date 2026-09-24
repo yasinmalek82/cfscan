@@ -70,7 +70,7 @@ except ImportError:
         return fn
 
 APP_NAME = "CF Scanner"
-APP_VERSION = "5.3"
+APP_VERSION = "5.4"
 
 try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -521,7 +521,49 @@ def normalise_data(raw):
         "history": history[-HISTORY_LIMIT:],
         "zones": raw.get("zones") if isinstance(raw.get("zones"), dict) else {},
         "ranges": raw.get("ranges") if isinstance(raw.get("ranges"), dict) else {},
+        "multi": {sid: m for sid, m in ((sid, _multi_session(m, net_ids))
+                                        for sid, m in _as_dict(raw.get("multi")).items()
+                                        if sid in ids) if m},
     }
+
+
+def _number(value, default=0):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+
+
+def _multi_session(raw, net_ids):
+    """A stored multi-carrier session with every odd value dropped, or None."""
+    raw = _as_dict(raw)
+    carriers = [str(n) for n in _as_list(raw.get("carriers")) if str(n) in net_ids]
+    carriers = list(dict.fromkeys(carriers))
+    if not carriers:
+        return None
+    rounds = {}
+    for nid, entry in _as_dict(raw.get("rounds")).items():
+        entry = _as_dict(entry)
+        if nid not in carriers:
+            continue
+        verified = []
+        for m in _as_list(entry.get("verified")):
+            m = _as_dict(m)
+            if not isinstance(m.get("ip"), str) or not m["ip"]:
+                continue
+            delay = m.get("delay")
+            verified.append({
+                "ip": m["ip"], "ok": int(_number(m.get("ok"))),
+                "attempts": int(_number(m.get("attempts"))),
+                "delay": delay if _number(delay, None) is not None and delay >= 0 else None,
+                "jitter": _number(m.get("jitter"), None),
+                "loss": float(_number(m.get("loss"), 100.0)),
+                "colo": m.get("colo") if isinstance(m.get("colo"), str) else ""})
+        rounds[nid] = {"ts": _number(entry.get("ts")), "scanned": int(_number(entry.get("scanned"))),
+                       "reachable": int(_number(entry.get("reachable"))), "verified": verified}
+    seed = raw.get("seed")
+    return {"id": str(raw.get("id") or ""), "carriers": carriers,
+            "seed": seed if isinstance(seed, int) and not isinstance(seed, bool) else 1,
+            "created": _number(raw.get("created")), "rounds": rounds,
+            "skipped": [str(n) for n in _as_list(raw.get("skipped"))
+                        if str(n) in net_ids and str(n) not in carriers]}
 
 
 class Secrets:
@@ -683,6 +725,7 @@ class Store:
         with self.lock:
             self.data["servers"] = [s for s in self.servers if s["id"] != sid]
             self.data["matrix"].pop(sid, None)
+            self.data["multi"].pop(sid, None)
             for group in GROUPS:
                 self.data["records"].pop(slot_key(sid, group), None)
             if self.data.get("server") == sid:
@@ -773,6 +816,11 @@ class Store:
                 for cells in table.values():
                     cells.pop(nid, None)
             self.data["bad"].pop(nid, None)
+            for sid, session in list(self.data["multi"].items()):
+                session["carriers"] = [n for n in session["carriers"] if n != nid]
+                session["rounds"].pop(nid, None)
+                if not session["carriers"]:
+                    del self.data["multi"][sid]
             if self.data["network"] == nid:
                 self.data["network"] = self.networks[0]["id"]
             self.save()
@@ -829,6 +877,49 @@ class Store:
     def clear_bad(self):
         with self.lock:
             self.data["bad"] = {}
+            self.save()
+
+    # -- multi-carrier sessions (cfscan's menu 10) -----------------------------
+
+    def multi_session(self, sid):
+        return self.data["multi"].get(sid)
+
+    def start_multi(self, sid, carriers, seed=None):
+        """A new session for ``sid``: these networks, in this order, one list."""
+        with self.lock:
+            session = {"id": "%x" % int(time.time()), "carriers": list(dict.fromkeys(carriers)),
+                       "seed": int(seed if seed is not None else random.randrange(1, 2 ** 31)),
+                       "created": time.time(), "rounds": {}, "skipped": []}
+            self.data["multi"][sid] = session
+            self.save()
+            return session
+
+    def add_round(self, sid, nid, scanned, reachable, ms):
+        """This network's round; a second round of the same network replaces it."""
+        keep = ("ip", "ok", "attempts", "delay", "jitter", "loss", "colo")
+        with self.lock:
+            session = self.data["multi"].get(sid)
+            if session is None:
+                return None
+            session["rounds"][nid] = {
+                "ts": time.time(), "scanned": int(scanned), "reachable": int(reachable),
+                "verified": [{k: m.get(k) for k in keep} for m in ms]}
+            self.save()
+            return session
+
+    def skip_carrier(self, sid, nid):
+        """Leave a carrier out of the session (it could not be reached now)."""
+        with self.lock:
+            session = self.data["multi"].get(sid)
+            if session and nid in session["carriers"] and len(session["carriers"]) > 1:
+                session["carriers"].remove(nid)
+                session["rounds"].pop(nid, None)
+                session.setdefault("skipped", []).append(nid)
+                self.save()
+
+    def clear_multi(self, sid):
+        with self.lock:
+            self.data["multi"].pop(sid, None)
             self.save()
 
     def clear_matrix(self):
@@ -2317,6 +2408,108 @@ def relevant_networks(store, group):
 
 # ---------------------------------------------------------------- scan engine
 
+# ---------------------------------------------------------------- several carriers
+#
+# cfscan's multi-carrier scan: one fixed candidate list measured on each
+# carrier in turn (the user switches SIM or Wi-Fi in between), then the
+# addresses that pass on every carrier, ranked by their worst case.
+
+#: Never verify more than this many addresses in one round (this carrier's own
+#: best plus everything earlier carriers proved), as cfscan's VERIFY_CAP.
+MULTI_VERIFY_CAP = 40
+
+
+def multi_pool(store, session):
+    """The session's candidate list: the same in every round (a stored seed)."""
+    return sweep_candidates(store.ranges(4), random.Random(session["seed"]))
+
+
+def multi_proved(session, settings):
+    """Addresses that passed in a finished round, for the next rounds to verify."""
+    out = []
+    for nid in session["carriers"]:
+        for m in (session["rounds"].get(nid) or {}).get("verified") or []:
+            if _passed(m, settings) and m["ip"] not in out:
+                out.append(m["ip"])
+    return out
+
+
+def _passed(m, settings):
+    return is_healthy(m, settings["max_loss_pct"], settings["max_ping_ms"])
+
+
+def multi_rows(session, settings):
+    """One row per address verified in the session, with a column per carrier."""
+    done = [nid for nid in session["carriers"] if nid in session["rounds"]]
+    rows, order = {}, []
+    for nid in done:
+        for m in session["rounds"][nid]["verified"]:
+            if m["ip"] not in rows:
+                rows[m["ip"]] = {"ip": m["ip"], "per": {}}
+                order.append(m["ip"])
+            rows[m["ip"]]["per"][nid] = dict(m, passed=_passed(m, settings))
+    out = []
+    for ip in order:
+        row = rows[ip]
+        passing = [nid for nid in done if (row["per"].get(nid) or {}).get("passed")]
+        delays = [row["per"][nid]["delay"] for nid in passing]
+        row.update(passing=passing, covered=len(passing), total=len(done),
+                   worst=max(delays) if delays else None,
+                   spread=max(delays) - min(delays) if delays else None)
+        out.append(row)
+    return out
+
+
+def multi_report(session, settings, count=1):
+    """Everything the report shows: works everywhere, coverage, best per carrier
+    and what to use (``recommend``: ``{"ips", "kind", "reason"}`` or None)."""
+    rows = multi_rows(session, settings)
+    done = [nid for nid in session["carriers"] if nid in session["rounds"]]
+    total = len(done)
+    common = sorted([r for r in rows if total and r["covered"] == total],
+                    key=lambda r: (r["worst"], r["spread"] or 0, r["ip"]))
+    coverage = sorted([r for r in rows if 0 < r["covered"] < total],
+                      key=lambda r: (-r["covered"], r["worst"], r["ip"]))
+    best = []
+    for nid in done:
+        passing = [m for m in session["rounds"][nid]["verified"] if _passed(m, settings)]
+        best.append((nid, min(passing, key=lambda m: (m["delay"], m["ip"])) if passing else None))
+    if common:
+        chosen = common[:max(1, int(count))]
+        recommend = {"ips": [r["ip"] for r in chosen], "kind": "common",
+                     "worst": max(r["worst"] for r in chosen),
+                     "reason": "روی همهٔ %d اینترنت سالم؛ بدترین حالت %.0fms"
+                               % (total, max(r["worst"] for r in chosen))}
+    elif coverage:
+        top = coverage[0]
+        recommend = {"ips": [top["ip"]], "kind": "coverage", "worst": top["worst"],
+                     "reason": "هیچ IPی روی همه سالم نبود؛ این یکی روی %d از %d سالم بود"
+                               % (top["covered"], total)}
+    else:
+        recommend = None
+    return {"rows": rows, "common": common, "coverage": coverage, "best": best,
+            "done": done, "total": total, "recommend": recommend}
+
+
+def apply_multi(store, sid, ips, groups=("mobile",), network="", via_ips=(),
+                api_factory=None):
+    """Point the server's records of ``groups`` at the session's choice.
+
+    Returns the records written. The session's own proof (passed on every
+    chosen carrier) replaces the single-network choice rules here.
+    """
+    server = store.server(sid)
+    written = []
+    for group in groups:
+        if not server.get("record_" + group):
+            continue
+        key = slot_key(sid, group)
+        extra = {"api_factory": api_factory} if api_factory is not None else {}
+        apply_record(store, key, list(ips), via_ips or ips, network, "multi", **extra)
+        written.append(key)
+    return written
+
+
 STEP_TITLES = ("بررسی IPهای فعلی رکورد", "پیدا کردن IPهای در دسترس",
                "بررسی دقیق برترها و انتخاب", "به‌روزرسانی DNS")
 
@@ -2361,8 +2554,9 @@ class ScanJob:
 
     def __init__(self, store, sid, nid, events=None, mode="auto", context_factory=make_context,
                  api_factory=CloudflareAPI, candidates=None, rng=None,
-                 probe_trace=http_ping, probe_ws=tunnel_ping, now=None):
+                 probe_trace=http_ping, probe_ws=tunnel_ping, now=None, round_of=None):
         self.store = store
+        self.round_of = round_of  # a multi-carrier session: this job is one of its rounds
         self.sid = sid
         self.nid = nid
         self.events = events or Events()
@@ -2418,6 +2612,8 @@ class ScanJob:
     # -- the steps -------------------------------------------------------
 
     def _run(self):
+        if self.round_of is not None:
+            return self._run_round()
         store = self.store
         s = store.settings
         server = store.server(self.sid)
@@ -2629,6 +2825,79 @@ class ScanJob:
             result["kind"] = "pending"
         else:
             self.apply(result)
+        return result
+
+    def _run_round(self):
+        """One carrier's round of a multi-carrier session (cfscan's menu 10).
+
+        The session's fixed list is swept, this carrier's own best and every
+        address earlier carriers proved are checked strictly, and the round is
+        stored. No record changes: that waits for the report of all rounds.
+        """
+        store = self.store
+        s = store.settings
+        session = self.round_of
+        server = store.server(self.sid)
+        if not server.get("sni"):
+            raise UserError("دامنهٔ CDN سرور «%s» خالی است" % server["name"])
+        target = store.target(server)
+        ctx = self.context_factory()
+        use_ws = target.kind != "trace"
+        result = {"kind": None, "server": self.sid, "network": self.nid, "round": True,
+                  "group": store.network(self.nid)["group"], "key": None, "record": "",
+                  "current": [], "ips": [], "verified": [], "unverified": [], "conflict": [],
+                  "warning": "", "scanned": 0, "answered": 0, "errors": "", "test": target.kind}
+        if target.kind != "vless":
+            self.events.note("لینک کانفیگ این سرور تنظیم نشده؛ عددها «تأخیر تا سرور» است، نه "
+                             "تأخیر کانفیگ.")
+        self.events.step(0, "skip", "رکورد بعد از همهٔ دورها و گزارش عوض می‌شود")
+
+        self.events.step(1, "run")
+        cands = (list(self.fixed_candidates) if self.fixed_candidates is not None
+                 else multi_pool(store, session))
+        self.events.note_scope(len(cands), True)
+        answered, scanned, failed, errors = self._fast_pass(cands, target, ctx, s, stop_after=0)
+        result["scanned"], result["answered"] = scanned, len(answered)
+        result["errors"] = error_summary(errors)
+        locs = {r["loc"] for r in answered if r.get("loc")}
+        if locs and "IR" not in locs:
+            result["warning"] = ("به نظر VPN روشن است (موقعیت: %s). نتیجه مال این اینترنت نیست."
+                                 % ", ".join(sorted(locs)))
+            self.events.note(result["warning"])
+        if answered:
+            store.remember_bad(self.nid, failed)
+        store.save()
+        if self.cancelled:
+            return self._stopped(result)
+        self.events.step(1, "ok" if answered else "fail",
+                         "%d IP در دسترس از %d (همان فهرست ثابت همهٔ دورها)"
+                         % (len(answered), scanned))
+
+        self.events.step(2, "run")
+        own = [r["ip"] for r in sorted(answered, key=self._rank)[:int(s["verify_top"])]]
+        proved = [ip for ip in multi_proved(session, s) if ip not in own]
+        wanted = (own + proved)[:MULTI_VERIFY_CAP]
+        colo_of = {r["ip"]: r["colo"] for r in answered}
+        ms = self._measure_many(wanted, target, ctx, int(s["verify_attempts"]), use_ws)
+        for m in ms:
+            m["colo"] = m["colo"] or colo_of.get(m["ip"], "")
+        self._record(ms)
+        ms.sort(key=score)
+        result["verified"] = ms
+        self.events.found(ms)
+        if self.cancelled:
+            store.save()
+            return self._stopped(result)
+        passed = [m for m in ms if self._ok(m)]
+        detail = "%d از %d IP بدون افت سالم" % (len(passed), len(ms))
+        if proved:
+            detail += "؛ %d IP از دورهای قبل هم بررسی شد" % len(proved)
+        self.events.step(2, "ok" if passed else "fail", detail)
+        store.add_round(self.sid, self.nid, scanned, len(answered), ms)
+        self.events.step(3, "skip", "بعد از همهٔ دورها، از روی گزارش")
+        result.update(kind="round", ips=[m["ip"] for m in passed])
+        if not answered and not ms:
+            result["hint"] = self._hint(errors, 4)
         return result
 
     def apply(self, result=None, ips=None, kind="apply"):
@@ -2866,6 +3135,7 @@ RESULT_TEXT = {
     "found": "IP پیدا شد (رکورد یا توکن تنظیم نشده)",
     "conflict": "IP سالم این اینترنت روی اینترنت دیگر همین گروه خراب است",
     "stopped": "متوقف شد",
+    "round": "دور این اینترنت تمام شد",
     "nothing": "IP سالمی پیدا نشد",
     "apply_failed": "اعمال روی DNS نشد",
     "error": "خطا",
@@ -3004,7 +3274,8 @@ def matrix_lines(store, sid):
 
 def history_lines(store, sid=None):
     names = {n["id"]: n["name"] for n in store.networks}
-    kinds = {"apply": "", "manual": " (دستی)", "rollback": " (برگشت)", "forced": " (اجباری)"}
+    kinds = {"apply": "", "manual": " (دستی)", "rollback": " (برگشت)", "forced": " (اجباری)",
+             "multi": " (چند اپراتوره)"}
     lines = []
     for h in store.history(sid):
         when = time.strftime("%m/%d %H:%M", time.localtime(h.get("ts", 0)))
@@ -3256,13 +3527,16 @@ if ui is not None:
             self.net_btn.action = lambda s: run_bg(self.app.network_menu)
             self.scan_btn = make_button("اسکن", self.tapped_scan, primary=True, size=18)
             self.scan_btn.corner_radius = 16
-            self.force_btn = make_link("دنبال IP سریع‌تر (حتی اگر سالم است)", self.tapped_force)
+            self.force_btn = make_link("دنبال IP سریع‌تر", self.tapped_force)
             self.all_btn = make_link("همهٔ سرورها روی این اینترنت", self.tapped_all)
+            self.multi_btn = make_button("اسکن چند اپراتوره (مثل cfscan)",
+                                         lambda s: run_bg(self.app.multi_flow), color=ACCENT,
+                                         size=15)
             self.setup = make_label("", 13, color=BAD, lines=3)
             self.empty_btn = make_button("افزودن سرور (لینک vless کانفیگ CDN)",
                                          lambda s: run_bg(self.app.edit_server, None), primary=True)
             for v in (self.servers, self.server_info, self.net_btn, self.scan_btn,
-                      self.force_btn, self.all_btn, self.setup, self.empty_btn):
+                      self.force_btn, self.all_btn, self.multi_btn, self.setup, self.empty_btn):
                 self.scroll.add_subview(v)
             self.cards = []
             self.right_button_items = [
@@ -3280,7 +3554,8 @@ if ui is not None:
                 self.scroll.remove_subview(c)
             self.cards = []
             has = server is not None
-            for v in (self.servers, self.server_info, self.scan_btn, self.force_btn):
+            for v in (self.servers, self.server_info, self.scan_btn, self.force_btn,
+                      self.multi_btn):
                 v.hidden = not has
             self.empty_btn.hidden = has
             self.all_btn.hidden = len(store.servers) < 2
@@ -3351,6 +3626,8 @@ if ui is not None:
                 self.force_btn.frame = (pad + half, y, half, 30)
                 self.all_btn.frame = (pad, y, half, 30)
                 y += 40
+                self.multi_btn.frame = (pad, y, inner, 44)
+                y += 56
             if not self.setup.hidden:
                 self.setup.frame = (pad, y, inner, 54)
                 y += 62
@@ -3475,6 +3752,7 @@ if ui is not None:
             self.started = time.time()
             store = app.store
             self.name = store.network(nid)["name"]
+            self.net_name = self.name
             self.background_color = BG
 
             self.scroll = ui.ScrollView()
@@ -3573,9 +3851,11 @@ if ui is not None:
             sid = self.sids[index]
             store = self.app.store
             server = store.server(sid)
-            group = store.network(self.nid)["group"]
+            network = store.network(self.nid)
+            group = network["group"]
+            self.net_name = network["name"]
             self.server_label.text = fa("%s · %s · روی %s" % (server["name"], GROUP_NAMES[group],
-                                                              self.name))
+                                                              self.net_name))
             self.record_label.text = server.get("record_" + group) or server["sni"]
             self.batch_label.text = fa("سرور %d از %d" % (index + 1, len(self.sids))) \
                 if self.batch else ""
@@ -3591,7 +3871,8 @@ if ui is not None:
             self.track.hidden = self.counter.hidden = True
             self.table_title.text = ""
             self._show_rows([])
-            self.job = ScanJob(store, sid, self.nid, events=self, mode=self.mode)
+            self.job = ScanJob(store, sid, self.nid, events=self, mode=self.mode,
+                               **self._job_args())
             self.layout()
             threading.Thread(target=self.job.run, name="job", daemon=True).start()
 
@@ -3627,6 +3908,7 @@ if ui is not None:
             card_h = row_y + 4
             self.step_card.frame = (pad, y, inner, card_h)
             y += card_h + 12
+            y = self._layout_extra(y, pad, inner)
             if not self.outcome.hidden:
                 oh = text_height(self.outcome.text, inner - 24, 15) + 24
                 self.outcome.frame = (pad, y, inner, oh)
@@ -3651,8 +3933,7 @@ if ui is not None:
             self.scroll.content_size = (w, y)
             by = h - bottom + 12
             if self.stop_btn.hidden:
-                visible = [b for b in (self.apply_btn, self.anyway_btn, self.faster_btn,
-                                       self.done_btn) if not b.hidden]
+                visible = [b for b in self._bottom_buttons() if not b.hidden]
                 gap = 8
                 bw = (inner - gap * (len(visible) - 1)) / max(1, len(visible))
                 x = w - pad - bw
@@ -3661,6 +3942,17 @@ if ui is not None:
                     x -= bw + gap
             else:
                 self.stop_btn.frame = (pad, by, inner, 50)
+
+        # hooks for MultiScanView ------------------------------------------
+
+        def _job_args(self):
+            return {}
+
+        def _layout_extra(self, y, pad, inner):
+            return y
+
+        def _bottom_buttons(self):
+            return (self.apply_btn, self.anyway_btn, self.faster_btn, self.done_btn)
 
         # -- Events (called from worker threads) -------------------------
 
@@ -3902,6 +4194,405 @@ if ui is not None:
         def layout(self):
             self.table.frame = (0, 0, self.width, self.height)
 
+    # ------------------------------------------------------------------ several carriers
+
+    class MultiScanView(ScanView):
+        """cfscan's multi-carrier scan: a round per carrier, a pause between.
+
+        Every round sweeps the session's fixed list on the network the phone
+        is on now; between rounds the screen waits until the user switched
+        SIM or Wi-Fi and the network is detected as the next carrier.
+        """
+
+        def __init__(self, app, sid, session):
+            pending = [n for n in session["carriers"] if n not in session["rounds"]]
+            ScanView.__init__(self, app, [sid], (pending or session["carriers"])[0], "force")
+            self.sid = sid
+            self.name = "اسکن چند اپراتوره"
+            self.pause_card = make_card()
+            self.pause_card.border_width = 1.5
+            self.pause_card.border_color = ACCENT
+            self.pause = make_label("", 15, lines=0)
+            self.pause_card.add_subview(self.pause)
+            self.pause_card.hidden = self.pause.hidden = True
+            self.scroll.add_subview(self.pause_card)
+            self.next_btn = make_button("شروع", self.tapped_next, primary=True)
+            self.again_btn = make_button("دوباره همین", self.tapped_again)
+            self.report_btn = make_button("گزارش", self.tapped_report)
+            for b in (self.next_btn, self.again_btn, self.report_btn):
+                b.hidden = True
+                self.add_subview(b)
+
+        def session(self):
+            return self.app.store.multi_session(self.sid)
+
+        def pending(self):
+            session = self.session()
+            if not session:
+                return []
+            return [n for n in session["carriers"] if n not in session["rounds"]]
+
+        def _job_args(self):
+            return {"round_of": self.session()}
+
+        def _bottom_buttons(self):
+            return (self.next_btn, self.again_btn, self.report_btn, self.done_btn)
+
+        def _layout_extra(self, y, pad, inner):
+            self.pause_card.hidden = self.pause.hidden
+            if not self.pause.hidden:
+                th = text_height(self.pause.text, inner - 32, 15)
+                self.pause_card.frame = (pad, y, inner, th + 28)
+                self.pause.frame = (16, 14, inner - 32, th)
+                y += th + 28 + 12
+            return y
+
+        def start(self):
+            console.set_idle_timer_disabled(True)
+            self.alive = True
+            threading.Thread(target=self._ticker, name="clock", daemon=True).start()
+            pending = self.pending()
+            here = self.app.store.current_network["id"]
+            if pending and pending[0] == here:
+                self._begin_round(here)
+            elif pending:
+                self._show_pause(pending[0])
+            else:
+                self._all_done()
+
+        @on_main_thread
+        def _begin_round(self, nid):
+            self.nid = nid
+            for b in self._bottom_buttons():
+                b.hidden = True
+            self.stop_btn.hidden = False
+            self.stop_btn.enabled = True
+            self.stop_btn.title = "توقف"
+            self.pause.hidden = True
+            self.outcome.hidden = True
+            self.notes.text = ""
+            self.notes.hidden = True
+            self.result = None
+            self.alive = True
+            console.set_idle_timer_disabled(True)
+            self._begin(0)
+
+        def _status_lines(self):
+            session = self.session() or {"carriers": [], "rounds": {}}
+            names = {n["id"]: n["name"] for n in self.app.store.networks}
+            s = self.app.store.settings
+            lines = []
+            for nid in session["carriers"]:
+                done = session["rounds"].get(nid)
+                if done:
+                    good = sum(1 for m in done["verified"] if _passed(m, s))
+                    lines.append("✓ %s: %d IP بدون افت" % (names.get(nid, nid), good))
+                else:
+                    lines.append("○ %s: در انتظار" % names.get(nid, nid))
+            return lines
+
+        @on_main_thread
+        def _show_pause(self, nid):
+            session = self.session()
+            name = self.app.store.network(nid)["name"]
+            index = session["carriers"].index(nid) + 1
+            self.pause.text = fa("\n".join([
+                "دور %d از %d: «%s»" % (index, len(session["carriers"]), name),
+                "اینترنت گوشی را به «%s» عوض کنید (سیم‌کارت یا وای‌فای). VPN خاموش باشد."
+                % name,
+                "بعد «شروع دور %s» را بزنید؛ برنامه اول بررسی می‌کند که واقعاً روی %s هستید."
+                % (name, name), ""] + self._status_lines()))
+            self.pause.hidden = False
+            self.next_btn.title = "شروع دور %s" % name
+            self.next_btn.hidden = False
+            self.next_btn.enabled = True
+            self.report_btn.hidden = not session["rounds"]
+            self.report_btn.title = "گزارش تا اینجا"
+            self.stop_btn.hidden = True
+            self.layout()
+
+        @on_main_thread
+        def finished(self, result):
+            self.result = result
+            kind = result.get("kind")
+            if result.get("hint") or (kind == "error" and result.get("message")):
+                self.note(result.get("hint") or result["message"])
+            if kind == "stopped":
+                self._show_rows([r for r in self.rows if not r.get("pending")])
+                for icon, name, detail in self.step_views:
+                    if icon.text in SPINNER or icon.text == STEP_ICONS["run"][0]:
+                        icon.text, icon.text_color = STEP_ICONS["skip"]
+                        detail.text = fa("متوقف شد")
+            self.alive = False
+            console.set_idle_timer_disabled(False)
+            self.track.hidden = self.counter.hidden = True
+            self.stop_btn.hidden = True
+            passed = len(result.get("ips") or []) if kind == "round" else 0
+            if kind == "round":
+                self._show_outcome("دور «%s» تمام شد: %d IP بدون افت سالم"
+                                   % (self.net_name, passed), passed > 0)
+            elif kind == "stopped":
+                self._show_outcome("دور «%s» متوقف شد" % self.net_name, False)
+            else:
+                self._show_outcome(result_line(result, self.app.store), False)
+            self.app.main.refresh()
+            pending = self.pending()
+            self.again_btn.hidden = kind == "round" and passed > 0
+            if kind != "round" or not passed:
+                # nothing proven here: usually the connection was not switched yet
+                self.again_btn.title = "دوباره «%s»" % self.net_name
+            if pending:
+                self._show_pause(pending[0])
+            else:
+                self._all_done()
+            console.hud_alert("دور تمام شد", "success", 1.0)
+
+        @on_main_thread
+        def _all_done(self):
+            self.pause.hidden = True
+            self.next_btn.hidden = True
+            self.stop_btn.hidden = True
+            self.report_btn.hidden = False
+            self.report_btn.title = "گزارش"
+            self.done_btn.hidden = False
+            self.layout()
+            if self.session() and self.session()["rounds"]:
+                self.app.open_multi_report(self.sid)
+
+        def tapped_next(self, sender):
+            sender.enabled = False
+            run_bg(self._next_flow)
+
+        def _next_flow(self):
+            """The pause: go on only once the phone is on the next carrier."""
+            try:
+                while True:
+                    pending = self.pending()
+                    if not pending:
+                        self._all_done()
+                        return
+                    want = self.app.store.network(pending[0])
+                    network = self.app.detect(True)
+                    if network is not None and network["id"] == want["id"]:
+                        self._begin_round(want["id"])
+                        return
+                    info = self.app.connection or {}
+                    if network is not None:
+                        where = "«%s»" % network["name"]
+                    elif info.get("country") and info["country"] != "IR":
+                        where = "VPN روشن (%s)" % info["country"]
+                    else:
+                        where = "اینترنتی که تشخیص داده نشد"
+                    choice = alert("هنوز «%s» نیست" % want["name"],
+                                   "الان روی %s هستید. اینترنت را به «%s» عوض کنید، بعد دوباره "
+                                   "بررسی کنید." % (where, want["name"]),
+                                   "دوباره بررسی", "رد کردن «%s»" % want["name"], "گزارش تا اینجا")
+                    if choice == 1:
+                        continue
+                    if choice == 2:
+                        self.app.store.skip_carrier(self.sid, want["id"])
+                        rest = self.pending()
+                        if rest:
+                            self._show_pause(rest[0])
+                        else:
+                            self._all_done()
+                    elif choice == 3:
+                        self.app.open_multi_report(self.sid)
+                    return
+            finally:
+                self._enable_next()
+
+        @on_main_thread
+        def _enable_next(self):
+            self.next_btn.enabled = True
+
+        def tapped_again(self, sender):
+            run_bg(self._again_flow)
+
+        def _again_flow(self):
+            """The same carrier once more (the round is replaced), if still on it."""
+            network = self.app.detect(True)
+            if network is not None and network["id"] == self.nid:
+                self._begin_round(self.nid)
+            else:
+                alert("اینترنت", "برای تکرار دور «%s» باید روی همان اینترنت باشید."
+                      % self.net_name)
+
+        def tapped_report(self, sender):
+            self.app.open_multi_report(self.sid)
+
+    def multi_row_parts(row, names, done):
+        """The report's line for one address: its worst case and each carrier."""
+        per = []
+        for nid in done:
+            m = row["per"].get(nid)
+            if m is None:
+                per.append("%s —" % names.get(nid, nid))
+            elif m["passed"]:
+                per.append("%s %.0f ✓" % (names.get(nid, nid), m["delay"]))
+            else:
+                per.append("%s ✕" % names.get(nid, nid))
+        everywhere = row["covered"] == row["total"]
+        right = "%.0fms" % row["worst"] if row.get("worst") is not None else "—"
+        return row["ip"], right, GOOD if everywhere else WARN, " · ".join(per)
+
+    class MultiReportView(ui.View):
+        """What a multi-carrier session found, and the button to use it."""
+
+        ROW = 54
+
+        def __init__(self, app, sid):
+            self.app = app
+            self.sid = sid
+            self.name = "گزارش چند اپراتوره"
+            self.background_color = BG
+            store = app.store
+            server = store.server(sid)
+            session = store.multi_session(sid) or {"carriers": [], "rounds": {}}
+            self.session = session
+            self.report = multi_report(session, store.settings, int(store.settings["ips_per_record"]))
+            names = {n["id"]: n["name"] for n in store.networks}
+            done = self.report["done"]
+            self.scroll = ui.ScrollView()
+            self.add_subview(self.scroll)
+            self.blocks = []
+
+            skipped = [names.get(n, n) for n in list(session["carriers"])
+                       + list(session.get("skipped") or []) if n not in done]
+            head = "%s · %s" % (server["name"], " · ".join(names.get(n, n) for n in done) or "—")
+            if skipped:
+                head += "\nاجرا نشده: %s" % "، ".join(skipped)
+            self._add("head", make_label(head, 15, bold=True, lines=0))
+
+            rec = self.report["recommend"]
+            if rec:
+                text = "پیشنهاد برای %s:\n%s\n%s" % (server.get("record_mobile") or "رکورد موبایل",
+                                                   "، ".join(rec["ips"]), rec["reason"])
+                good = rec["kind"] == "common"
+            else:
+                text = "هیچ IPی در این جلسه بدون افت سالم نبود؛ دوباره اسکن کنید."
+                good = False
+            self.recommend = make_label(text, 15, bold=True, lines=0, align="center",
+                                        color=GOOD if good else (WARN if rec else BAD))
+            self.recommend.background_color = GOOD_BG if good else (WARN_BG if rec else BAD_BG)
+            self.recommend.corner_radius = 14
+            self._add("card", self.recommend)
+
+            if self.report["common"]:
+                self._list("روی همه سالم (%d)" % len(self.report["common"]),
+                           [multi_row_parts(r, names, done) for r in self.report["common"][:15]])
+            if self.report["coverage"]:
+                self._list("فقط روی بعضی‌ها سالم",
+                           [multi_row_parts(r, names, done) for r in self.report["coverage"][:8]])
+            best = []
+            for nid, m in self.report["best"]:
+                if m is None:
+                    best.append(("—", "✕", BAD, "بهترینِ %s: هیچ IP بدون افت" % names.get(nid, nid)))
+                else:
+                    best.append((m["ip"], "%.0fms" % m["delay"], GOOD,
+                                 "بهترینِ %s · %s" % (names.get(nid, nid), m.get("colo") or "")))
+            if best:
+                self._list("بهترین هر اینترنت", best)
+
+            short = (server.get("record_mobile") or "cdn1").split(".")[0]
+            self.apply_btn = make_button("اعمال روی %s" % short, self.tapped_apply, primary=True)
+            self.apply_btn.hidden = not (rec and server.get("record_mobile"))
+            self.done_btn = make_button("بازگشت", lambda s: self.app.nav.pop_view())
+            for b in (self.apply_btn, self.done_btn):
+                self.add_subview(b)
+
+        def _add(self, kind, view):
+            self.scroll.add_subview(view)
+            self.blocks.append((kind, view))
+
+        def _list(self, title, parts):
+            self._add("title", make_label(title, 14, bold=True))
+            card = make_card()
+            rows = []
+            for i, p in enumerate(parts):
+                row = ResultRow(lambda s: None)
+                row.show(p, i)
+                card.add_subview(row)
+                rows.append(row)
+            card.rows = rows
+            self._add("list", card)
+
+        def layout(self):
+            w, h = self.width, self.height
+            pad, inner, bottom = 16, self.width - 32, 76
+            self.scroll.frame = (0, 0, w, h - bottom)
+            y = 12
+            for kind, view in self.blocks:
+                if kind == "head":
+                    vh = text_height(view.text, inner, 15)
+                    view.frame = (pad, y, inner, vh)
+                    y += vh + 10
+                elif kind == "card":
+                    vh = text_height(view.text, inner - 24, 15) + 24
+                    view.frame = (pad, y, inner, vh)
+                    y += vh + 16
+                elif kind == "title":
+                    view.frame = (pad, y, inner, 22)
+                    y += 28
+                else:
+                    vh = len(view.rows) * self.ROW
+                    view.frame = (pad, y, inner, vh)
+                    for i, row in enumerate(view.rows):
+                        row.frame = (0, i * self.ROW, inner, self.ROW)
+                        row.layout()
+                    y += vh + 18
+            self.scroll.content_size = (w, y + 12)
+            visible = [b for b in (self.apply_btn, self.done_btn) if not b.hidden]
+            gap = 8
+            bw = (inner - gap * (len(visible) - 1)) / max(1, len(visible))
+            x = w - pad - bw
+            for b in visible:
+                b.frame = (x, h - bottom + 12, bw, 50)
+                x -= bw + gap
+
+        def tapped_apply(self, sender):
+            sender.enabled = False
+            run_bg(self._apply_flow)
+
+        def _apply_flow(self):
+            try:
+                self._apply()
+            finally:
+                self._enable()
+
+        @on_main_thread
+        def _enable(self):
+            self.apply_btn.enabled = True
+
+        def _apply(self):
+            store = self.app.store
+            server = store.server(self.sid)
+            rec = self.report["recommend"]
+            if not rec:
+                return
+            if rec["kind"] != "common" and alert(
+                    "روی همه سالم نیست", rec["reason"] + "\nبا این وجود اعمال شود؟", "اعمال") != 1:
+                return
+            groups = ["mobile"]
+            homes = [n for n in self.report["done"] if store.network(n)["group"] == "home"]
+            if homes and server.get("record_home"):
+                choice = alert("رکورد خانگی", "این IP روی اینترنت خانگی هم سالم بود. روی %s هم "
+                               "گذاشته شود؟" % server["record_home"],
+                               "فقط %s" % server["record_mobile"], "هر دو رکورد")
+                if choice == 0:
+                    return
+                if choice == 2:
+                    groups.append("home")
+            try:
+                written = apply_multi(store, self.sid, rec["ips"], groups,
+                                      network=store.current_network["id"])
+            except (CFError, NetError) as exc:
+                alert("اعمال نشد", str(exc))
+                return
+            self.app.main.refresh()
+            alert("انجام شد", "\n".join("%s → %s" % (record_name(store, k), ", ".join(rec["ips"]))
+                                        for k in written))
+
     # ------------------------------------------------------------------ forms
 
     class FormView(ui.View):
@@ -4068,6 +4759,90 @@ if ui is not None:
         @on_main_thread
         def push_list(self, title, lines):
             self.nav.push_view(ListView(self, title, lines))
+
+        # -- several carriers (cfscan's menu 10) ----------------------------
+
+        def multi_flow(self):
+            """Start, resume or report a multi-carrier session for the server."""
+            store = self.store
+            server = store.selected
+            if server is None:
+                return self.edit_server(None)
+            if self.active_scan is not None and self.active_scan.running:
+                self._push_active()
+                return
+            sid = server["id"]
+            session = store.multi_session(sid)
+            if session:
+                names = {n["id"]: n["name"] for n in store.networks}
+                pending = [n for n in session["carriers"] if n not in session["rounds"]]
+                items, actions = [], []
+                if pending:
+                    items.append("ادامه: دور %d از %d («%s»)" % (
+                        len(session["carriers"]) - len(pending) + 1, len(session["carriers"]),
+                        names.get(pending[0], pending[0])))
+                    actions.append("resume")
+                if session["rounds"]:
+                    items.append("گزارش این جلسه")
+                    actions.append("report")
+                items.append("جلسهٔ جدید")
+                actions.append("new")
+                index = pick("اسکن چند اپراتوره «%s»" % server["name"], items)
+                if index is None:
+                    return
+                if actions[index] == "report":
+                    return self.open_multi_report(sid)
+                if actions[index] == "resume":
+                    self.detect(True)
+                    return self.open_multi(sid)
+            carriers = self.choose_carriers()
+            if not carriers:
+                return
+            network = self.detect(True)
+            if network is not None and network["id"] in carriers:
+                carriers.remove(network["id"])
+                carriers.insert(0, network["id"])  # the first round right away
+            store.start_multi(sid, carriers)
+            self.open_multi(sid)
+
+        def choose_carriers(self):
+            """Which networks this session measures (at least two)."""
+            store = self.store
+            fields = [{"type": "switch", "key": n["id"], "value": n["group"] == "mobile",
+                       "title": "%s (%s)" % (n["name"], GROUP_NAMES[n["group"]])}
+                      for n in store.networks]
+            while True:
+                values = ask_form("اسکن چند اپراتوره", [(
+                    "روی کدام اینترنت‌ها", fields,
+                    "مثل cfscan: یک فهرست ثابت از کل رنج (یکی از هر /24) روی هر اینترنت "
+                    "اسکن می‌شود و بین دورها برنامه صبر می‌کند تا اینترنت را عوض کنید. در آخر "
+                    "IPی که روی همه سالم بوده برای رکورد موبایل پیشنهاد می‌شود؛ اگر خانگی را هم "
+                    "انتخاب کنید، همان IP را می‌شود روی رکورد خانگی هم گذاشت.")], "ادامه")
+                if values is None:
+                    return None
+                chosen = [n["id"] for n in store.networks if values.get(n["id"])]
+                if len(chosen) >= 2:
+                    return chosen
+                alert("اینترنت‌ها", "حداقل دو اینترنت را انتخاب کنید.")
+                for f in fields:
+                    f["value"] = bool(values.get(f["key"]))
+
+        @on_main_thread
+        def _push_active(self):
+            self.nav.push_view(self.active_scan)
+
+        @on_main_thread
+        def open_multi(self, sid):
+            view = MultiScanView(self, sid, self.store.multi_session(sid))
+            self.active_scan = view
+            self.nav.push_view(view)
+            view.start()
+
+        @on_main_thread
+        def open_multi_report(self, sid):
+            if not self.store.multi_session(sid):
+                return
+            self.nav.push_view(MultiReportView(self, sid))
 
         @on_main_thread
         def open_scan(self, sids, nid, mode):
@@ -4444,11 +5219,12 @@ if ui is not None:
                 "وارد کردن تنظیمات از کلیپ‌بورد",
                 "کپی لاگ برای گزارش خطا",
                 "تست پورت‌های کلادفلر روی «%s»" % name,
+                "گزارش آخرین اسکن چند اپراتورهٔ «%s»" % name,
             ]
             index = pick("ابزارها", items)
             if index is None:
                 return
-            if index in (0, 1, 2, 3, 4, 12) and server is None:
+            if index in (0, 1, 2, 3, 4, 12, 13) and server is None:
                 alert("سرور", "اول یک سرور اضافه کنید.")
                 return
             if index == 0:
@@ -4501,6 +5277,11 @@ if ui is not None:
                 console.hud_alert("لاگ کپی شد")
             elif index == 12:
                 self.test_ports(server["id"])
+            elif index == 13:
+                if self.store.multi_session(server["id"]):
+                    self.open_multi_report(server["id"])
+                else:
+                    alert("چند اپراتوره", "هنوز اسکن چند اپراتوره‌ای برای «%s» انجام نشده." % name)
 
         def test_ports(self, sid, ip=None):
             """Which Cloudflare port answers fastest here, on the record's address."""

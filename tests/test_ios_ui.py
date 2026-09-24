@@ -538,6 +538,137 @@ class ScanFlowTests(AppTestCase):
         self.assertEqual(fake["clipboard"].DATA[0], view.rows[0]["ip"])
 
 
+class MultiCarrierFlowTests(AppTestCase):
+    """cfscan's multi-carrier scan on the phone: rounds, the pause, the report."""
+
+    def setUp(self):
+        super().setUp()
+        # 1.0.0.1 works on all three, 1.0.0.2 is the fastest on MCI but dead on Irancell
+        self.tables = {"mci": {"1.0.0.1": (True, 180.0, "FRA"), "1.0.0.2": (True, 90.0, "FRA")},
+                       "mtn": {"1.0.0.1": (True, 210.0, "FRA"), "1.0.0.2": (False, None, ""),
+                               "1.0.0.9": (True, 70.0, "AMS")},
+                       "home": {"1.0.0.1": (True, 120.0, "FRA")}}
+
+    def wait(self, view):
+        deadline = time.time() + 10
+        while (view.result is None or view.running) and time.time() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.05)
+
+    def start_session(self, carriers):
+        self.answer({"mci": "mci" in carriers, "mtn": "mtn" in carriers,
+                     "home": "home" in carriers})
+        self.app.nav.pushed = []
+        self.app.multi_flow()
+        view = self.app.nav.pushed[-1]
+        self.assertIsInstance(view, app.MultiScanView)
+        return view
+
+    def test_three_carriers_with_a_pause_between_them(self):
+        sid = self.ready()
+        self.store.save_server(sid, dict(self.store.server(sid),
+                                         record_home="cdn2.germany.example.com"))
+        self.assertFalse(self.main.multi_btn.hidden)
+        view = self.start_session(["mci", "mtn", "home"])
+        self.assertEqual(self.store.multi_session(sid)["carriers"], ["mci", "mtn", "home"])
+        self.wait(view)  # the first round runs at once: the phone is on MCI
+        self.assertEqual((view.result["kind"], view.result["round"]), ("round", True))
+        self.assertEqual(engine.FakeAPI.records, {})       # nothing applied during rounds
+        self.assertFalse(view.pause.hidden)                 # cfscan's pause
+        self.assertIn("دور 2 از 3: «ایرانسل»", view.pause.text)
+        self.assertIn("✓ همراه اول: 2 IP بدون افت", view.pause.text)
+        self.assertEqual(view.next_btn.title, "شروع دور ایرانسل")
+
+        # still on MCI: the round does not start, the user is told
+        self.answer(alerts=[0])
+        view.tapped_next(view.next_btn)
+        self.assertEqual(self.alerts()[-1][1], "هنوز «ایرانسل» نیست")
+        self.assertIn("الان روی «همراه اول» هستید", self.alerts()[-1][2])
+        self.assertNotIn("mtn", self.store.multi_session(sid)["rounds"])
+
+        # switched to Irancell
+        self.conn.update(asn=44244, org="Irancell")
+        view.tapped_next(view.next_btn)
+        self.wait(view)
+        rounds = self.store.multi_session(sid)["rounds"]
+        verified = sorted(m["ip"] for m in rounds["mtn"]["verified"])
+        self.assertEqual(verified, ["1.0.0.1", "1.0.0.2", "1.0.0.9"])  # MCI's proof checked too
+        self.assertIn("دور 3 از 3: «خانگی»", view.pause.text)
+
+        # home: a new ASN is named once, then the last round and the report
+        self.conn.update(asn=58224, org="TCI")
+        self.answer(2)  # "this is خانگی"
+        view.tapped_next(view.next_btn)
+        self.wait(view)
+        report = self.app.nav.pushed[-1]
+        self.assertIsInstance(report, app.MultiReportView)
+        self.assertEqual(report.report["recommend"]["ips"], ["1.0.0.1"])
+        self.assertIn("روی همهٔ 3 اینترنت سالم؛ بدترین حالت 210ms", report.recommend.text)
+        rows = [r for kind, v in report.blocks if kind == "list" for r in v.rows]
+        self.assertEqual(rows[0].left.text, "1.0.0.1")
+        self.assertIn("همراه اول 180 ✓ · ایرانسل 210 ✓ · خانگی 120 ✓", rows[0].detail.text)
+        report.frame = (0, 0, 375, 760)
+        report.layout()
+
+        # apply: MCI, Irancell and home all passed, so cdn2 is offered too
+        self.answer(alerts=[2])
+        report.tapped_apply(report.apply_btn)
+        self.assertEqual(engine.FakeAPI.records[("cdn1.germany.example.com", "A")], ["1.0.0.1"])
+        self.assertEqual(engine.FakeAPI.records[("cdn2.germany.example.com", "A")], ["1.0.0.1"])
+        self.assertEqual(self.store.history(sid)[0]["kind"], "multi")
+        self.assertIn("(چند اپراتوره)", app.history_lines(self.store, sid)[0])
+
+    def test_a_carrier_can_be_skipped_and_the_report_still_comes(self):
+        sid = self.ready()
+        view = self.start_session(["mci", "mtn"])
+        self.wait(view)
+        self.answer(alerts=[2])  # "leave Irancell out": nothing left, so the report
+        view.tapped_next(view.next_btn)
+        self.assertEqual(self.store.multi_session(sid)["carriers"], ["mci"])
+        self.assertEqual(self.store.multi_session(sid)["skipped"], ["mtn"])
+        report = self.app.nav.pushed[-1]
+        self.assertIsInstance(report, app.MultiReportView)
+        self.assertIn("اجرا نشده: ایرانسل", report.blocks[0][1].text)
+        self.assertEqual(report.report["recommend"]["ips"], ["1.0.0.2"])  # MCI alone: fastest
+
+    def test_one_carrier_is_not_a_comparison(self):
+        self.ready()
+        self.answer({"mci": True, "mtn": False, "home": False}, None)
+        self.app.nav.pushed = []
+        self.app.multi_flow()
+        self.assertEqual(self.alerts()[-1][1], "اینترنت‌ها")
+        self.assertEqual(self.app.nav.pushed, [])
+
+    def test_a_half_done_session_resumes_after_a_restart(self):
+        sid = self.ready()
+        view = self.start_session(["mci", "mtn"])
+        self.wait(view)
+        restarted = app.App(app.Store(self.store.path, secrets=self.store.secrets))
+        self.app = restarted
+        self.start()
+        self.conn.update(asn=44244, org="Irancell")
+        self.answer("ادامه: دور 2 از 2 («ایرانسل»)")
+        self.app.nav.pushed = []
+        self.app.multi_flow()
+        view = self.app.nav.pushed[-1]
+        self.wait(view)  # on Irancell already: the round starts without a pause
+        self.assertEqual(set(self.app.store.multi_session(sid)["rounds"]), {"mci", "mtn"})
+        self.assertIsInstance(self.app.nav.pushed[-1], app.MultiReportView)
+
+    def test_screens_fit_every_phone_width(self):
+        self.ready()
+        view = self.start_session(["mci", "mtn"])
+        self.wait(view)
+        for width in (320, 375, 430):
+            view.frame = (0, 0, width, 700)
+            view.layout()
+            self.assertLessEqual(view.pause.x + view.pause.width, width)
+            for b in (view.next_btn, view.report_btn):
+                if not b.hidden:
+                    self.assertGreater(b.width, 60)
+                    self.assertGreaterEqual(b.x, 0)
+
+
 class MenuTests(AppTestCase):
     def test_every_tool_opens_without_errors(self):
         sid = self.ready()
@@ -545,12 +676,12 @@ class MenuTests(AppTestCase):
         items = None
         # what each tool asks: an IP to test, IPs to set, a confirmation...
         alerts = {2: ["1.0.0.2", 1], 3: ["1.0.0.2"], 4: [1], 8: [1]}
-        for index in range(13):
+        for index in range(14):
             fake["dialogs"].LOG[:] = []
             self.answer(index, alerts=alerts.get(index, [1]))
             self.app.open_tools()
             items = items or fake["dialogs"].LOG[0][2]
-        self.assertEqual(len(items), 13)
+        self.assertEqual(len(items), 14)
         errors = [line for line in Path(app.LOG_PATH).read_text().splitlines()
                   if "failed" in line and "flow" in line]
         self.assertEqual(errors, [])

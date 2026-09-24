@@ -862,6 +862,144 @@ class PortTests(unittest.TestCase):
         self.assertEqual(sorted(set(ports)), sorted(app.CF_HTTP_PORTS))
 
 
+class MultiCarrierTests(unittest.TestCase):
+    """cfscan's multi-carrier scan: one list, a round per carrier, one report."""
+
+    SETTINGS = {"max_loss_pct": 0, "max_ping_ms": 1000}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        FakeAPI.records = {}
+        FakeAPI.unreachable_direct = False
+        FakeAPI.down = False
+        FakeAPI.calls = []
+
+    @staticmethod
+    def m(ip, delay, ok=20):
+        return {"ip": ip, "ok": ok, "attempts": 20, "delay": delay, "jitter": 5.0,
+                "loss": 100.0 * (20 - ok) / 20, "colo": "FRA"}
+
+    def session(self, rounds):
+        return {"id": "x", "carriers": list(rounds), "seed": 1, "created": 0,
+                "rounds": {nid: {"ts": 1, "scanned": 5957, "reachable": 100, "verified": ms}
+                           for nid, ms in rounds.items()}}
+
+    def test_everywhere_first_ranked_by_the_worst_case(self):
+        session = self.session({
+            "mci": [self.m("A", 150), self.m("B", 180), self.m("C", 100), self.m("D", 90, ok=19)],
+            "mtn": [self.m("A", 210), self.m("B", 170), self.m("D", 80)],
+            "home": [self.m("A", 120), self.m("B", 175)]})
+        report = app.multi_report(session, self.SETTINGS, count=1)
+        self.assertEqual([r["ip"] for r in report["common"]], ["B", "A"])  # 180 beats 210
+        self.assertEqual(report["recommend"]["ips"], ["B"])
+        self.assertIn("روی همهٔ 3 اینترنت سالم؛ بدترین حالت 180ms", report["recommend"]["reason"])
+        self.assertEqual([r["ip"] for r in report["coverage"]], ["D", "C"])  # 1 of 3; 80 < 100
+        self.assertEqual([(nid, m["ip"]) for nid, m in report["best"]],
+                         [("mci", "C"), ("mtn", "D"), ("home", "A")])
+        two = app.multi_report(session, self.SETTINGS, count=2)["recommend"]
+        self.assertEqual((two["ips"], two["worst"]), (["B", "A"], 210))
+
+    def test_nothing_everywhere_recommends_the_widest_coverage(self):
+        session = self.session({"mci": [self.m("A", 100), self.m("B", 200)],
+                                "mtn": [self.m("B", 300), self.m("A", 90, ok=15)],
+                                "home": [self.m("C", 50)]})
+        report = app.multi_report(session, self.SETTINGS)
+        self.assertEqual(report["common"], [])
+        self.assertEqual(report["recommend"]["kind"], "coverage")
+        self.assertEqual(report["recommend"]["ips"], ["B"])  # 2 of 3
+        self.assertIn("2 از 3", report["recommend"]["reason"])
+
+    def test_unfinished_rounds_do_not_count(self):
+        session = self.session({"mci": [self.m("A", 100)]})
+        session["carriers"] = ["mci", "mtn"]
+        report = app.multi_report(session, self.SETTINGS)
+        self.assertEqual((report["total"], report["done"]), (1, ["mci"]))
+        self.assertEqual(report["recommend"]["ips"], ["A"])
+        self.assertIsNone(app.multi_report(self.session({"mci": []}), self.SETTINGS)["recommend"])
+
+    def test_every_round_scans_the_same_list(self):
+        store = make_store(self.tmp)
+        a = store.start_multi("s1", ["mci", "mtn"], seed=42)
+        pool = app.multi_pool(store, a)
+        self.assertEqual(app.multi_pool(store, dict(a)), pool)
+        self.assertGreater(len(pool), 5900)
+        b = store.start_multi("s1", ["mci", "mtn"], seed=43)
+        self.assertNotEqual(app.multi_pool(store, b), pool)
+
+    def test_a_later_round_checks_what_earlier_rounds_proved(self):
+        store = make_store(self.tmp, verify_top=1)
+        session = store.start_multi("s1", ["mci", "mtn"])
+        mci = {"1.0.0.1": (True, 100.0, ""), "1.0.0.2": (True, 300.0, "")}
+        job = app.ScanJob(store, "s1", "mci", events=RecordingEvents(), round_of=session,
+                          context_factory=lambda: None, api_factory=FakeAPI,
+                          candidates=list(mci), probe_trace=scripted_probe(mci),
+                          probe_ws=scripted_probe(mci))
+        result = job.run()
+        self.assertEqual((result["kind"], result["ips"]), ("round", ["1.0.0.1"]))
+        self.assertEqual(FakeAPI.records, {})  # nothing applied during the rounds
+        self.assertIn((0, "skip"), job.events.steps)
+        # Irancell: its own best is 1.0.0.2, and 1.0.0.1 (proved on MCI) is checked too
+        mtn = {"1.0.0.1": (True, 220.0, ""), "1.0.0.2": (True, 90.0, "")}
+        job = app.ScanJob(store, "s1", "mtn", events=RecordingEvents(), round_of=session,
+                          context_factory=lambda: None, api_factory=FakeAPI,
+                          candidates=list(mtn), probe_trace=scripted_probe(mtn),
+                          probe_ws=scripted_probe(mtn))
+        job.run()
+        stored = store.multi_session("s1")
+        self.assertEqual(sorted(m["ip"] for m in stored["rounds"]["mtn"]["verified"]),
+                         ["1.0.0.1", "1.0.0.2"])
+        report = app.multi_report(stored, store.settings)
+        self.assertEqual([r["ip"] for r in report["common"]], ["1.0.0.1"])
+        self.assertEqual(store.cells("s1")["1.0.0.1"]["mtn"]["delay"], 220.0)  # cards see it
+        # the report survives a restart
+        again = app.Store(store.path, secrets=store.secrets)
+        self.assertEqual(again.multi_session("s1")["rounds"]["mtn"], stored["rounds"]["mtn"])
+
+    def test_a_carrier_measured_again_replaces_its_round(self):
+        store = make_store(self.tmp)
+        store.start_multi("s1", ["mci", "mtn"])
+        store.add_round("s1", "mci", 10, 2, [self.m("A", 100)])
+        store.add_round("s1", "mci", 10, 3, [self.m("B", 90)])
+        rounds = store.multi_session("s1")["rounds"]
+        self.assertEqual((list(rounds), rounds["mci"]["verified"][0]["ip"]), (["mci"], "B"))
+
+    def test_odd_stored_sessions_are_cleaned(self):
+        raw = {"version": 7, "servers": [{"id": "s1", "sni": "germany.example.com"}],
+               "multi": {"s1": {"carriers": ["mci", "nope", "mci", 5], "seed": "x",
+                                "rounds": {"mci": {"verified": [{"ip": "A", "delay": -3},
+                                                                 {"ip": 5}, "junk"]},
+                                           "nope": {}, "mtn": []}},
+                         "s9": {"carriers": ["mci"]}, "s2": "junk"}}
+        data = app.normalise_data(raw)
+        session = data["multi"]["s1"]
+        self.assertEqual((session["carriers"], session["seed"]), (["mci"], 1))
+        self.assertEqual(list(session["rounds"]), ["mci"])
+        self.assertEqual(session["rounds"]["mci"]["verified"][0]["delay"], None)
+        self.assertEqual(list(data["multi"]), ["s1"])
+        json.dumps(data)
+
+    def test_deleting_a_network_or_server_cleans_its_sessions(self):
+        store = make_store(self.tmp)
+        store.start_multi("s1", ["mci", "home"])
+        store.delete_network("home")
+        self.assertEqual(store.multi_session("s1")["carriers"], ["mci"])
+        store.delete_server("s1")
+        self.assertIsNone(store.multi_session("s1"))
+
+    def test_the_choice_goes_to_cdn1_and_cdn2_when_home_was_measured(self):
+        store = make_store(self.tmp, record_home="cdn2.germany.example.test")
+        written = app.apply_multi(store, "s1", ["1.0.0.1"], ("mobile", "home"), "mci",
+                                  api_factory=FakeAPI)
+        self.assertEqual(written, ["s1:mobile", "s1:home"])
+        self.assertEqual(FakeAPI.records[DE], ["1.0.0.1"])
+        self.assertEqual(FakeAPI.records[DE_HOME], ["1.0.0.1"])
+        self.assertEqual(store.history()[0]["kind"], "multi")
+        only = make_store(tempfile.mkdtemp(dir=self.tmp))
+        self.assertEqual(app.apply_multi(only, "s1", ["1.0.0.2"], ("mobile", "home"), "mci",
+                                         api_factory=FakeAPI), ["s1:mobile"])
+
+
 class RobustnessTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
