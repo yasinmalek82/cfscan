@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
-"""CF Scanner for iPhone - one clean-IP record that works on every network.
+"""CF Scanner for iPhone - clean Cloudflare addresses that work on every network.
 
-Runs inside Pythonista 3 on the iPhone. The idea in one line: a clean
-Cloudflare address depends only on the customer's network, never on the
-server (the SNI picks the server), so one DNS-only record, ``ip1``, can
-serve every CDN config of every server.
+Runs inside Pythonista 3 on the iPhone. Every CDN server has its own
+DNS-only address record (``cdn1.germany.example.com``) that its CDN config
+uses as the address. Whether a Cloudflare address is clean depends on the
+customer's network, so measurements are shared: one scan per network fills
+a coverage table, and every server's record is filled from it.
 
 With the VPN off, pick the network the phone is on (MCI, Irancell, home...)
 and tap "scan this network":
 
-1. the addresses ``ip1`` holds now are re-checked on this network,
-2. if one fails here, Cloudflare addresses are scanned - first the ones
-   that already work on the other networks, then known-good ones and their
-   /24 neighbours, then random ones,
-3. every answer lands in a coverage table (address x network), and ``ip1``
-   gets the addresses that work on the most networks, ranked by their
-   worst ping; each is confirmed with a real WebSocket upgrade on every
-   CDN server,
-4. ``ip1`` is pointed at them through the Cloudflare API. An optional
-   ``ip2`` takes the best addresses for the networks ``ip1`` cannot cover.
+1. the addresses every server's record holds now are re-checked here,
+2. if a server is not served here, Cloudflare addresses are scanned -
+   first the ones that already work on the other networks, then known-good
+   ones and their /24 neighbours, then random ones,
+3. every answer lands in a coverage table (address x network); each
+   server's record gets the addresses that work on the most networks,
+   ranked by their worst ping, confirmed with a real WebSocket upgrade on
+   that server,
+4. the records are updated through the Cloudflare API. A server may have
+   a second record for the networks no common address reaches.
 
 Secrets: the Cloudflare API token lives in the iOS Keychain, never in the
 data file. Everything else is kept in ``cfscan_ios_data.json`` next to this
@@ -94,8 +95,6 @@ CF_RANGES_V6 = (
 
 
 DEFAULT_SETTINGS = {
-    "ip1": "",              # DNS-only record every CDN config uses as its address
-    "ip2": "",              # optional record for networks ip1 cannot cover
     "zone_id": "",          # optional; looked up from the record name when empty
     "ttl": 60,
     "ips_per_record": 2,
@@ -121,6 +120,8 @@ SERVER_DEFAULTS = {
     "path": "",             # WebSocket path of the config; empty = trace test only
     "port": 443,
     "tls": True,
+    "record": "",           # DNS-only address record of its CDN config (cdn1.germany...)
+    "record2": "",          # optional second record for networks record cannot cover
 }
 
 _ALL_DEFAULTS = dict(SERVER_DEFAULTS)
@@ -141,7 +142,6 @@ DEFAULT_NETWORKS = [
     {"id": "home", "name": "خانگی"},
 ]
 
-RECORDS = ("ip1", "ip2")
 HISTORY_LIMIT = 300
 MATRIX_LIMIT = 400
 BAD_LIMIT = 5000
@@ -225,19 +225,22 @@ def _coerce(key, value):
         if key == "ip_version" and int(number) not in (4, 6):
             raise ValueError("ip_version must be 4 or 6")
         return int(number) if isinstance(default, int) else number
-    if key in ("sni", "ip1", "ip2"):
+    if key in ("sni", "record", "record2"):
         return normalise_host(value)
     if key == "path":
         return normalise_path(value)
     return str(value).strip()
 
 
-def suggest_record(sni, name="ip1"):
-    """``ip1.example.com`` from a CDN domain like ``de.example.com``."""
-    labels = normalise_host(sni).split(".")
-    if len(labels) >= 3:
-        labels = labels[1:]
-    return "%s.%s" % (name, ".".join(labels)) if len(labels) >= 2 else ""
+def suggest_record(sni, prefix="cdn1"):
+    """``cdn1.germany.example.com`` from the CDN domain ``germany.example.com``."""
+    sni = normalise_host(sni)
+    return "%s.%s" % (prefix, sni) if sni.count(".") >= 1 else ""
+
+
+def slot_key(sid, second=False):
+    """The key a server's record is stored under: ``s1`` or ``s1:2``."""
+    return "%s:2" % sid if second else sid
 
 
 def _server(raw, index):
@@ -316,8 +319,18 @@ def normalise_data(raw):
         if mem.get("bad"):
             bad.setdefault(nid, {}).update(mem["bad"])
 
-    if not settings["ip1"] and servers:
-        settings["ip1"] = suggest_record(servers[0]["sni"], "ip1")
+    records = raw.get("records") if version == 3 and isinstance(raw.get("records"), dict) else {}
+    if servers and version == 3:
+        first = servers[0]
+        for old, field, key in (("ip1", "record", first["id"]), ("ip2", "record2", first["id"] + ":2")):
+            name = normalise_host(raw_settings.get(old) or "")
+            if name and not first.get(field):
+                first[field] = name
+                if old in records:
+                    records[key] = records.pop(old)
+        for h in raw.get("history") or []:
+            if isinstance(h, dict) and h.get("record") in ("ip1", "ip2"):
+                h["record"] = first["id"] if h["record"] == "ip1" else first["id"] + ":2"
 
     net_ids = [n["id"] for n in networks]
     current = raw.get("network")
@@ -329,7 +342,7 @@ def normalise_data(raw):
         "network": current if current in net_ids else net_ids[0],
         "matrix": matrix,
         "bad": bad,
-        "records": raw.get("records") if version == 3 and isinstance(raw.get("records"), dict) else {},
+        "records": records,
         "history": [h for h in raw.get("history") or [] if isinstance(h, dict)][-HISTORY_LIMIT:],
         "zones": raw.get("zones") if isinstance(raw.get("zones"), dict) else {},
         "ranges": raw.get("ranges") if isinstance(raw.get("ranges"), dict) else {},
@@ -432,15 +445,33 @@ class Store:
                 server = self.server(sid)
                 server.update(clean)
                 server["name"] = server["name"] or server["sni"] or sid
-            if not self.settings["ip1"]:
-                self.settings["ip1"] = suggest_record(self.server(sid)["sni"], "ip1")
             self.save()
             return sid
 
     def delete_server(self, sid):
         with self.lock:
             self.data["servers"] = [s for s in self.servers if s["id"] != sid]
+            for key in (sid, sid + ":2"):
+                self.data["records"].pop(key, None)
             self.save()
+
+    def slots(self):
+        """Every configured record: ``(key, server, record name, second)``."""
+        out = []
+        for sv in self.servers:
+            if sv.get("record"):
+                out.append((slot_key(sv["id"]), sv, sv["record"], False))
+            if sv.get("record2"):
+                out.append((slot_key(sv["id"], True), sv, sv["record2"], True))
+        return out
+
+    def slot_label(self, key):
+        sid, _, second = key.partition(":")
+        try:
+            server = self.server(sid)
+        except KeyError:
+            return key
+        return "%s%s" % (server["name"], " (دوم)" if second else "")
 
     # -- networks ----------------------------------------------------------
 
@@ -1177,9 +1208,15 @@ def with_zone(store, api, record, fn):
 
 
 def record_name(store, key):
-    name = store.settings.get(key) or ""
+    """The DNS name behind a slot key (``s1`` -> the server's record)."""
+    sid, _, second = key.partition(":")
+    try:
+        server = store.server(sid)
+    except KeyError:
+        raise CFError("سرور این رکورد دیگر وجود ندارد")
+    name = server.get("record2" if second else "record") or ""
     if not name:
-        raise CFError("نام رکورد %s در تنظیمات خالی است" % key)
+        raise CFError("رکورد آدرس سرور «%s» تنظیم نشده" % server["name"])
     return name
 
 
@@ -1212,7 +1249,7 @@ def inspect_record(store, key, rtype, api_factory=CloudflareAPI):
 
 def apply_record(store, key, ips, via_ips=(), network="", kind="apply",
                  api_factory=CloudflareAPI, merged=False):
-    """Point record ``key`` (``ip1``/``ip2``) at ``ips``; returns the route used."""
+    """Point the record of slot ``key`` at ``ips``; returns the route used."""
     record = record_name(store, key)
     if not ips:
         raise CFError("هیچ IP برای اعمال نیست")
@@ -1282,49 +1319,50 @@ def rank_addresses(matrix, networks, now, window_s, among=None):
 
 def choose_addresses(matrix, networks, now, window_s, count, must_work_on=None,
                      merge_gaps=False):
-    """What ip1 and ip2 should hold.
+    """What a server's record (``main``) and second record should hold.
 
-    ``ip1``: up to ``count`` addresses that all cover the widest set of
+    ``main``: up to ``count`` addresses that all cover the widest set of
     networks, best worst-ping first; between equally wide sets the one with
     ``must_work_on`` (the network just scanned) wins. A network no common
-    address reaches never pulls ip1 away from the others: it is left to
-    ``ip2``, the best addresses for the networks ip1 leaves out.
+    address reaches never pulls the record away from the others: it is left
+    to ``second``, the best addresses for the networks ``main`` leaves out.
 
-    ``merge_gaps`` (no ip2 record): those addresses join ip1 instead - one
-    record holding a separate address per network beats a network with none.
+    ``merge_gaps`` (no second record): those addresses join ``main`` instead -
+    one record holding a separate address per network beats a network with
+    none.
     """
     rows = rank_addresses(matrix, networks, now, window_s)
     rows.sort(key=lambda r: (-len(r[1]), must_work_on not in r[1], r[2]))
     if not rows:
-        return {"ip1": [], "ip2": [], "covered": [], "uncovered": list(networks)}
+        return {"main": [], "second": [], "merged": False, "covered": [], "uncovered": list(networks)}
     best_set = set(rows[0][1])
-    ip1 = [ip for ip, covered, _ in rows if set(covered) == best_set][:count]
+    main = [ip for ip, covered, _ in rows if set(covered) == best_set][:count]
     uncovered = [n for n in networks if n not in best_set]
-    ip2 = []
+    second = []
     if uncovered:
         scored = []
         for ip, covered, _ in rows:
             gain = [n for n in covered if n in uncovered]
-            if gain and ip not in ip1:
+            if gain and ip not in main:
                 pings = [matrix[ip][n].get("ping") or 0 for n in gain]
                 scored.append((ip, len(gain), max(pings)))
         scored.sort(key=lambda r: (-r[1], r[2]))
-        ip2 = [ip for ip, _, _ in scored[:count]]
-    merged = bool(merge_gaps and ip2)
+        second = [ip for ip, _, _ in scored[:count]]
+    merged = bool(merge_gaps and second)
     if merged:
         extra, still = [], set(uncovered)
-        for ip in ip2:
+        for ip in second:
             gain = still & set(coverage(matrix, ip, networks, now, window_s)[0])
             if gain:
                 extra.append(ip)
                 still -= gain
-        ip1 = ip1[:max(1, min(count, 3) - len(extra))] + extra
-        ip1 = ip1[:3]
-        ip2 = []
+        main = main[:max(1, min(count, 3) - len(extra))] + extra
+        main = main[:3]
+        second = []
     covered = set()
-    for ip in ip1:
+    for ip in main:
         covered.update(coverage(matrix, ip, networks, now, window_s)[0])
-    return {"ip1": ip1, "ip2": ip2, "merged": merged,
+    return {"main": main, "second": second, "merged": merged,
             "covered": [n for n in networks if n in covered],
             "uncovered": uncovered}
 
@@ -1345,7 +1383,7 @@ def seeds_for(matrix, nid, networks, now, window_s, limit=60):
 
 # ---------------------------------------------------------------- scan engine
 
-STEP_TITLES = ("بررسی ip1 روی این اینترنت", "اسکن", "انتخاب و تأیید روی سرورها",
+STEP_TITLES = ("بررسی رکوردها روی این اینترنت", "اسکن", "انتخاب و تأیید روی هر سرور",
                "به‌روزرسانی DNS")
 
 
@@ -1373,9 +1411,9 @@ class UserError(Exception):
 
 
 class ScanJob:
-    """One network: check ip1 here -> scan -> choose -> confirm -> apply.
+    """One network: check the records here -> scan -> choose -> confirm -> apply.
 
-    ``mode``: ``auto`` scans only when ip1 fails on this network, ``force``
+    ``mode``: ``auto`` scans only when a server is not served here, ``force``
     scans anyway.
     """
 
@@ -1439,54 +1477,61 @@ class ScanJob:
         has_token = bool(store.token)
         window = float(s["fresh_hours"]) * 3600
         net_ids = [n["id"] for n in store.networks]
-        result = {"kind": None, "network": self.nid, "ip1": [], "ip2": [], "current": [],
-                  "verified": [], "covered": [], "uncovered": [], "warning": "",
+        slots = [sl for sl in store.slots() if sl[1].get("sni")]
+        result = {"kind": None, "network": self.nid, "servers": {}, "changes": {},
+                  "merged_slots": [], "current": {}, "verified": [], "warning": "",
                   "scanned": 0, "answered": 0, "errors": ""}
 
-        # 1. what ip1 (and ip2) hold now, measured on this network
+        # 1. what every server's record holds now, measured on this network
         self.events.step(0, "run")
         current = {}
-        for key in RECORDS:
+        for key, server, name, _ in slots:
             ips = store.record_ips(key)
-            if s.get(key) and has_token:
+            if has_token:
                 try:
                     ips = read_record(store, key, rtype, api_factory=self.api_factory)
                     store.set_record_ips(key, ips)
                 except (CFError, NetError) as exc:
-                    self.events.note("خواندن %s از کلادفلر نشد: %s" % (key, exc))
+                    self.events.note("خواندن %s از کلادفلر نشد: %s" % (name, exc))
             current[key] = [ip for ip in ips if (":" in ip) == (version == 6)]
-        result["current"] = current["ip1"]
-        checked = current["ip1"] + [ip for ip in current["ip2"] if ip not in current["ip1"]]
-        healthy = None
+        result["current"] = current
+        checked = []
+        for ips in current.values():
+            checked += [ip for ip in ips if ip not in checked]
+        served = {}
         if checked:
             attempts = max(4, int(s["verify_attempts"]) // 2)
             ms = self._measure_many(checked, target, ctx, attempts, use_ws)
             self._record(ms)
             by_ip = {m["ip"]: m for m in ms}
+            store.save()
 
             def serves_here(key):
                 """Every address works here - or, in a record holding one
                 address per network, at least one does."""
-                ips = current[key]
+                ips = current.get(key) or []
                 if not ips:
                     return False
                 ok = [self._ok(by_ip[ip]) for ip in ips]
                 return any(ok) if store.record_merged(key) else all(ok)
 
-            healthy = any(serves_here(key) for key in RECORDS)
-            store.save()
+            for server in servers:
+                if server.get("record"):
+                    served[server["id"]] = (serves_here(slot_key(server["id"]))
+                                            or serves_here(slot_key(server["id"], True)))
+            healthy = bool(served) and all(served.values())
             self.events.step(0, "ok" if healthy else "fail",
                              "  ".join(self._measure_text(by_ip[ip]) for ip in checked))
         else:
-            self.events.step(0, "skip", "ip1 هنوز IP ندارد")
+            healthy = False
+            self.events.step(0, "skip", "رکوردها هنوز IP ندارند")
         if self.cancelled:
             return self._stopped(result)
         if healthy and self.mode == "auto":
             for i in (1, 2, 3):
                 self.events.step(i, "skip")
-            self._fill_coverage(result, net_ids, window)
             result["kind"] = "healthy"
-            result["ip1"] = current["ip1"]
+            result["servers"] = {sid: {"main": current.get(sid) or []} for sid in served}
             return result
 
         # 2. scan: addresses working elsewhere first
@@ -1527,7 +1572,7 @@ class ScanJob:
             return result
         self.events.step(1, "ok", "%d از %d پاسخ داد" % (len(answered), scanned))
 
-        # 3. careful measure, then choose by coverage and confirm on every server
+        # 3. careful measure, then choose by coverage, per server, confirmed on it
         self.events.step(2, "run")
         top = sorted(answered, key=lambda r: r["total"])[:int(s["verify_top"])]
         seeded = [r for r in answered if r["ip"] in seeds and r not in top][:int(s["verify_top"])]
@@ -1543,38 +1588,54 @@ class ScanJob:
         self.events.found(ms)
         if self.cancelled:
             return self._stopped(result)
+        names = {n["id"]: n["name"] for n in store.networks}
         count = int(s["ips_per_record"])
-        choice = self._choose_confirmed(servers[1:], ctx, net_ids, window, count)
-        result.update(ip1=choice["ip1"], ip2=choice["ip2"] if s.get("ip2") else [],
-                      covered=choice["covered"], uncovered=choice["uncovered"],
-                      merged=choice.get("merged", False))
-        if not choice["ip1"]:
+        lines, gaps = [], []
+        for server in servers:
+            choice = self._choose_confirmed(server, ctx, net_ids, window, count)
+            result["servers"][server["id"]] = choice
+            if not choice["main"]:
+                lines.append("%s: IP تأییدشده‌ای نیست" % server["name"])
+                continue
+            line = "%s: %s" % (server["name"], ", ".join(choice["main"]))
+            if choice["uncovered"] and not choice["merged"] and not server.get("record2"):
+                line += " (بدون پوشش: %s)" % "، ".join(names[n] for n in choice["uncovered"])
+            lines.append(line)
+            if choice["merged"]:
+                gaps.append(server["name"])
+            if not server.get("record"):
+                continue
+            for key, ips in ((slot_key(server["id"]), choice["main"]),
+                             (slot_key(server["id"], True),
+                              choice["second"] if server.get("record2") else [])):
+                if ips and sorted(ips) != sorted(current.get(key) or []):
+                    result["changes"][key] = ips
+            if choice["merged"]:
+                result["merged_slots"].append(slot_key(server["id"]))
+        if not any(c["main"] for c in result["servers"].values()):
             errs = [e for m in ms for e in m["errors"]]
             self.events.step(2, "fail", "هیچ IP از تأیید رد نشد (%s)" % error_summary(errs))
             result["kind"] = "nothing"
             result["hint"] = self._hint(errs, version, verify=True, use_ws=use_ws)
             return result
-        names = {n["id"]: n["name"] for n in store.networks}
-        detail = "ip1: %s · پوشش: %s" % (", ".join(choice["ip1"]),
-                                         "، ".join(names[n] for n in choice["covered"]))
-        if choice["uncovered"]:
-            detail += " · بدون پوشش: %s" % "، ".join(names[n] for n in choice["uncovered"])
-        self.events.step(2, "ok", detail)
-        if choice.get("merged"):
-            self.events.note("IP مشترکی برای %s پیدا نشد؛ ip1 برای هر اینترنت IP جدا گرفت. "
-                             "اگر ادامه داشت، رکورد ip2 را در تنظیمات فعال کنید."
-                             % "، ".join(names[n] for n in choice["uncovered"]))
+        self.events.step(2, "ok", "\n".join(lines))
+        if gaps:
+            self.events.note("IP مشترکی برای همهٔ اینترنت‌ها پیدا نشد؛ رکورد %s برای هر اینترنت "
+                             "IP جدا گرفت. اگر ادامه داشت، رکورد دوم را برای آن سرور فعال کنید."
+                             % "، ".join(gaps))
 
         # 4. the records
         result["via"] = [m["ip"] for m in ms if m["ok"]]
-        changes = {k: result[k] for k in RECORDS
-                   if result[k] and sorted(result[k]) != sorted(current[k])}
-        result["changes"] = changes
-        if not changes:
-            self.events.step(3, "ok", "رکوردها همین IPها را دارند")
-            result["kind"] = "unchanged"
-        elif not has_token or not s.get("ip1"):
-            self.events.step(3, "skip", "توکن یا نام رکورد ip1 تنظیم نشده")
+        if not result["changes"]:
+            missing = [sv["name"] for sv in servers if not sv.get("record")]
+            if missing:
+                self.events.step(3, "skip", "رکورد آدرس تنظیم نشده: %s" % "، ".join(missing))
+                result["kind"] = "found"
+            else:
+                self.events.step(3, "ok", "رکوردها همین IPها را دارند")
+                result["kind"] = "unchanged"
+        elif not has_token:
+            self.events.step(3, "skip", "توکن کلادفلر تنظیم نشده")
             result["kind"] = "found"
         elif not s["auto_apply"]:
             self.events.step(3, "wait", "منتظر تأیید شما")
@@ -1593,8 +1654,8 @@ class ScanJob:
             for key, ips in changes.items():
                 apply_record(self.store, key, ips, result.get("via") or [], self.nid,
                              api_factory=self.api_factory,
-                             merged=key == "ip1" and bool(result.get("merged")))
-                done.append("%s → %s" % (self.store.settings[key], ", ".join(ips)))
+                             merged=key in (result.get("merged_slots") or []))
+                done.append("%s → %s" % (record_name(self.store, key), ", ".join(ips)))
         except (CFError, NetError) as exc:
             self.events.step(3, "fail", str(exc))
             result["kind"] = "apply_failed"
@@ -1615,42 +1676,38 @@ class ScanJob:
             self.store.record_result(m["ip"], self.nid, self._ok(m), m.get("ping"),
                                      m.get("colo", ""))
 
-    def _fill_coverage(self, result, net_ids, window):
-        now = self.clock()
-        active = active_networks(self.store.matrix, net_ids, now, window)
-        covered = set()
-        for ip in result.get("current") or []:
-            covered.update(coverage(self.store.matrix, ip, active, now, window)[0])
-        result["covered"] = [n for n in active if n in covered]
-        result["uncovered"] = [n for n in active if n not in covered]
-
-    def _choose_confirmed(self, other_servers, ctx, net_ids, window, count):
-        """choose_addresses, dropping any address another server refuses."""
+    def _choose_confirmed(self, server, ctx, net_ids, window, count):
+        """choose_addresses for one server, dropping what it refuses."""
         refused = set()
+        target = Target.from_settings(server)
         while True:
             now = self.clock()
             active = active_networks(self.store.matrix, net_ids, now, window)
             matrix = {ip: cells for ip, cells in self.store.matrix.items() if ip not in refused}
             choice = choose_addresses(matrix, active, now, window, count, must_work_on=self.nid,
-                                      merge_gaps=not self.store.settings.get("ip2"))
-            if not other_servers:
-                return choice
-            bad = [ip for ip in choice["ip1"] + choice["ip2"]
-                   if not self._works_on_servers(ip, other_servers, ctx)]
+                                      merge_gaps=not server.get("record2"))
+            # only what works on this network can be confirmed from here; the
+            # rest keeps what its own network's scan measured
+            here = [ip for ip in choice["main"] + choice["second"]
+                    if fresh_cell((self.store.matrix.get(ip) or {}).get(self.nid), now, window)
+                    and self.store.matrix[ip][self.nid].get("ok")]
+            bad = [ip for ip in here if not self._works_on(ip, target, ctx)]
             if not bad:
                 return choice
             refused.update(bad)
-            self.events.note("رد شد روی سرور دیگر: %s" % ", ".join(bad))
+            self.events.note("رد شد روی %s: %s" % (server["name"], ", ".join(bad)))
 
-    def _works_on_servers(self, ip, servers, ctx):
-        timeout = float(self.store.settings["timeout"]) + 1.0
-        for server in servers:
-            target = Target.from_settings(server)
-            m = measure(ip, target, ctx, 3, timeout, bool(target.path), cancel=self.cancel_event,
-                        pause=0.05, probe_trace=self.probe_trace, probe_ws=self.probe_ws)
-            if m["ok"] == 0:
-                return False
-        return True
+    def _works_on(self, ip, target, ctx):
+        """A few WebSocket upgrades (or traces) through ``ip`` as ``target``."""
+        cache = self.__dict__.setdefault("_confirmed", {})
+        key = (ip, target.sni, target.path, target.port)
+        if key not in cache:
+            timeout = float(self.store.settings["timeout"]) + 1.0
+            m = measure(ip, target, ctx, 3, timeout, bool(target.path),
+                        cancel=self.cancel_event, pause=0.05,
+                        probe_trace=self.probe_trace, probe_ws=self.probe_ws)
+            cache[key] = m["ok"] > 0
+        return cache[key]
 
     def _fast_pass(self, cands, target, ctx, s):
         queue = list(cands)
@@ -1745,11 +1802,11 @@ class ScanJob:
 
 
 RESULT_TEXT = {
-    "healthy": "ip1 روی این اینترنت سالم است",
-    "applied": "رکورد به‌روز شد",
+    "healthy": "همهٔ سرورها روی این اینترنت سالم‌اند",
+    "applied": "رکوردها به‌روز شد",
     "unchanged": "بهترین IPها همان قبلی‌اند",
     "pending": "IP پیدا شد؛ «اعمال» را بزنید",
-    "found": "IP پیدا شد (توکن یا رکورد تنظیم نشده)",
+    "found": "IP پیدا شد (توکن یا رکورد آدرس تنظیم نشده)",
     "stopped": "متوقف شد",
     "nothing": "IP سالمی پیدا نشد",
     "apply_failed": "اعمال روی DNS نشد",
@@ -1758,14 +1815,22 @@ RESULT_TEXT = {
 GOOD_KINDS = ("healthy", "applied", "unchanged", "pending", "found")
 
 
-def result_line(result):
-    """One Persian line for a finished run."""
+def result_line(result, store=None):
+    """A short Persian summary of a finished run."""
     kind = result.get("kind")
     text = RESULT_TEXT.get(kind, kind or "?")
-    if result.get("ip1") and kind in ("applied", "pending", "unchanged", "found", "healthy"):
-        text += ": " + ", ".join(result["ip1"])
     if kind in ("error", "apply_failed") and result.get("message"):
         text += " — " + result["message"]
+    if kind in GOOD_KINDS:
+        for sid, choice in (result.get("servers") or {}).items():
+            if choice.get("main"):
+                name = sid
+                if store is not None:
+                    try:
+                        name = store.server(sid)["name"]
+                    except KeyError:
+                        pass
+                text += "\n%s: %s" % (name, ", ".join(choice["main"]))
     return text
 
 
@@ -1908,7 +1973,7 @@ if ui is not None:
     # ------------------------------------------------------------------ record card
 
     class RecordCard(ui.View):
-        """One record (ip1 or ip2): its addresses and where each one works."""
+        """One server's record: its addresses and where each one works."""
 
         ROW = 58
 
@@ -1923,8 +1988,11 @@ if ui is not None:
             self.background_color = CARD
             self.corner_radius = 18
             self.border_width = 1
-            self.border_color = ACCENT if key == "ip1" else LINE
-            self.heading = make_label("%s · %s" % (key, s.get(key) or "تنظیم نشده"), 15, bold=True)
+            second = key.endswith(":2")
+            self.border_color = LINE if second else ACCENT
+            self.heading = make_label(store.slot_label(key), 16, bold=True)
+            self.record = make_label(record_name(store, key), 12, color=MUTED, mono=True)
+            self.add_subview(self.record)
             self.add_subview(self.heading)
             ips = store.record_ips(key)
             self.rows = []
@@ -1953,6 +2021,8 @@ if ui is not None:
                 parts.append("%s %s" % (n["name"], mark))
             last = (store.data["records"].get(key) or {}).get("ts")
             summary = "پوشش: %s" % " · ".join(parts) if ips else "هنوز IP ندارد؛ «اسکن این اینترنت» را بزنید"
+            if store.record_merged(key):
+                summary += " · هر اینترنت IP جدا"
             if last:
                 summary += "\nآخرین تغییر: %s" % ago(last)
             self.summary = make_label(summary, 12, color=MUTED, lines=2)
@@ -1960,12 +2030,13 @@ if ui is not None:
 
         @property
         def height_needed(self):
-            return 44 + max(1, len(self.rows)) * self.ROW + 44
+            return 62 + max(1, len(self.rows)) * self.ROW + 44
 
         def layout(self):
             w = self.width
             self.heading.frame = (16, 12, w - 32, 22)
-            y = 42
+            self.record.frame = (16, 34, w - 32, 18)
+            y = 60
             for ip_label, chips in self.rows:
                 ip_label.frame = (16, y, w - 32, 22)
                 n = max(1, len(chips))
@@ -2022,8 +2093,7 @@ if ui is not None:
             self.networks.selected_index = ids.index(store.data["network"])
             for c in self.cards:
                 self.scroll.remove_subview(c)
-            keys = [k for k in RECORDS if k == "ip1" or store.settings.get(k)]
-            self.cards = [RecordCard(self.app, k) for k in keys]
+            self.cards = [RecordCard(self.app, key) for key, _, _, _ in store.slots()]
             for c in self.cards:
                 self.scroll.add_subview(c)
             problems = []
@@ -2031,8 +2101,9 @@ if ui is not None:
                 problems.append("توکن کلادفلر")
             if not store.servers:
                 problems.append("یک سرور CDN")
-            if not store.settings.get("ip1"):
-                problems.append("نام رکورد ip1")
+            missing = [sv["name"] for sv in store.servers if not sv.get("record")]
+            if missing:
+                problems.append("رکورد آدرس سرور %s" % "، ".join(missing))
             self.setup.text = fa("برای شروع در «تنظیمات» وارد کنید: %s" % "، ".join(problems)) \
                 if problems else ""
             self.setup.hidden = not problems
@@ -2257,7 +2328,7 @@ if ui is not None:
             self.stop_btn.hidden = True
             self.done_btn.hidden = False
             self.apply_btn.hidden = kind not in ("pending", "apply_failed")
-            self._show_outcome(result_line(result), kind in GOOD_KINDS)
+            self._show_outcome(result_line(result, self.app.store), kind in GOOD_KINDS)
             console.hud_alert("تمام شد · %.0f ثانیه" % (time.time() - self.started),
                               "success" if kind in GOOD_KINDS else "error", 1.2)
             self.layout()
@@ -2291,7 +2362,7 @@ if ui is not None:
         def _after_apply(self, ok):
             self.apply_btn.enabled = True
             self.apply_btn.hidden = ok
-            self._show_outcome(result_line(self.result or {}), ok)
+            self._show_outcome(result_line(self.result or {}, self.app.store), ok)
             self.layout()
             self.app.main.refresh()
 
@@ -2328,7 +2399,7 @@ if ui is not None:
             old = ",".join(h.get("old") or []) or "—"
             new = ",".join(h.get("new") or []) or "—"
             where = names.get(h.get("network"), h.get("network") or "")
-            lines.append(fa("%s · %s · %s → %s%s" % (when, h.get("record", "?"), old, new,
+            lines.append(fa("%s · %s · %s → %s%s" % (when, store.slot_label(h.get("record", "?")), old, new,
                                                      " · " + where if where else "")))
         return lines
 
@@ -2338,7 +2409,9 @@ if ui is not None:
         window = float(s["fresh_hours"]) * 3600
         networks = [n["id"] for n in store.networks]
         names = {n["id"]: n["name"] for n in store.networks}
-        in_records = set(store.record_ips("ip1")) | set(store.record_ips("ip2"))
+        in_records = set()
+        for key, _, _, _ in store.slots():
+            in_records.update(store.record_ips(key))
         lines = []
         for ip, covered, worst in rank_addresses(store.matrix, networks, now, window):
             cells = store.matrix.get(ip) or {}
@@ -2388,20 +2461,20 @@ if ui is not None:
 
         def first_run(self):
             alert("خوش آمدید",
-                  "دو قدم:\n۱. توکن کلادفلر و نام رکورد ip1\n"
-                  "۲. سرورهای CDN (دامنه و path) برای تأیید\n\n"
+                  "دو قدم:\n۱. هر سرور CDN: دامنه، path و رکورد آدرسش (مثلاً cdn1.germany…)\n"
+                  "۲. توکن کلادفلر\n\n"
                   "بعد روی هر اینترنت «اسکن این اینترنت» را بزنید.")
             if not self.store.servers:
                 self.edit_server(None)
             self.edit_main()
 
         def open_settings(self):
-            index = pick("تنظیمات", ["توکن و رکوردها", "سرورهای CDN", "اینترنت‌ها",
+            index = pick("تنظیمات", ["سرورهای CDN و رکوردها", "کلادفلر (توکن)", "اینترنت‌ها",
                                      "پیشرفته (اسکن)"])
             if index == 0:
-                self.edit_main()
-            elif index == 1:
                 self.manage_servers()
+            elif index == 1:
+                self.edit_main()
             elif index == 2:
                 self.manage_networks()
             elif index == 3:
@@ -2416,15 +2489,12 @@ if ui is not None:
                      "title": "API Token (%s)" % ("ذخیره شده" if has else "خالی"), "value": ""},
                     text_field("zone_id", "Zone ID (اختیاری)", s["zone_id"]),
                 ], "توکن فقط در Keychain ذخیره می‌شود. خالی = بدون تغییر، «-» = پاک کردن."),
-                ("رکوردها (ابر خاکستری)", [
-                    text_field("ip1", "ip1 (همهٔ کانفیگ‌های CDN)", s["ip1"]),
-                    text_field("ip2", "ip2 (اختیاری)", s["ip2"]),
+                ("رکوردها", [
                     text_field("ips_per_record", "تعداد IP در هر رکورد (۱ تا ۳)", s["ips_per_record"], "number"),
                     {"type": "switch", "key": "auto_apply", "title": "اعمال خودکار", "value": s["auto_apply"]},
-                ], "ip1 را در پنل به‌عنوان address همهٔ هاست‌های CDN بگذارید. ip2 فقط وقتی لازم است "
-                   "که IP مشترکی برای یک اینترنت پیدا نشود."),
+                ], "رکورد آدرس هر سرور در «سرورهای CDN» تنظیم می‌شود."),
             ]
-            values = dialogs.form_dialog("توکن و رکوردها", sections=sections, done_button_title="ذخیره")
+            values = dialogs.form_dialog("کلادفلر", sections=sections, done_button_title="ذخیره")
             if values is None:
                 return
             raw = (values.pop("token", "") or "").strip()
@@ -2481,18 +2551,27 @@ if ui is not None:
         def edit_server(self, sid):
             server = self.store.server(sid) if sid else dict(SERVER_DEFAULTS)
             fields = [
-                text_field("name", "نام (مثلاً DE)", server["name"]),
+                text_field("name", "نام (مثلاً آلمان)", server["name"]),
                 text_field("sni", "دامنهٔ CDN (SNI)", server["sni"]),
                 text_field("path", "WebSocket path", server["path"]),
                 text_field("port", "پورت", server["port"], "number"),
                 {"type": "switch", "key": "tls", "title": "TLS", "value": server["tls"]},
             ]
+            records = [
+                text_field("record", "رکورد آدرس", server["record"] or suggest_record(server["sni"])),
+                text_field("record2", "رکورد دوم (اختیاری)", server["record2"]),
+            ]
+            sections = [
+                ("سرور", fields, "همان دامنه و path هاست CDN این سرور در پنل."),
+                ("رکورد (ابر خاکستری)", records,
+                 "address هاست CDN این سرور در پنل، مثلاً cdn1.germany.example.com. خالی بگذارید "
+                 "تا cdn1.<دامنهٔ CDN> پیشنهاد شود. رکورد دوم فقط وقتی لازم است که IP مشترکی "
+                 "برای یک اینترنت پیدا نشود."),
+            ]
             if sid:
-                fields.append({"type": "switch", "key": "delete", "title": "حذف این سرور",
-                               "value": False})
-            values = dialogs.form_dialog("سرور CDN", sections=[("سرور", fields,
-                "همان دامنه و path هاست CDN در پنل. هر IP قبل از اعمال روی همهٔ سرورها تأیید می‌شود.")],
-                done_button_title="ذخیره")
+                sections.append(("", [{"type": "switch", "key": "delete", "title": "حذف این سرور",
+                                       "value": False}]))
+            values = dialogs.form_dialog("سرور CDN", sections=sections, done_button_title="ذخیره")
             if values is None:
                 return
             if sid and values.get("delete"):
@@ -2501,6 +2580,12 @@ if ui is not None:
                 return
             if not normalise_host(values.get("sni")):
                 alert("دامنهٔ CDN", "دامنهٔ CDN را وارد کنید.")
+                return self.edit_server(sid)
+            if not normalise_host(values.get("record")):
+                values["record"] = suggest_record(values.get("sni"))
+            if normalise_host(values.get("record")) == normalise_host(values.get("sni")):
+                alert("رکورد آدرس", "رکورد آدرس باید با دامنهٔ CDN فرق داشته باشد "
+                                    "(رکورد خاکستری، دامنهٔ CDN نارنجی).")
                 return self.edit_server(sid)
             try:
                 self.store.save_server(sid, values)
@@ -2512,7 +2597,8 @@ if ui is not None:
         def manage_servers(self):
             while True:
                 servers = self.store.servers
-                items = ["%s — %s %s" % (s["name"], s["sni"], s["path"]) for s in servers]
+                items = ["%s — %s → %s" % (s["name"], s["sni"], s["record"] or "بدون رکورد")
+                         for s in servers]
                 index = pick("سرورهای CDN", items + ["+ سرور جدید"])
                 if index is None:
                     break
@@ -2547,8 +2633,8 @@ if ui is not None:
                 "جدول همهٔ IPها",
                 "تاریخچهٔ تغییرات",
                 "تست یک IP روی این اینترنت",
-                "تنظیم دستی ip1",
-                "برگرداندن ip1 قبلی",
+                "تنظیم دستی یک رکورد",
+                "برگرداندن رکورد به IP قبلی",
                 "تست اتصال به کلادفلر",
                 "بررسی دوبارهٔ اتصال اینترنت",
                 "به‌روزرسانی رنج IP کلادفلر",
@@ -2566,14 +2652,21 @@ if ui is not None:
                 ip = console.input_alert("تست یک IP", "آدرس IP کلادفلر", "", "تست").strip()
                 self.test_ip(ip)
             elif index == 3:
-                text = console.input_alert("ip1 دستی", "یک یا چند IP، با کاما جدا کنید", "", "اعمال")
-                self.apply_manual("ip1", [x.strip() for x in text.replace(" ", ",").split(",") if x.strip()])
+                key = self.pick_slot("کدام رکورد؟")
+                if key:
+                    text = console.input_alert(record_name(self.store, key),
+                                               "یک یا چند IP، با کاما جدا کنید", "", "اعمال")
+                    self.apply_manual(key, [x.strip() for x in text.replace(" ", ",").split(",")
+                                            if x.strip()])
             elif index == 4:
-                old = self.store.previous_ips("ip1")
-                if not old:
-                    alert("برگرداندن", "IP قبلی ثبت نشده.")
-                elif alert("برگرداندن", "ip1 به %s برگردد؟" % ", ".join(old), "برگردان") == 1:
-                    self.apply_manual("ip1", old, "rollback")
+                key = self.pick_slot("کدام رکورد؟")
+                if key:
+                    old = self.store.previous_ips(key)
+                    if not old:
+                        alert("برگرداندن", "IP قبلی ثبت نشده.")
+                    elif alert("برگرداندن", "%s به %s برگردد؟" % (record_name(self.store, key),
+                                                                 ", ".join(old)), "برگردان") == 1:
+                        self.apply_manual(key, old, "rollback")
             elif index == 5:
                 self.test_cloudflare()
             elif index == 6:
@@ -2600,23 +2693,33 @@ if ui is not None:
                 clipboard.set(read_log_tail(120))
                 console.hud_alert("لاگ کپی شد")
 
+        def pick_slot(self, title):
+            slots = self.store.slots()
+            if not slots:
+                alert("رکورد", "هیچ سروری رکورد آدرس ندارد.")
+                return None
+            if len(slots) == 1:
+                return slots[0][0]
+            index = pick(title, ["%s — %s" % (self.store.slot_label(k), name)
+                                 for k, _, name, _ in slots])
+            return None if index is None else slots[index][0]
+
         def address_menu(self, ip):
-            items = ["کپی IP", "گذاشتن روی ip1", "تست دوباره (۱۰ بار)"]
-            if self.store.settings.get("ip2"):
-                items.insert(2, "گذاشتن روی ip2")
+            slots = self.store.slots()
+            items = ["کپی IP", "تست دوباره (۱۰ بار)"] + \
+                    ["گذاشتن روی %s" % self.store.slot_label(k) for k, _, _, _ in slots]
             index = pick(ip, items)
             if index is None:
                 return
-            choice = items[index]
-            if choice == "کپی IP":
+            if index == 0:
                 clipboard.set(ip)
                 console.hud_alert("کپی شد")
-            elif choice.startswith("گذاشتن"):
-                key = "ip2" if "ip2" in choice else "ip1"
-                if alert(key, "%s فقط روی %s تنظیم شود؟" % (key, ip), "بله") == 1:
-                    self.apply_manual(key, [ip])
-            else:
+            elif index == 1:
                 self.test_ip(ip)
+            else:
+                key, _, name, _ = slots[index - 2]
+                if alert(name, "%s فقط روی %s تنظیم شود؟" % (name, ip), "بله") == 1:
+                    self.apply_manual(key, [ip])
 
         def apply_manual(self, key, ips, kind="manual"):
             if not ips:
@@ -2693,13 +2796,13 @@ if ui is not None:
                     alert("تست کلادفلر", "\n".join(lines))
                     return
                 rtype = "AAAA" if store.settings["ip_version"] == 6 else "A"
-                for key in RECORDS:
-                    if not store.settings.get(key):
-                        continue
+                if not store.slots():
+                    lines.append("هیچ سروری رکورد آدرس ندارد.")
+                for key, _, name, _ in store.slots():
                     try:
                         zone_name, ips, notes = inspect_record(store, key, rtype)
                         store.set_record_ips(key, ips)
-                        line = "%s (%s): %s" % (key, store.settings[key],
+                        line = "%s (%s): %s" % (store.slot_label(key), name,
                                                 ", ".join(ips) or "هنوز رکورد %s ندارد" % rtype)
                         if zone_name:
                             line += "\n  دامنه: %s" % zone_name
@@ -2709,7 +2812,7 @@ if ui is not None:
                             line += "\n  ⚠ %s" % n
                         lines.append(line)
                     except (CFError, NetError) as exc:
-                        lines.append("%s: خطا — %s" % (key, exc))
+                        lines.append("%s: خطا — %s" % (store.slot_label(key), exc))
                 store.save()
             finally:
                 console.hide_activity()
