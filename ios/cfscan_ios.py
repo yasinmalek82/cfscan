@@ -46,6 +46,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid as uuid_module
 
 try:  # Pythonista only; everything below the UI marker needs these.
     import ui
@@ -107,7 +108,7 @@ DEFAULT_SETTINGS = {
     "verify_top": 6,
     "verify_attempts": 8,
     "max_loss_pct": 0,
-    "max_ping_ms": 800,
+    "max_ping_ms": 1500,    # slowest config delay that still counts as healthy
     "colos": "",            # allowed datacentres, e.g. "FRA,AMS"; empty = any
     "ip_version": 4,
     "bad_ttl_hours": 6,
@@ -120,6 +121,7 @@ SERVER_DEFAULTS = {
     "path": "",             # WebSocket path of the config; empty = trace test only
     "port": 443,
     "tls": True,
+    "host": "",             # Host header when it differs from the SNI
     "record": "",           # DNS-only address record of its CDN config (cdn1.germany...)
     "record2": "",          # optional second record for networks record cannot cover
 }
@@ -225,7 +227,7 @@ def _coerce(key, value):
         if key == "ip_version" and int(number) not in (4, 6):
             raise ValueError("ip_version must be 4 or 6")
         return int(number) if isinstance(default, int) else number
-    if key in ("sni", "record", "record2"):
+    if key in ("sni", "host", "record", "record2"):
         return normalise_host(value)
     if key == "path":
         return normalise_path(value)
@@ -276,6 +278,9 @@ def normalise_data(raw):
             except (TypeError, ValueError):
                 pass
 
+    if version < 4 and settings.get("max_ping_ms") == 800:
+        settings["max_ping_ms"] = DEFAULT_SETTINGS["max_ping_ms"]  # was a TCP ping limit
+
     if version == 1:
         server_list = [dict(raw_settings, id="s1")] if raw_settings.get("sni") else []
         net_list = raw.get("profiles") or []
@@ -318,8 +323,15 @@ def normalise_data(raw):
                                               "colo": g.get("colo", ""), "ts": g.get("ts", 0)}
         if mem.get("bad"):
             bad.setdefault(nid, {}).update(mem["bad"])
+    if version < 4:
+        # older results timed a TCP connect, not a config delay; keep whether
+        # an address worked, forget the numbers
+        for cells in matrix.values():
+            for c in cells.values():
+                if isinstance(c, dict):
+                    c["ping"] = None
 
-    records = raw.get("records") if version == 3 and isinstance(raw.get("records"), dict) else {}
+    records = raw.get("records") if version >= 3 and isinstance(raw.get("records"), dict) else {}
     if servers and version == 3:
         first = servers[0]
         for old, field, key in (("ip1", "record", first["id"]), ("ip2", "record2", first["id"] + ":2")):
@@ -335,7 +347,7 @@ def normalise_data(raw):
     net_ids = [n["id"] for n in networks]
     current = raw.get("network")
     return {
-        "version": 3,
+        "version": 4,
         "settings": settings,
         "servers": servers,
         "networks": networks,
@@ -353,7 +365,7 @@ class Secrets:
     """The Cloudflare token: iOS Keychain in Pythonista, memory elsewhere."""
 
     def __init__(self):
-        self._memory = ""
+        self._memory = {}
         try:
             import keychain
         except ImportError:
@@ -361,19 +373,27 @@ class Secrets:
         self._keychain = keychain
 
     def get(self, sid=None):
-        if self._keychain is None:
-            return self._memory
-        return self._keychain.get_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) or ""
+        return self.get_named(KEYCHAIN_ACCOUNT)
 
     def set(self, token, sid=None):
-        token = (token or "").strip()
+        self.set_named(KEYCHAIN_ACCOUNT, token)
+
+    def get_named(self, name):
         if self._keychain is None:
-            self._memory = token
-        elif token:
-            self._keychain.set_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, token)
+            return self._memory.get(name, "") if isinstance(self._memory, dict) else ""
+        return self._keychain.get_password(KEYCHAIN_SERVICE, name) or ""
+
+    def set_named(self, name, value):
+        value = (value or "").strip()
+        if self._keychain is None:
+            if not isinstance(self._memory, dict):
+                self._memory = {}
+            self._memory[name] = value
+        elif value:
+            self._keychain.set_password(KEYCHAIN_SERVICE, name, value)
         else:
             try:
-                self._keychain.delete_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                self._keychain.delete_password(KEYCHAIN_SERVICE, name)
             except Exception:
                 pass
 
@@ -402,6 +422,19 @@ class Store:
     @property
     def token(self):
         return sanitize_token(self.secrets.get())
+
+    def uuid_for(self, sid):
+        """The VLESS uuid of a server's CDN config (Keychain), or ''."""
+        getter = getattr(self.secrets, "get_named", None)
+        return getter("vless:%s" % sid) if getter else ""
+
+    def set_uuid(self, sid, value):
+        setter = getattr(self.secrets, "set_named", None)
+        if setter:
+            setter("vless:%s" % sid, value)
+
+    def target(self, server):
+        return Target.from_settings(server, self.uuid_for(server["id"]))
 
     # -- settings ----------------------------------------------------------
 
@@ -454,6 +487,7 @@ class Store:
             for key in (sid, sid + ":2"):
                 self.data["records"].pop(key, None)
             self.save()
+        self.set_uuid(sid, "")
 
     def slots(self):
         """Every configured record: ``(key, server, record name, second)``."""
@@ -631,17 +665,69 @@ class Store:
 # ---------------------------------------------------------------- probes
 
 class Target:
-    """What a probe connects as: the config's SNI/Host, path, port and TLS."""
+    """What a probe connects as: the config's SNI, Host, path, port and TLS.
 
-    def __init__(self, sni, path="", port=443, tls=True):
+    With a VLESS ``uuid`` the WebSocket probe goes on through the tunnel,
+    exactly like a client's "real delay" test.
+    """
+
+    def __init__(self, sni, path="", port=443, tls=True, host="", uuid=""):
         self.sni = normalise_host(sni)
+        self.host = normalise_host(host) or self.sni
         self.path = normalise_path(path)
         self.port = int(port)
         self.tls = bool(tls)
+        self.uuid = str(uuid or "").strip()
 
     @classmethod
-    def from_settings(cls, s):
-        return cls(s["sni"], s["path"], s["port"], s["tls"])
+    def from_settings(cls, s, uuid=""):
+        return cls(s["sni"], s["path"], s["port"], s["tls"], s.get("host", ""), uuid)
+
+    @property
+    def kind(self):
+        """What a successful probe proves: the config, the tunnel, or the edge."""
+        if self.uuid:
+            return "vless"
+        return "ws" if self.path else "trace"
+
+
+#: Where the "real delay" request goes, as in the clients (plain HTTP inside
+#: the tunnel, so no second TLS handshake is timed).
+DELAY_TEST_HOST = "www.gstatic.com"
+DELAY_TEST_PATH = "/generate_204"
+
+#: What the delay number means for each kind of test.
+DELAY_LABEL = {"vless": "تأخیر کانفیگ", "ws": "تأخیر تا سرور", "trace": "تأخیر تا کلادفلر"}
+
+
+def parse_vless_link(link):
+    """The parts of a ``vless://`` WebSocket config link, or ValueError."""
+    link = re.sub(_INVISIBLE, "", str(link or ""))
+    parts = urllib.parse.urlsplit(link)
+    if parts.scheme.lower() != "vless" or "@" not in parts.netloc:
+        raise ValueError("لینک باید با vless:// شروع شود")
+    user, _, hostport = parts.netloc.rpartition("@")
+    try:
+        uuid_text = str(uuid_module.UUID(urllib.parse.unquote(user)))
+    except ValueError:
+        raise ValueError("UUID لینک نامعتبر است")
+    query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+    kind = (query.get("type") or "tcp").lower()
+    if kind not in ("ws", "httpupgrade"):
+        raise ValueError("فقط کانفیگ WebSocket پشت CDN پشتیبانی می‌شود (type=%s)" % kind)
+    if query.get("encryption", "none") not in ("", "none"):
+        raise ValueError("encryption باید none باشد")
+    try:
+        port = parts.port or 443
+    except ValueError:
+        raise ValueError("پورت لینک نامعتبر است")
+    host = normalise_host(query.get("host", ""))
+    sni = normalise_host(query.get("sni", "")) or host or normalise_host(parts.hostname)
+    path = urllib.parse.unquote(query.get("path", "/")).split("?", 1)[0]
+    return {"uuid": uuid_text, "sni": sni, "host": host if host != sni else "",
+            "path": normalise_path(path) or "/", "port": port,
+            "tls": query.get("security", "none").lower() == "tls",
+            "name": urllib.parse.unquote(parts.fragment or "")}
 
 
 def make_context():
@@ -734,7 +820,7 @@ def trace_probe(ip, target, ctx, timeout):
     try:
         sock, start, r["tcp"] = _connect(ip, target, ctx, timeout)
         request = ("GET /cdn-cgi/trace HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
-                   "Accept: */*\r\nConnection: close\r\n\r\n" % (target.sni, USER_AGENT))
+                   "Accept: */*\r\nConnection: close\r\n\r\n" % (target.host, USER_AGENT))
         sock.sendall(request.encode("ascii"))
         data = _read(sock)
         r["total"] = (time.perf_counter() - start) * 1000
@@ -755,9 +841,86 @@ def trace_probe(ip, target, ctx, timeout):
     return r
 
 
+def ws_frame(payload, opcode=0x2):
+    """One masked client WebSocket frame."""
+    mask = os.urandom(4)
+    n = len(payload)
+    if n < 126:
+        head = bytes([0x80 | opcode, 0x80 | n])
+    elif n < 65536:
+        head = bytes([0x80 | opcode, 0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        head = bytes([0x80 | opcode, 0x80 | 127]) + n.to_bytes(8, "big")
+    return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+class _WSReader:
+    """Server frames from a socket, starting with bytes already read."""
+
+    def __init__(self, sock, pending=b""):
+        self.sock = sock
+        self.buf = pending
+
+    def _need(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionResetError("closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def frame(self):
+        b0, b1 = self._need(2)
+        n = b1 & 0x7F
+        if n == 126:
+            n = int.from_bytes(self._need(2), "big")
+        elif n == 127:
+            n = int.from_bytes(self._need(8), "big")
+        mask = self._need(4) if b1 & 0x80 else None
+        data = self._need(n)
+        if mask:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        return b0 & 0x0F, data
+
+
+def vless_request(uuid_text, host, port, payload):
+    """A VLESS request header (TCP to ``host:port``) followed by ``payload``."""
+    addr = host.encode("ascii")
+    return (b"\x00" + uuid_module.UUID(uuid_text).bytes + b"\x00\x01"
+            + int(port).to_bytes(2, "big") + b"\x02" + bytes([len(addr)]) + addr + payload)
+
+
+def _vless_exchange(sock, pending, target):
+    """Send one HTTP request through the tunnel; the status it gets back."""
+    request = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: close\r\n\r\n"
+               % (DELAY_TEST_PATH, DELAY_TEST_HOST, USER_AGENT)).encode("ascii")
+    sock.sendall(ws_frame(vless_request(target.uuid, DELAY_TEST_HOST, 80, request)))
+    reader = _WSReader(sock, pending)
+    data, header_done = b"", False
+    while True:
+        opcode, payload = reader.frame()
+        if opcode == 0x8:
+            raise ConnectionResetError("closed by server")
+        if opcode not in (0x0, 0x1, 0x2):
+            continue
+        data += payload
+        if not header_done:
+            if len(data) < 2 or len(data) < 2 + data[1]:
+                continue
+            data = data[2 + data[1]:]  # VLESS response header: version, addons
+            header_done = True
+        if b"\r\n" in data:
+            return parse_status(data)
+
+
 def ws_probe(ip, target, ctx, timeout):
     """A WebSocket upgrade on the config's path; ``101`` means the whole
-    chain (Cloudflare, the server and Xray) answered."""
+    chain (Cloudflare, the server and Xray) answered.
+
+    With a VLESS uuid on the target it goes on like a client's "real delay":
+    one HTTP request through the tunnel, timed until its status line.
+    """
     r = _blank_result(ip)
     sock = None
     key = base64.b64encode(os.urandom(16)).decode("ascii")
@@ -766,14 +929,24 @@ def ws_probe(ip, target, ctx, timeout):
         request = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
                    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                    "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
-                   % (target.path or "/", target.sni, USER_AGENT, key))
+                   % (target.path or "/", target.host, USER_AGENT, key))
         sock.sendall(request.encode("ascii"))
         data = _read(sock, until_head=True)
-        r["total"] = (time.perf_counter() - start) * 1000
         r["status"] = parse_status(data)
-        r["ok"] = r["status"] == 101
-        if not r["ok"]:
+        if r["status"] != 101:
+            r["total"] = (time.perf_counter() - start) * 1000
             r["error"] = "HTTP %s" % r["status"] if r["status"] else "empty answer"
+        elif not target.uuid:
+            r["total"] = (time.perf_counter() - start) * 1000
+            r["ok"] = True
+        else:
+            pending = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
+            status = _vless_exchange(sock, pending, target)
+            r["total"] = (time.perf_counter() - start) * 1000
+            r["status"] = status
+            r["ok"] = status is not None and 200 <= status < 400
+            if not r["ok"]:
+                r["error"] = "tunnel HTTP %s" % status if status else "tunnel: no answer"
     except Exception as exc:
         r["error"] = describe_error(exc)
     finally:
@@ -794,10 +967,18 @@ def successive_jitter_ms(samples):
 
 
 def measure(ip, target, ctx, attempts, timeout, use_ws, cancel=None, pause=0.15,
-            probe_trace=trace_probe, probe_ws=ws_probe):
-    """``attempts`` sequential probes of one address, summarised."""
+            probe_trace=trace_probe, probe_ws=ws_probe, warmup=False):
+    """``attempts`` sequential probes of one address, summarised.
+
+    ``delay`` is the median time of a whole probe - with a VLESS target the
+    client's "real delay"; ``ping`` the median TCP connect. ``warmup``
+    first makes one untimed probe: on a phone the first packets wake the
+    radio and would count 50-200 ms that no later request pays.
+    """
     tcp, total, errors = [], [], []
     colo = ""
+    if warmup and not (cancel is not None and cancel.is_set()):
+        (probe_ws if use_ws else probe_trace)(ip, target, ctx, timeout)
     for i in range(int(attempts)):
         if cancel is not None and cancel.is_set():
             break
@@ -816,21 +997,22 @@ def measure(ip, target, ctx, attempts, timeout, use_ws, cancel=None, pause=0.15,
         "loss": 100.0 * len(errors) / done if done else 100.0,
         "ping": statistics.median(tcp) if tcp else None,
         "total": statistics.median(total) if total else None,
-        "jitter": successive_jitter_ms(tcp),
+        "delay": statistics.median(total) if total else None,
+        "jitter": successive_jitter_ms(total),
         "colo": colo, "errors": errors,
     }
 
 
 def score(m):
-    """Lower is better: response time, twice the jitter, heavy loss penalty."""
-    if m.get("total") is None:
+    """Lower is better: config delay, twice the jitter, heavy loss penalty."""
+    if m.get("delay") is None:
         return float("inf")
-    return m["total"] + 2 * (m.get("jitter") or 0) + 50 * m.get("loss", 100)
+    return m["delay"] + 2 * (m.get("jitter") or 0) + 50 * m.get("loss", 100)
 
 
-def is_healthy(m, max_loss, max_ping):
+def is_healthy(m, max_loss, max_delay):
     return (m.get("ok", 0) > 0 and m.get("loss", 100) <= max_loss
-            and m.get("ping") is not None and m["ping"] <= max_ping)
+            and m.get("delay") is not None and m["delay"] <= max_delay)
 
 
 def parse_colos(text):
@@ -1287,6 +1469,9 @@ def connection_check(timeout=6.0, url="https://speed.cloudflare.com/cdn-cgi/trac
 
 # ---------------------------------------------------------------- coverage
 
+UNKNOWN_DELAY = 99999.0
+
+
 def fresh_cell(cell, now, window_s):
     return bool(cell) and now - cell.get("ts", 0) < window_s
 
@@ -1302,8 +1487,14 @@ def coverage(matrix, ip, networks, now, window_s):
     cells = matrix.get(ip) or {}
     covered = [n for n in networks
                if fresh_cell(cells.get(n), now, window_s) and cells[n].get("ok")]
-    pings = [cells[n].get("ping") or 0 for n in covered]
+    pings = [cell_delay(cells[n]) for n in covered]
     return covered, (max(pings) if pings else float("inf"))
+
+
+def cell_delay(cell):
+    """A cell's config delay; an unmeasured one ranks behind every measured one."""
+    value = (cell or {}).get("ping")
+    return UNKNOWN_DELAY if value is None else value
 
 
 def rank_addresses(matrix, networks, now, window_s, among=None):
@@ -1344,7 +1535,7 @@ def choose_addresses(matrix, networks, now, window_s, count, must_work_on=None,
         for ip, covered, _ in rows:
             gain = [n for n in covered if n in uncovered]
             if gain and ip not in main:
-                pings = [matrix[ip][n].get("ping") or 0 for n in gain]
+                pings = [cell_delay(matrix[ip][n]) for n in gain]
                 scored.append((ip, len(gain), max(pings)))
         scored.sort(key=lambda r: (-r[1], r[2]))
         second = [ip for ip, _, _ in scored[:count]]
@@ -1469,11 +1660,13 @@ class ScanJob:
         servers = [sv for sv in store.servers if sv.get("sni")]
         if not servers:
             raise UserError("اول یک سرور CDN (دامنه و path) در تنظیمات اضافه کنید")
-        target = Target.from_settings(servers[0])
+        # measure through the server whose full config we have, if any
+        servers.sort(key=lambda sv: not store.uuid_for(sv["id"]))
+        target = store.target(servers[0])
         version = int(s["ip_version"])
         rtype = "AAAA" if version == 6 else "A"
         ctx = self.context_factory()
-        use_ws = bool(target.path)
+        use_ws = target.kind != "trace"
         has_token = bool(store.token)
         window = float(s["fresh_hours"]) * 3600
         net_ids = [n["id"] for n in store.networks]
@@ -1574,7 +1767,9 @@ class ScanJob:
 
         # 3. careful measure, then choose by coverage, per server, confirmed on it
         self.events.step(2, "run")
-        top = sorted(answered, key=lambda r: r["total"])[:int(s["verify_top"])]
+        # the fast pass only says who answers; its times are taken under heavy
+        # load, so only the TCP connect (least affected) orders the shortlist
+        top = sorted(answered, key=lambda r: r["tcp"])[:int(s["verify_top"])]
         seeded = [r for r in answered if r["ip"] in seeds and r not in top][:int(s["verify_top"])]
         colo_of = {r["ip"]: r["colo"] for r in answered}
         ms = self._measure_many([r["ip"] for r in top + seeded], target, ctx,
@@ -1673,13 +1868,13 @@ class ScanJob:
 
     def _record(self, ms):
         for m in ms:
-            self.store.record_result(m["ip"], self.nid, self._ok(m), m.get("ping"),
+            self.store.record_result(m["ip"], self.nid, self._ok(m), m.get("delay"),
                                      m.get("colo", ""))
 
     def _choose_confirmed(self, server, ctx, net_ids, window, count):
         """choose_addresses for one server, dropping what it refuses."""
         refused = set()
-        target = Target.from_settings(server)
+        target = self.store.target(server)
         while True:
             now = self.clock()
             active = active_networks(self.store.matrix, net_ids, now, window)
@@ -1703,7 +1898,7 @@ class ScanJob:
         key = (ip, target.sni, target.path, target.port)
         if key not in cache:
             timeout = float(self.store.settings["timeout"]) + 1.0
-            m = measure(ip, target, ctx, 3, timeout, bool(target.path),
+            m = measure(ip, target, ctx, 3, timeout, target.kind != "trace",
                         cancel=self.cancel_event, pause=0.05,
                         probe_trace=self.probe_trace, probe_ws=self.probe_ws)
             cache[key] = m["ok"] > 0
@@ -1730,7 +1925,7 @@ class ScanJob:
                     counters["done"] += 1
                     if r["ok"] and (not colos or r["colo"] in colos):
                         answered.append(r)
-                        top = sorted(answered, key=lambda x: x["total"])[:8]
+                        top = sorted(answered, key=lambda x: x["tcp"])[:8]
                     else:
                         top = None
                         if not r["ok"]:
@@ -1756,14 +1951,20 @@ class ScanJob:
         self.events.progress(counters["done"], total, len(answered))
         return answered, counters["done"], failed, errors
 
+    #: Addresses measured at the same time in the careful step. More would
+    #: time the phone's CPU (Python threads, TLS) instead of the network.
+    CALM_WORKERS = 3
+
     def _measure_many(self, ips, target, ctx, attempts, use_ws):
         out = [None] * len(ips)
-        timeout = float(self.store.settings["timeout"]) + 1.0
+        timeout = float(self.store.settings["timeout"]) + 2.0
+        gate = threading.Semaphore(self.CALM_WORKERS)
 
         def one(i, ip):
-            out[i] = measure(ip, target, ctx, attempts, timeout, use_ws,
-                             cancel=self.cancel_event, probe_trace=self.probe_trace,
-                             probe_ws=self.probe_ws)
+            with gate:
+                out[i] = measure(ip, target, ctx, attempts, timeout, use_ws,
+                                 cancel=self.cancel_event, probe_trace=self.probe_trace,
+                                 probe_ws=self.probe_ws, warmup=True)
 
         threads = [threading.Thread(target=one, args=(i, ip), name="verify-%d" % i, daemon=True)
                    for i, ip in enumerate(ips)]
@@ -1775,9 +1976,9 @@ class ScanJob:
 
     @staticmethod
     def _measure_text(m):
-        if m.get("ping") is None:
+        if m.get("delay") is None:
             return "%s: پاسخ نداد (%s)" % (m["ip"], error_summary(m.get("errors") or [], 1))
-        return "%s %.0fms loss %.0f%%" % (m["ip"], m["ping"], m["loss"])
+        return "%s %.0fms loss %.0f%%" % (m["ip"], m["delay"], m["loss"])
 
     @staticmethod
     def _stopped(result):
@@ -1858,14 +2059,16 @@ def cell_text(cell, now, window_s):
 
 
 def format_measure_row(m):
-    if m.get("ping") is None:
+    """A careful result: config delay, its jitter, loss and datacentre."""
+    if m.get("delay") is None:
         return "%-15s  FAIL" % m["ip"]
-    return "%-15s %4.0fms j%-3.0f %3.0f%% %s" % (m["ip"], m["ping"], m.get("jitter") or 0,
+    return "%-15s %4.0fms ±%-3.0f %3.0f%% %s" % (m["ip"], m["delay"], m.get("jitter") or 0,
                                                  m["loss"], m.get("colo", ""))
 
 
 def format_trace_row(r):
-    return "%-15s %4.0fms  %s" % (r["ip"], r["total"], r.get("colo", ""))
+    """A fast-pass answer: only that it answered, and from where."""
+    return "%-15s  ✓  %s" % (r["ip"], r.get("colo", ""))
 
 
 # ======================================================================= UI
@@ -2293,7 +2496,7 @@ if ui is not None:
                 det.text = fa(detail)
                 det.text_color = BAD if status == "fail" else MUTED
             if index == 2 and status == "run":
-                self.table_title.text = fa("اندازه‌گیری دقیق روی این اینترنت")
+                self.table_title.text = fa("تأخیر کانفیگ · نوسان · افت · دیتاسنتر")
 
         @on_main_thread
         def progress(self, done, total, found):
@@ -2529,7 +2732,7 @@ if ui is not None:
                 text_field("verify_top", "تعداد IP برای اندازه‌گیری دقیق", s["verify_top"], "number"),
                 text_field("verify_attempts", "تلاش برای هر IP", s["verify_attempts"], "number"),
                 text_field("max_loss_pct", "حداکثر افت مجاز (٪)", s["max_loss_pct"], "number"),
-                text_field("max_ping_ms", "حداکثر پینگ سالم (ms)", s["max_ping_ms"], "number"),
+                text_field("max_ping_ms", "حداکثر تأخیر کانفیگ سالم (ms)", s["max_ping_ms"], "number"),
                 text_field("colos", "فقط این دیتاسنترها (مثلاً FRA,AMS)", s["colos"]),
                 {"type": "switch", "key": "ip_version", "title": "IPv6 به جای IPv4",
                  "value": s["ip_version"] == 6},
@@ -2561,7 +2764,15 @@ if ui is not None:
                 text_field("record", "رکورد آدرس", server["record"] or suggest_record(server["sni"])),
                 text_field("record2", "رکورد دوم (اختیاری)", server["record2"]),
             ]
+            has_link = bool(sid and self.store.uuid_for(sid))
+            link = [{"type": "text", "key": "link", "value": "",
+                     "title": "vless://… (%s)" % ("ذخیره شده ✓" if has_link else "اختیاری"),
+                     "autocorrection": False, "autocapitalization": ui.AUTOCAPITALIZE_NONE}]
             sections = [
+                ("لینک کانفیگ CDN همین سرور", link,
+                 "با لینک، تست دقیقاً مثل «real delay» کلاینت‌ها انجام می‌شود: یک درخواست واقعی از "
+                 "داخل تونل. دامنه، path و پورت هم از لینک پر می‌شوند. فقط UUID در Keychain ذخیره "
+                 "می‌شود. خالی = بدون تغییر، «-» = حذف."),
                 ("سرور", fields, "همان دامنه و path هاست CDN این سرور در پنل."),
                 ("رکورد (ابر خاکستری)", records,
                  "address هاست CDN این سرور در پنل، مثلاً cdn1.germany.example.com. خالی بگذارید "
@@ -2578,6 +2789,21 @@ if ui is not None:
                 if alert("حذف", "سرور «%s» حذف شود؟" % server["name"], "حذف") == 1:
                     self.store.delete_server(sid)
                 return
+            raw_link = (values.pop("link", "") or "").strip()
+            uuid_value = None
+            if raw_link == "-":
+                uuid_value = ""
+            elif raw_link:
+                try:
+                    parsed = parse_vless_link(raw_link)
+                except ValueError as exc:
+                    alert("لینک کانفیگ", str(exc))
+                    return self.edit_server(sid)
+                uuid_value = parsed["uuid"]
+                for key in ("sni", "path", "port", "tls", "host"):
+                    values[key] = parsed[key]
+                if not (values.get("name") or "").strip() and parsed["name"]:
+                    values["name"] = parsed["name"]
             if not normalise_host(values.get("sni")):
                 alert("دامنهٔ CDN", "دامنهٔ CDN را وارد کنید.")
                 return self.edit_server(sid)
@@ -2588,16 +2814,19 @@ if ui is not None:
                                     "(رکورد خاکستری، دامنهٔ CDN نارنجی).")
                 return self.edit_server(sid)
             try:
-                self.store.save_server(sid, values)
+                sid = self.store.save_server(sid, values)
             except ValueError as exc:
                 alert("مقدار نامعتبر", str(exc))
                 return self.edit_server(sid)
+            if uuid_value is not None:
+                self.store.set_uuid(sid, uuid_value)
             self.main.refresh()
 
         def manage_servers(self):
             while True:
                 servers = self.store.servers
-                items = ["%s — %s → %s" % (s["name"], s["sni"], s["record"] or "بدون رکورد")
+                items = ["%s — %s → %s%s" % (s["name"], s["sni"], s["record"] or "بدون رکورد",
+                                              " · تست کامل ✓" if self.store.uuid_for(s["id"]) else "")
                          for s in servers]
                 index = pick("سرورهای CDN", items + ["+ سرور جدید"])
                 if index is None:
@@ -2753,24 +2982,27 @@ if ui is not None:
                 alert("سرور", "اول یک سرور CDN اضافه کنید.")
                 return
             s = store.settings
-            target = Target.from_settings(servers[0])
+            servers.sort(key=lambda sv: not store.uuid_for(sv["id"]))
+            target = store.target(servers[0])
             console.show_activity()
             try:
                 trace = trace_probe(ip, target, make_context(), float(s["timeout"]) + 1)
-                m = measure(ip, target, make_context(), 10, float(s["timeout"]) + 1,
-                            bool(target.path))
+                m = measure(ip, target, make_context(), 10, float(s["timeout"]) + 2,
+                            target.kind != "trace", warmup=True)
             finally:
                 console.hide_activity()
             net = store.current_network
             ok = is_healthy(m, s["max_loss_pct"], s["max_ping_ms"])
-            store.record_result(ip, net["id"], ok, m["ping"], trace.get("colo", ""))
+            store.record_result(ip, net["id"], ok, m["delay"], trace.get("colo", ""))
             store.save()
             self.main.refresh()
-            lines = ["اینترنت: %s" % net["name"],
+            lines = ["اینترنت: %s · سرور: %s" % (net["name"], servers[0]["name"]),
                      "نتیجه: %s" % ("سالم" if ok else "ناسالم"),
-                     "دیتاسنتر: %s" % (trace.get("colo") or "—"),
-                     "پینگ: %s" % ("%.0f ms" % m["ping"] if m["ping"] is not None else "—"),
-                     "jitter: %.0f · افت: %.0f%%" % (m["jitter"] or 0, m["loss"])]
+                     "%s: %s" % (DELAY_LABEL[target.kind],
+                                 "%.0f ms" % m["delay"] if m["delay"] is not None else "—"),
+                     "پینگ TCP: %s" % ("%.0f ms" % m["ping"] if m["ping"] is not None else "—"),
+                     "نوسان: %.0f · افت: %.0f%%" % (m["jitter"] or 0, m["loss"]),
+                     "دیتاسنتر: %s" % (trace.get("colo") or "—")]
             if m["errors"]:
                 lines.append("خطاها: %s" % error_summary(m["errors"]))
             if trace.get("loc") and trace["loc"] != "IR":

@@ -41,6 +41,12 @@ class MemorySecrets:
     def set(self, token, sid=None):
         self.token = token
 
+    def get_named(self, name):
+        return self.__dict__.setdefault("named", {}).get(name, "")
+
+    def set_named(self, name, value):
+        self.__dict__.setdefault("named", {})[name] = value
+
 
 def make_store(tmp, token=TEST_TOKEN, sni="germany.example.test", path="/ws",
                record="cdn1.germany.example.test", record2="", **settings):
@@ -146,12 +152,12 @@ class StoreTests(unittest.TestCase):
               "state": {"mci": {"good": {"1.1.1.1": {"ts": 5, "ping": 40, "colo": "FRA"}},
                                 "bad": {"9.9.9.9": 6}}}}
         data = app.normalise_data(v1)
-        self.assertEqual(data["version"], 3)
+        self.assertEqual(data["version"], 4)
         self.assertEqual((data["servers"][0]["sni"], data["servers"][0]["path"]),
                          ("cdn.example.com", "/ws"))
         self.assertEqual(data["networks"], [{"id": "mci", "name": "MCI"}])
         self.assertEqual(data["matrix"]["1.1.1.1"]["mci"],
-                         {"ok": True, "ping": 40, "colo": "FRA", "ts": 5})
+                         {"ok": True, "ping": None, "colo": "FRA", "ts": 5})
         self.assertEqual(data["bad"]["mci"], {"9.9.9.9": 6})
         self.assertEqual(data["settings"]["ttl"], 120)
         self.assertEqual(data["servers"][0]["record"], "")
@@ -184,6 +190,22 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(data["matrix"]["2.2.2.2"]["rtl"]["ok"])
         self.assertEqual(data["settings"]["zone_id"], "z1")
         self.assertEqual(data["settings"]["workers"], 20)
+
+    def test_the_config_uuid_lives_only_in_the_keychain(self):
+        store = make_store(self.tmp)
+        store.set_uuid("s1", VLESS_UUID)
+        store.save()
+        self.assertEqual(store.target(store.server("s1")).kind, "vless")
+        self.assertNotIn(VLESS_UUID, Path(store.path).read_text(encoding="utf-8"))
+        self.assertNotIn(VLESS_UUID, store.export_json())
+        store.delete_server("s1")
+        self.assertEqual(store.uuid_for("s1"), "")
+
+    def test_an_old_tcp_ping_limit_becomes_a_config_delay_limit(self):
+        data = app.normalise_data({"version": 3, "settings": {"max_ping_ms": 800}})
+        self.assertEqual(data["settings"]["max_ping_ms"], 1500)
+        data = app.normalise_data({"version": 4, "settings": {"max_ping_ms": 800}})
+        self.assertEqual(data["settings"]["max_ping_ms"], 800)
 
     def test_previous_ips_come_from_the_record_history(self):
         store = make_store(self.tmp)
@@ -312,12 +334,39 @@ class HelperTests(unittest.TestCase):
                         probe_ws=lambda *a: next(answers))
         self.assertEqual((m["ok"], m["attempts"], m["loss"]), (3, 4, 25.0))
         self.assertEqual(m["ping"], 110.0)
+        self.assertEqual(m["delay"], 310.0)
         self.assertAlmostEqual(m["jitter"], 15.0)
         self.assertEqual(m["colo"], "FRA")
         self.assertFalse(app.is_healthy(m, 0, 800))
         self.assertTrue(app.is_healthy(m, 30, 800))
-        self.assertLess(app.score({"total": 100, "jitter": 1, "loss": 0}),
-                        app.score({"total": 90, "jitter": 1, "loss": 10}))
+        self.assertFalse(app.is_healthy(m, 30, 300))
+        self.assertLess(app.score({"delay": 100, "jitter": 1, "loss": 0}),
+                        app.score({"delay": 90, "jitter": 1, "loss": 10}))
+
+    def test_vless_links_are_parsed(self):
+        link = ("vless://%s@cdn1.germany.example.com:2053?encryption=none&security=tls"
+                "&sni=germany.example.com&type=ws&host=germany.example.com"
+                "&path=%%2Fws%%3Fed%%3D2560#DE%%20%%F0%%9F%%9B%%A1" % VLESS_UUID)
+        p = app.parse_vless_link(" " + link + "\u200f")
+        self.assertEqual((p["uuid"], p["sni"], p["host"], p["path"], p["port"], p["tls"]),
+                         (VLESS_UUID, "germany.example.com", "", "/ws", 2053, True))
+        self.assertEqual(p["name"], "DE 🛡")
+        for bad in ("vmess://abc", "vless://nouuid@x.com:443?type=ws",
+                    "vless://%s@x.com:443?type=tcp&security=reality" % VLESS_UUID):
+            with self.assertRaises(ValueError):
+                app.parse_vless_link(bad)
+        self.assertEqual(app.vless_request(VLESS_UUID, "a.b", 80, b"X")[:1], b"\x00")
+        self.assertEqual(app.ws_frame(b"hi")[:2], bytes([0x82, 0x82]))
+
+    def test_the_warmup_probe_is_not_counted(self):
+        answers = iter([
+            {"ok": True, "tcp": 250.0, "total": 900.0, "colo": "", "error": ""},
+            {"ok": True, "tcp": 100.0, "total": 300.0, "colo": "", "error": ""},
+            {"ok": True, "tcp": 100.0, "total": 310.0, "colo": "", "error": ""},
+        ])
+        m = app.measure("1.2.3.4", None, None, 2, 1, True, pause=0, warmup=True,
+                        probe_ws=lambda *a: next(answers))
+        self.assertEqual((m["attempts"], m["delay"]), (2, 305.0))
 
     def test_ago_and_colos(self):
         self.assertEqual(app.ago(0), "هرگز")
@@ -460,8 +509,16 @@ class ZoneTests(unittest.TestCase):
 
 # ------------------------------------------------------------------ real sockets
 
+VLESS_UUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
+
+
 class _TLSServer:
-    """Answers /cdn-cgi/trace with 200 and the WebSocket path with 101."""
+    """Answers /cdn-cgi/trace with 200 and the WebSocket path with 101.
+
+    After the upgrade it acts as a tiny VLESS server: a request with the
+    right uuid gets a VLESS response header and ``HTTP/1.1 204`` split over
+    two server frames; a wrong uuid gets the connection closed.
+    """
 
     def __init__(self, certfile, keyfile, ws_path="/ws"):
         self.ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -472,6 +529,7 @@ class _TLSServer:
         self.port = self.sock.getsockname()[1]
         self.ws_path = ws_path
         self.hosts = []
+        self.tunnel_requests = []
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
@@ -501,11 +559,56 @@ class _TLSServer:
                 tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
             elif path == self.ws_path and "upgrade: websocket" in head.lower():
                 tls.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+                self._vless(tls, data.split(b"\r\n\r\n", 1)[1])
             else:
                 tls.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
             tls.close()
         except (OSError, ssl.SSLError):
             pass
+
+    @staticmethod
+    def _frame(tls, pending):
+        buf = pending
+
+        def need(n):
+            nonlocal buf
+            while len(buf) < n:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    raise OSError("closed")
+                buf += chunk
+            out, buf = buf[:n], buf[n:]
+            return out
+
+        b0, b1 = need(2)
+        n = b1 & 0x7F
+        if n == 126:
+            n = int.from_bytes(need(2), "big")
+        mask = need(4)
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(need(n)))
+        return b1 & 0x80, payload
+
+    def _vless(self, tls, pending):
+        tls.settimeout(2)
+        try:
+            masked, payload = self._frame(tls, pending)
+        except OSError:
+            return
+        import uuid as uuid_mod
+        version, user = payload[0], payload[1:17]
+        addons = payload[17]
+        rest = payload[18 + addons:]
+        cmd, port = rest[0], int.from_bytes(rest[1:3], "big")
+        atyp, alen = rest[3], rest[4]
+        host = rest[5:5 + alen].decode()
+        request = rest[5 + alen:]
+        self.tunnel_requests.append((bool(masked), version, str(uuid_mod.UUID(bytes=user)),
+                                     cmd, host, port, request))
+        if str(uuid_mod.UUID(bytes=user)) != VLESS_UUID:
+            return
+        first = b"\x00\x00HTTP/1.1 2"
+        second = b"04 No Content\r\n\r\n"
+        tls.sendall(bytes([0x82, len(first)]) + first + bytes([0x80, len(second)]) + second)
 
     def close(self):
         self.sock.close()
@@ -550,6 +653,25 @@ class ProbeSocketTests(unittest.TestCase):
         wrong = app.ws_probe("127.0.0.1", self.target("/other"), self.client_ctx(), 3)
         self.assertFalse(wrong["ok"])
         self.assertEqual(wrong["error"], "HTTP 404")
+
+    def test_a_vless_target_times_a_real_request_through_the_tunnel(self):
+        target = app.Target("cdn.example.test", "/ws", self.server.port, True, uuid=VLESS_UUID)
+        self.assertEqual(target.kind, "vless")
+        r = app.ws_probe("127.0.0.1", target, self.client_ctx(), 3)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["status"], 204)
+        masked, version, user, cmd, host, port, request = self.server.tunnel_requests[-1]
+        self.assertTrue(masked)
+        self.assertEqual((version, user, cmd, host, port),
+                         (0, VLESS_UUID, 1, app.DELAY_TEST_HOST, 80))
+        self.assertTrue(request.startswith(b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com"))
+
+    def test_a_wrong_uuid_fails_after_the_upgrade(self):
+        target = app.Target("cdn.example.test", "/ws", self.server.port, True,
+                            uuid="00000000-0000-4000-8000-000000000000")
+        r = app.ws_probe("127.0.0.1", target, self.client_ctx(), 3)
+        self.assertFalse(r["ok"])
+        self.assertIn(r["error"], ("reset", "timeout", "closed", "closed by server"))
 
     def test_a_certificate_for_another_name_is_a_tls_failure(self):
         r = app.trace_probe("127.0.0.1", self.target(sni="other.example.test"),
@@ -829,6 +951,20 @@ class ScanJobTests(unittest.TestCase):
         store = make_store(self.tmp, token="")
         result = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")}).run()
         self.assertEqual((result["kind"], result["servers"]["s1"]["main"]), ("found", ["1.0.0.2"]))
+
+    def test_the_server_with_a_full_config_is_the_one_measured(self):
+        store = make_store(self.tmp)
+        tr = store.save_server(None, {"name": "TR", "sni": "turkey.example.test", "path": "/tr",
+                                      "record": "cdn1.turkey.example.test"})
+        store.set_uuid(tr, VLESS_UUID)
+        seen = []
+
+        def probe(ip, target, ctx, timeout):
+            seen.append((target.sni, target.kind))
+            return scripted_probe({"1.0.0.2": (True, 100.0, "")})(ip, target, ctx, timeout)
+
+        self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")}, probe=probe).run()
+        self.assertEqual(seen[0], ("turkey.example.test", "vless"))
 
     def test_cancel_stops_the_run(self):
         store = make_store(self.tmp)
