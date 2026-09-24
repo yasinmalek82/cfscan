@@ -914,6 +914,7 @@ class FakeAPI:
 
     records = {}
     unreachable_direct = False
+    down = False
     calls = []
 
     def __init__(self, token="", via_ip=None, **kw):
@@ -922,6 +923,8 @@ class FakeAPI:
 
     def _check(self):
         FakeAPI.calls.append(self.via_ip)
+        if FakeAPI.down:
+            raise app.NetError("connection reset")
         if FakeAPI.unreachable_direct and self.via_ip is None:
             raise app.NetError("timeout")
 
@@ -980,6 +983,7 @@ class ScanJobTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp)
         FakeAPI.records = {}
         FakeAPI.unreachable_direct = False
+        FakeAPI.down = False
         FakeAPI.calls = []
 
     def job(self, store, nid, table, sid="s1", mode="auto", loc="IR", candidates=None,
@@ -1133,6 +1137,30 @@ class ScanJobTests(unittest.TestCase):
         result = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")}).run()
         self.assertEqual(result["kind"], "applied")
         self.assertIn("1.0.0.2", FakeAPI.calls)
+
+    def test_cloudflare_down_keeps_the_choice_for_a_retry(self):
+        store = make_store(self.tmp)
+        store.set_record_ips("s1:mobile", ["1.0.0.9"])
+        FakeAPI.down = True
+        job = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")})
+        result = job.run()
+        self.assertEqual(result["kind"], "apply_failed")
+        self.assertIn("connection reset", result["message"])
+        self.assertTrue(any("خواندن رکورد" in n for n in job.events.notes))
+        self.assertEqual(store.record_ips("s1:mobile"), ["1.0.0.9"])  # unchanged
+        self.assertEqual(store.history(), [])
+        FakeAPI.down = False
+        self.assertTrue(job.apply(result))
+        self.assertEqual(FakeAPI.records[DE], ["1.0.0.2"])
+        self.assertEqual(store.record_ips("s1:mobile"), ["1.0.0.2"])
+        self.assertEqual(store.history()[0]["old"], ["1.0.0.9"])
+
+    def test_ipv6_scans_write_an_aaaa_record(self):
+        store = make_store(self.tmp, ip_version=6)
+        result = self.job(store, "mci", {"2606:4700::1": (True, 120.0, "FRA")}).run()
+        self.assertEqual(result["kind"], "applied")
+        self.assertEqual(FakeAPI.records[("cdn1.germany.example.test", "AAAA")],
+                         ["2606:4700::1"])
 
     def test_nothing_answering_gives_a_hint_and_marks_nothing_bad(self):
         store = make_store(self.tmp)

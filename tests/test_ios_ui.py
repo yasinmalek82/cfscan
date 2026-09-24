@@ -74,6 +74,9 @@ class AppTestCase(unittest.TestCase):
         engine.FakeAPI.records = {}
         engine.FakeAPI.calls = []
         engine.FakeAPI.unreachable_direct = False
+        engine.FakeAPI.down = False
+        # the shared fakes raise the engine copy's errors; make them this copy's
+        self.patch(engine.app, "NetError", app.NetError)
         self.conn = dict(MCI)
         self.tables = {"mci": {"1.0.0.1": (True, 300.0, "GYD"), "1.0.0.2": (True, 150.0, "FRA")},
                        "mtn": {"1.0.0.1": (True, 200.0, "FRA"), "1.0.0.2": (False, None, ""),
@@ -286,6 +289,19 @@ class ScanFlowTests(AppTestCase):
         view.tapped_apply(view.apply_btn)
         self.assertEqual(view.result["kind"], "applied")
         self.assertTrue(view.apply_btn.hidden)
+
+    def test_a_failed_update_can_be_retried(self):
+        self.ready()
+        engine.FakeAPI.down = True
+        view = self.scan()
+        self.assertEqual(view.result["kind"], "apply_failed")
+        self.assertFalse(view.apply_btn.hidden)
+        self.assertIn("connection reset", view.notes.text)
+        engine.FakeAPI.down = False
+        view.tapped_apply(view.apply_btn)
+        self.assertEqual(view.result["kind"], "applied")
+        self.assertTrue(view.apply_btn.hidden)
+        self.assertEqual(view.outcome.text_color, app.GOOD)
 
     def test_all_servers(self):
         self.ready()
