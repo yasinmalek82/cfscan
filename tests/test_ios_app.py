@@ -198,7 +198,7 @@ class StoreTests(unittest.TestCase):
         data = app.normalise_data(v3)
         self.assertEqual(data["servers"][0]["record_mobile"], "cdn1.germany.example.com")
         self.assertEqual(data["records"]["s1:mobile"]["ips"], ["1.1.1.1"])
-        self.assertEqual(data["settings"]["max_ping_ms"], 1500)
+        self.assertEqual(data["settings"]["max_ping_ms"], 1000)  # 800 -> 1500 -> 1000
         v1 = {"version": 1, "settings": {"sni": "cdn.example.com", "path": "ws"},
               "profiles": [{"id": "mci", "name": "MCI"}],
               "state": {"mci": {"good": {"1.1.1.1": {"ts": 5, "ping": 40}}, "bad": {"9.9.9.9": 6}}}}
@@ -379,15 +379,21 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(app.vless_request(VLESS_UUID, "a.b", 80, b"X")[:1], b"\x00")
         self.assertEqual(app.ws_frame(b"hi")[:2], bytes([0x82, 0x82]))
 
-    def test_the_warmup_probe_is_not_counted(self):
-        answers = iter([
-            {"ok": True, "tcp": 250.0, "total": 900.0, "colo": "", "error": ""},
-            {"ok": True, "tcp": 100.0, "total": 300.0, "colo": "", "error": ""},
-            {"ok": True, "tcp": 100.0, "total": 310.0, "colo": "", "error": ""},
-        ])
-        m = app.measure("1.2.3.4", None, None, 2, 1, True, pause=0, warmup=True,
-                        probe_ws=lambda *a: next(answers))
-        self.assertEqual((m["attempts"], m["delay"]), (2, 305.0))
+    def test_twenty_requests_go_five_per_connection(self):
+        calls = []
+
+        def probe(ip, target, ctx, timeout, count):
+            calls.append(count)
+            got = [200.0] * count if len(calls) != 2 else [200.0] * (count - 3)  # 3 lost once
+            return {"ip": ip, "ok": True, "tcp": 80.0, "samples": got, "sent": count,
+                    "received": len(got), "setup": 900.0, "total": 200.0, "colo": "FRA",
+                    "error": "lost"}
+
+        m = app.measure("1.2.3.4", None, None, 20, 1, True, pause=0, probe_ws=probe)
+        self.assertEqual(calls, [5, 5, 5, 5])
+        self.assertEqual((m["ok"], m["attempts"], m["loss"]), (17, 20, 15.0))  # "17/20": FAIL
+        self.assertEqual((m["delay"], m["setup"], m["ping"]), (200.0, 900.0, 80.0))
+        self.assertFalse(app.is_healthy(m, 0, 1000))
 
     def test_ago_and_colos(self):
         self.assertEqual(app.ago(0), "هرگز")
@@ -538,7 +544,10 @@ class _TLSServer:
 
     After the upgrade it acts as a tiny VLESS server: a request with the
     right uuid gets a VLESS response header and ``HTTP/1.1 204`` split over
-    two server frames; a wrong uuid gets the connection closed.
+    two server frames; a wrong uuid gets the connection closed. Connections
+    are kept alive (``/cdn-cgi/trace`` answers chunked every other time), and
+    later requests in the tunnel get their 204 too. ``drop_after`` closes a
+    connection after that many answers.
     """
 
     def __init__(self, certfile, keyfile, ws_path="/ws"):
@@ -551,6 +560,9 @@ class _TLSServer:
         self.ws_path = ws_path
         self.hosts = []
         self.tunnel_requests = []
+        self.connections = 0
+        self.answers = 0
+        self.drop_after = None
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
@@ -562,43 +574,57 @@ class _TLSServer:
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn):
+        self.connections += 1
+        tls = None
         try:
             tls = self.ctx.wrap_socket(conn, server_side=True)
-            data = b""
-            while b"\r\n\r\n" not in data:
-                chunk = tls.recv(4096)
-                if not chunk:
-                    return
-                data += chunk
-            head = data.decode("latin-1")
-            path = head.split(" ", 2)[1]
-            for line in head.split("\r\n"):
-                if line.lower().startswith("host:"):
-                    self.hosts.append(line.split(":", 1)[1].strip())
-            if path == "/cdn-cgi/trace":
-                body = b"fl=1\nip=5.6.7.8\ncolo=TST\nloc=IR\n"
-                tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
-            elif path == self.ws_path and "upgrade: websocket" in head.lower():
-                tls.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
-                self._vless(tls, data.split(b"\r\n\r\n", 1)[1])
-            else:
-                tls.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-            tls.close()
+            tls.settimeout(3)
+            data, served = b"", 0
+            while True:
+                while b"\r\n\r\n" not in data:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        return
+                    data += chunk
+                raw, data = data.split(b"\r\n\r\n", 1)
+                head = raw.decode("latin-1")
+                path = head.split(" ", 2)[1]
+                for line in head.split("\r\n"):
+                    if line.lower().startswith("host:"):
+                        self.hosts.append(line.split(":", 1)[1].strip())
+                if path == "/cdn-cgi/trace":
+                    body = b"fl=1\nip=5.6.7.8\ncolo=TST\nloc=IR\n"
+                    if served % 2:
+                        tls.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                    b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body))
+                    else:
+                        tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
+                                    % (len(body), body))
+                    served += 1
+                    self.answers += 1
+                    if self.drop_after is not None and served >= self.drop_after:
+                        break
+                    continue
+                if path == self.ws_path and "upgrade: websocket" in head.lower():
+                    tls.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+                    self._vless(tls, data)
+                else:
+                    tls.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                break
         except (OSError, ssl.SSLError):
             pass
+        finally:
+            (tls or conn).close()
 
     @staticmethod
-    def _frame(tls, pending):
-        buf = pending
-
+    def _frame(tls, state):
         def need(n):
-            nonlocal buf
-            while len(buf) < n:
+            while len(state["buf"]) < n:
                 chunk = tls.recv(4096)
                 if not chunk:
                     raise OSError("closed")
-                buf += chunk
-            out, buf = buf[:n], buf[n:]
+                state["buf"] += chunk
+            out, state["buf"] = state["buf"][:n], state["buf"][n:]
             return out
 
         b0, b1 = need(2)
@@ -611,8 +637,9 @@ class _TLSServer:
 
     def _vless(self, tls, pending):
         tls.settimeout(2)
+        state = {"buf": pending}
         try:
-            masked, payload = self._frame(tls, pending)
+            masked, payload = self._frame(tls, state)
         except OSError:
             return
         import uuid as uuid_mod
@@ -630,6 +657,14 @@ class _TLSServer:
         first = b"\x00\x00HTTP/1.1 2"
         second = b"04 No Content\r\n\r\n"
         tls.sendall(bytes([0x82, len(first)]) + first + bytes([0x80, len(second)]) + second)
+        while True:  # later requests on the same tunnel
+            try:
+                masked, request = self._frame(tls, state)
+            except OSError:
+                return
+            self.tunnel_requests.append((bool(masked), None, None, None, None, None, request))
+            answer = b"HTTP/1.1 204 No Content\r\n\r\n"
+            tls.sendall(bytes([0x82, len(answer)]) + answer)
 
     def close(self):
         self.sock.close()
@@ -695,6 +730,39 @@ class ProbeSocketTests(unittest.TestCase):
         for key in ("ping", "tls_ms", "ws_ms", "tunnel_ms"):
             self.assertIsNotNone(m[key], key)
 
+    def test_http_ping_times_requests_on_one_connection(self):
+        target = app.Target("cdn.example.test", "/ws", self.server.port, True)
+        before = self.server.connections
+        r = app.http_ping("127.0.0.1", target, self.client_ctx(), 3, 5)
+        self.assertEqual((r["ok"], r["sent"], r["received"], r["colo"]), (True, 5, 5, "TST"))
+        self.assertEqual(len(r["samples"]), 5)             # chunked and sized answers alike
+        self.assertEqual(self.server.connections - before, 1)
+        self.assertAlmostEqual(r["total"], sum(r["samples"]) / 5)
+
+    def test_a_dropped_connection_is_opened_again_once(self):
+        target = app.Target("cdn.example.test", "/ws", self.server.port, True)
+        self.server.drop_after = 2
+        self.addCleanup(setattr, self.server, "drop_after", None)
+        before = self.server.connections
+        r = app.http_ping("127.0.0.1", target, self.client_ctx(), 3, 6)
+        self.assertEqual(self.server.connections - before, 2)
+        self.assertEqual((r["sent"], r["received"]), (6, 4))  # 2 + 2 answered, then given up
+        self.assertEqual(r["error"], "reset")  # why the rest were lost
+
+    def test_tunnel_ping_times_requests_through_one_tunnel(self):
+        target = app.Target("cdn.example.test", "/ws", self.server.port, True, uuid=VLESS_UUID)
+        before = self.server.connections
+        r = app.tunnel_ping("127.0.0.1", target, self.client_ctx(), 3, 5)
+        self.assertEqual((r["ok"], r["received"], r["status"]), (True, 5, 204), r)
+        self.assertEqual(self.server.connections - before, 1)
+        later = self.server.tunnel_requests[-4:]
+        self.assertTrue(all(req[6].startswith(b"GET /generate_204 HTTP/1.1") for req in later))
+        self.assertTrue(all(b"keep-alive" in req[6] for req in later))
+        self.assertGreaterEqual(r["setup"], r["tcp"] + r["tls"] + r["ws"])
+        m = app.measure("127.0.0.1", target, self.client_ctx(), 20, 3, True, pause=0)
+        self.assertEqual((m["ok"], m["attempts"], m["loss"]), (20, 20, 0.0))  # cfscan's PASS
+        self.assertLessEqual(m["delay"], m["setup"])  # a warm request, not a new connection
+
     def test_a_wrong_uuid_fails_after_the_upgrade(self):
         target = app.Target("cdn.example.test", "/ws", self.server.port, True,
                             uuid="00000000-0000-4000-8000-000000000000")
@@ -726,19 +794,23 @@ class DiagnoseTests(unittest.TestCase):
 
     def m(self, ping, tls, ws, tunnel):
         return {"ping": ping, "tls_ms": tls, "ws_ms": ws, "tunnel_ms": tunnel,
-                "delay": ping + tls + ws + tunnel}
+                "setup": ping + tls + ws + tunnel, "delay": 200.0}
 
-    def test_the_first_line_compares_with_the_clients_ping(self):
+    def test_the_first_lines_say_what_each_number_is(self):
         lines = app.diagnose(self.m(160, 170, 330, 260))
-        self.assertIn("پینگ (یک رفت‌وبرگشت تا کلادفلر، مثل پینگ Happ): 160ms", lines[0])
-        self.assertIn("تأخیر کامل: 920ms", lines[0])
-        self.assertIn("TLS 170 · CF→سرور 330 · تونل 260", lines[1])
+        self.assertIn("تأخیر در استفاده (درخواست روی اتصال باز، مثل cfscan): 200ms", lines[0])
+        self.assertIn("اتصال جدید از صفر (real delay کلاینت‌ها): 920ms · پینگ TCP: 160ms",
+                      lines[1])
+        self.assertIn("TCP 160 · TLS 170 · CF→سرور 330 · تونل 260", lines[2])
 
     def test_each_slow_part_gets_its_cause(self):
-        self.assertIn("TLS کُند", app.diagnose(self.m(100, 600, 150, 150))[2])
-        self.assertIn("کلادفلر تا سرور", app.diagnose(self.m(100, 110, 600, 150))[2])
-        self.assertIn("DNS خود سرور", app.diagnose(self.m(100, 110, 150, 600))[2])
-        self.assertIn("رفت‌وبرگشت", app.diagnose(self.m(160, 170, 300, 250))[2])
+        def causes(m):
+            return "\n".join(app.diagnose(m)[3:])
+
+        self.assertIn("TLS کُند", causes(self.m(100, 600, 150, 150)))
+        self.assertIn("کلادفلر تا سرور", causes(self.m(100, 110, 600, 150)))
+        self.assertIn("DNS خود سرور", causes(self.m(100, 110, 150, 600)))
+        self.assertIn("رفت‌وبرگشت", causes(self.m(160, 170, 300, 250)))
 
     def test_a_non_standard_port_points_at_the_port_test(self):
         self.assertIn("تست پورت‌های کلادفلر", app.diagnose(self.m(160, 170, 300, 250), 2053)[-1])
@@ -752,7 +824,7 @@ class PortTests(unittest.TestCase):
     def test_every_cloudflare_port_is_tried_and_the_faster_one_advised(self):
         seen = []
 
-        def probe(ip, target, ctx, timeout):
+        def probe(ip, target, ctx, timeout, count=1):
             seen.append(target.port)
             total = 200.0 if target.port == 443 else 600.0
             return {"ip": ip, "ok": True, "tcp": 80.0, "total": total, "tls": 60.0,
@@ -786,7 +858,7 @@ class PortTests(unittest.TestCase):
         target = app.Target("germany.example.test", "/ws", 8080, False)
         ports = []
         app.port_test("104.16.0.1", target, ctx_factory=lambda: None, attempts=2,
-                      probe=lambda ip, t, c, to: ports.append(t.port) or app._blank_result(ip))
+                      probe=lambda ip, t, c, to, n=1: ports.append(t.port) or app._blank_result(ip))
         self.assertEqual(sorted(set(ports)), sorted(app.CF_HTTP_PORTS))
 
 
@@ -798,27 +870,27 @@ class RobustnessTests(unittest.TestCase):
     def test_a_dead_address_is_given_up_quickly(self):
         calls = []
 
-        def dead(ip, target, ctx, timeout):
+        def dead(ip, target, ctx, timeout, count=1):
             calls.append(ip)
             return {"ip": ip, "ok": False, "tcp": None, "total": None, "error": "timeout"}
 
-        m = app.measure("1.2.3.4", None, None, 6, 1, True, pause=0, warmup=True, probe_ws=dead)
-        self.assertEqual(len(calls), 2)  # the warm-up and one attempt
+        m = app.measure("1.2.3.4", None, None, 6, 1, True, pause=0, probe_ws=dead)
+        self.assertEqual(len(calls), 2)  # two connections that answered nothing
         self.assertEqual((m["ok"], m["loss"], m["delay"]), (0, 100.0, None))
 
     def test_a_flaky_start_is_not_given_up(self):
         answers = iter([False, True, True, True])
 
-        def flaky(ip, target, ctx, timeout):
+        def flaky(ip, target, ctx, timeout, count=1):
             ok = next(answers)
             return {"ip": ip, "ok": ok, "tcp": 10.0 if ok else None,
                     "total": 30.0 if ok else None, "colo": "", "error": "" if ok else "reset"}
 
-        m = app.measure("1.2.3.4", None, None, 3, 1, True, pause=0, warmup=True, probe_ws=flaky)
+        m = app.measure("1.2.3.4", None, None, 4, 1, True, pause=0, probe_ws=flaky)
         self.assertEqual((m["ok"], m["attempts"]), (3, 4))
 
     def test_a_probe_that_raises_is_one_failure(self):
-        def broken(ip, target, ctx, timeout):
+        def broken(ip, target, ctx, timeout, count=1):
             raise ValueError("bug")
 
         m = app.measure("1.2.3.4", None, None, 3, 1, False, pause=0, probe_trace=broken)
@@ -827,10 +899,10 @@ class RobustnessTests(unittest.TestCase):
     def test_a_scan_survives_a_probe_that_raises(self):
         store = make_store(self.tmp)
 
-        def probe(ip, target, ctx, timeout):
+        def probe(ip, target, ctx, timeout, count=1):
             if ip == "1.0.0.9":
                 raise RuntimeError("bug")
-            return scripted_probe({"1.0.0.2": (True, 100.0, "")})(ip, target, ctx, timeout)
+            return scripted_probe({"1.0.0.2": (True, 100.0, "")})(ip, target, ctx, timeout, count)
 
         FakeAPI.records = {}
         FakeAPI.unreachable_direct = False
@@ -1046,12 +1118,18 @@ class FakeAPI:
 
 
 def scripted_probe(table, loc="IR"):
-    """A probe answering from ``table``: ip -> (ok, total_ms, colo)."""
+    """A probe answering from ``table``: ip -> (ok, round_trip_ms, colo).
 
-    def probe(ip, target, ctx, timeout):
+    Like :func:`app.http_ping`/:func:`app.tunnel_ping`: ``count`` requests on
+    one connection, each taking the table's time.
+    """
+
+    def probe(ip, target, ctx, timeout, count=1):
         ok, total, colo = table.get(ip, (False, None, ""))
         return {"ip": ip, "ok": ok, "tcp": total / 3 if ok else None,
                 "total": total if ok else None, "status": 200 if ok else None,
+                "samples": [total] * count if ok else [], "sent": count,
+                "received": count if ok else 0, "setup": total * 3 if ok else None,
                 "colo": colo if ok else "", "loc": loc if ok else "", "client": "",
                 "error": "" if ok else "timeout"}
 
@@ -1127,9 +1205,9 @@ class ScanJobTests(unittest.TestCase):
                "1.0.0.9": (True, 90.0, "")}
         seen = []
 
-        def probe(ip, target, ctx, timeout):
+        def probe(ip, target, ctx, timeout, count=1):
             seen.append(ip)
-            return scripted_probe(mtn)(ip, target, ctx, timeout)
+            return scripted_probe(mtn)(ip, target, ctx, timeout, count)
 
         store.update_settings({"candidates": 20, "stop_after": 3})
         job = self.job(store, "mtn", mtn, candidates=None, probe=probe)
@@ -1196,9 +1274,9 @@ class ScanJobTests(unittest.TestCase):
         store.set_uuid(tr, VLESS_UUID)
         seen = []
 
-        def probe(ip, target, ctx, timeout):
+        def probe(ip, target, ctx, timeout, count=1):
             seen.append((target.sni, target.kind))
-            return scripted_probe({"1.0.0.2": (True, 100.0, "")})(ip, target, ctx, timeout)
+            return scripted_probe({"1.0.0.2": (True, 100.0, "")})(ip, target, ctx, timeout, count)
 
         result = self.job(store, "mci", {"1.0.0.2": (True, 100.0, "")}, sid=tr, probe=probe).run()
         self.assertEqual(result["kind"], "applied")
@@ -1258,7 +1336,7 @@ class ScanJobTests(unittest.TestCase):
         self.assertIn((0, "slow"), job.events.steps)
         self.assertEqual((result["kind"], result["ips"]), ("applied", ["1.0.0.2"]))
         self.assertEqual(FakeAPI.records[DE], ["1.0.0.2"])
-        self.assertIn("1.0.0.2 (پینگ 100 · کامل 300ms)", app.result_line(result, store))
+        self.assertIn("1.0.0.2 (300ms)", app.result_line(result, store))
 
     def test_slow_but_nothing_clearly_faster_keeps_the_address(self):
         store = make_store(self.tmp)
@@ -1269,7 +1347,7 @@ class ScanJobTests(unittest.TestCase):
                          ("unchanged", ["1.0.0.9"], 900.0))
         line = app.result_line(result, store)
         self.assertIn("IP سریع‌تری", line)
-        self.assertIn("1.0.0.9 (پینگ 300 · کامل 900ms)", line)
+        self.assertIn("1.0.0.9 (900ms)", line)
         self.assertEqual(FakeAPI.records[DE], ["1.0.0.9"])
 
     def test_slow_again_soon_after_nothing_faster_is_not_rescanned(self):
@@ -1292,11 +1370,11 @@ class ScanJobTests(unittest.TestCase):
         store = make_store(self.tmp)
         job = self.job(store, "mci", {"1.0.0.2": (True, 300.0, "")})
         result = job.run()
-        self.assertTrue(result["diagnosis"][0].startswith("پینگ"))
+        self.assertTrue(result["diagnosis"][0].startswith("تأخیر در استفاده"))
         self.assertTrue(any(n.startswith("چرا این عدد؟ (1.0.0.2)") for n in job.events.notes))
         cell = store.cells("s1")["1.0.0.2"]["mci"]
         self.assertEqual((cell["ping"], cell["delay"]), (100.0, 300.0))
-        self.assertEqual(app.cell_text(cell, time.time(), 3600), "100/300")
+        self.assertEqual(app.cell_text(cell, time.time(), 3600), "300")
         restored = app.normalise_data(json.loads(json.dumps(store.data)))
         self.assertEqual(restored["matrix"]["s1"]["1.0.0.2"]["mci"]["ping"], 100.0)
 
@@ -1311,7 +1389,7 @@ class ScanJobTests(unittest.TestCase):
         store = make_store(self.tmp, verify_top=10)
         answered_by = {}
 
-        def probe(ip, target, ctx, timeout):
+        def probe(ip, target, ctx, timeout, count=1):
             """Only 104.16.0.0/16 answers; lower third octet = faster."""
             parts = ip.split(".")
             ok = parts[:2] == ["104", "16"]
@@ -1344,6 +1422,45 @@ class ScanJobTests(unittest.TestCase):
         self.assertEqual(result2["kind"], "applied")
         self.assertLessEqual(result2["scanned"], 256)
         self.assertTrue(any("کل رنج" in n for n in job2.events.notes))
+
+    def test_reachable_means_most_attempts_answered_fast_enough(self):
+        store = make_store(self.tmp, full_range=False, stop_after=0)
+
+        def probe(ip, target, ctx, timeout, count=1):
+            """.1 answers 3 of 4 (kept), .2 answers 2 of 4 (too much loss),
+            .3 answers all but slowly (over 1000ms), .4 and .5 all, fast."""
+            got, ms = {"1.0.0.1": (3, 150.0), "1.0.0.2": (2, 100.0), "1.0.0.3": (4, 1200.0),
+                       "1.0.0.4": (4, 300.0), "1.0.0.5": (4, 200.0)}.get(ip, (0, None))
+            return {"ip": ip, "ok": got > 0, "tcp": 30.0, "samples": [ms] * got, "sent": count,
+                    "received": got, "total": ms, "colo": "FRA", "loc": "IR", "error": ""}
+
+        job = self.job(store, "mci", {}, candidates=["1.0.0.%d" % i for i in range(1, 6)],
+                       probe=probe)
+        seen = []
+        job.events.found = seen.append
+        job.events.progress = lambda *a: None
+        job.run()
+        reach = [r["ip"] for r in seen[len(seen) - 1 - [i for i, rows in enumerate(reversed(seen))
+                                                       if rows and "attempts" not in rows[0]][0]]]
+        self.assertEqual(sorted(reach), ["1.0.0.1", "1.0.0.4", "1.0.0.5"])
+        self.assertEqual(reach[0], "1.0.0.5")                   # fastest first, as cfst sorts
+        self.assertEqual(job.events.details[1].split(" ")[0], "3")  # 3 reachable
+        self.assertIn("هر IP 4 بار", job.events.details[1])
+
+    def test_the_new_request_model_migrates_old_data(self):
+        old = {"version": 6, "settings": {"verify_attempts": 6, "workers": 32,
+                                          "max_ping_ms": 1500, "good_ping_ms": 500},
+               "servers": [{"id": "s1", "sni": "germany.example.com"}],
+               "matrix": {"s1": {"1.0.0.1": {"mci": {"ok": True, "delay": 900, "ping": 160,
+                                                     "ts": 5}}}}}
+        data = app.normalise_data(old)
+        s = data["settings"]
+        self.assertEqual((s["verify_attempts"], s["workers"], s["max_ping_ms"], s["good_ping_ms"]),
+                         (20, 64, 1000, 500))  # old defaults move on; a chosen value stays
+        cell = data["matrix"]["s1"]["1.0.0.1"]["mci"]
+        self.assertEqual((cell["ok"], cell["delay"]), (True, None))  # a new-connection number
+        self.assertNotIn("ping", {k: v for k, v in cell.items() if v is not None})
+        self.assertEqual(app.normalise_data(data)["matrix"], data["matrix"])  # stable
 
     def test_the_sweep_covers_each_24_once(self):
         cands = app.sweep_candidates(app.CF_RANGES_V4, random.Random(2),

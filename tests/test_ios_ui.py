@@ -260,7 +260,7 @@ class ScanFlowTests(AppTestCase):
         card.frame = (0, 0, 358, card.height_needed)
         card.layout()
         chips = [chip.text for chip in card.rows[0][1]]
-        self.assertEqual(chips, ["‏همراه اول 100/300", "‏ایرانسل 67/200"])  # ping/full
+        self.assertEqual(chips, ["‏همراه اول 300", "‏ایرانسل 200"])
         self.assertIn("همراه اول ✓ · ایرانسل ✓", card.summary.text)
         self.assertEqual((card.state, card.pill.text), ("ok", "‏سالم"))
         self.assertEqual(self.main.cards[1].pill.text, "‏اختیاری")
@@ -340,7 +340,7 @@ class ScanFlowTests(AppTestCase):
         self.assertIn("cdn1.germany.example.com", details[3])
         self.assertTrue(view.track.hidden and view.counter.hidden)  # nothing running
         self.assertRegex(view.clock_label.text, r"^\d+:\d\d$")
-        self.assertIn("تأخیر کامل کانفیگ", view.table_title.text)
+        self.assertIn("بررسی دقیق: تأخیر کانفیگ، 3 بار هر IP", view.table_title.text)
         self.assertFalse(view.list_card.hidden)
         for i, (icon, name, detail) in enumerate(view.step_views[:-1]):
             below = view.step_views[i + 1][1]
@@ -371,7 +371,7 @@ class ScanFlowTests(AppTestCase):
         engine.FakeAPI.records[("cdn1.germany.example.com", "A")] = ["1.0.0.1"]
         view = self.scan()
         self.assertEqual(view.result["kind"], "healthy")
-        self.assertIn("1.0.0.1 (پینگ 100 · کامل 300ms)", view.outcome.text)
+        self.assertIn("1.0.0.1 (300ms)", view.outcome.text)
         self.assertFalse(view.faster_btn.hidden)
         view.tapped_faster(view.faster_btn)
         deadline = time.time() + 10
@@ -418,12 +418,12 @@ class ScanFlowTests(AppTestCase):
         self.assertEqual([r.left.text for r in rows],
                          ["104.16.0.%d" % i for i in range(1, 6)])
         self.assertEqual([r.right.text.replace("‏", "") for r in rows],
-                         ["212ms", "640ms", "✕ جواب نداد", "در حال تست…", "در صف"])
+                         ["212ms ±9", "640ms ±30", "✕ جواب نداد", "در حال تست…", "در صف"])
         self.assertEqual([r.right.text_color for r in rows[:4]],
                          [app.GOOD, app.WARN, app.BAD, app.ACCENT])
-        self.assertIn("±9 · FRA", rows[0].detail.text)
+        self.assertIn("6/6 ✓ · FRA", rows[0].detail.text)
         self.assertIn("timeout", rows[2].detail.text)
-        self.assertIn("تست اصلی", view.table_title.text)
+        self.assertIn("بررسی دقیق", view.table_title.text)
         for i, r in enumerate(rows):  # stacked, inside the card, nothing overlapping
             self.assertEqual(r.y, i * view.row_height)
             self.assertLessEqual(r.left.x + r.left.width, r.right.x + 0.5)
@@ -441,10 +441,11 @@ class ScanFlowTests(AppTestCase):
         view.step(1, "run")
         view.note_scope(5957, True)
         self.assertIn("کل رنج کلادفلر: 5957 IP", view.step_views[1][2].text)
-        view.found([{"ip": "104.16.0.1", "ok": True, "tcp": 30.0, "total": 180.0, "colo": "FRA"}])
+        view.found([{"ip": "104.16.0.1", "ok": True, "tcp": 30.0, "total": 180.0, "colo": "FRA",
+                     "sent": 4, "received": 4, "samples": [180.0] * 4}])
         row = view.row_views[0]
-        self.assertEqual(row.right.text, "‏✓ FRA")
-        self.assertIn("فقط دسترسی · پاسخ در 180ms", row.detail.text)
+        self.assertEqual(row.right.text, "‏180ms")
+        self.assertIn("4/4 · FRA · فقط تا کلادفلر", row.detail.text)
         view.phase_started = time.time() - 60
         view.progress(1000, 5957, 40)
         self.assertIn("1000 از 5957 IP · 40 جواب داد · حدود 5 دقیقه مانده", view.counter.text)
@@ -503,7 +504,7 @@ class ScanFlowTests(AppTestCase):
         slow = engine.scripted_probe(self.tables["mci"])
 
         def probe(*args):
-            time.sleep(0.01)
+            time.sleep(0.05)
             return slow(*args)
 
         real_job = app.ScanJob
@@ -638,8 +639,7 @@ class MenuTests(AppTestCase):
 class LayoutTests(AppTestCase):
     def test_server_line_says_how_it_is_tested(self):
         sid = self.ready()
-        self.assertIn("germany.example.com · تأخیر کامل کانفیگ (real delay) ✓",
-                      self.main.server_info.text)
+        self.assertIn("germany.example.com · تأخیر کانفیگ ✓", self.main.server_info.text)
         self.store.set_uuid(sid, "")
         self.main.refresh()
         self.assertIn("لینک کانفیگ را اضافه کنید", self.main.server_info.text)

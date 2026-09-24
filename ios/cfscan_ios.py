@@ -70,7 +70,7 @@ except ImportError:
         return fn
 
 APP_NAME = "CF Scanner"
-APP_VERSION = "5.2"
+APP_VERSION = "5.3"
 
 try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -111,14 +111,17 @@ DEFAULT_SETTINGS = {
     "fresh_hours": 48,      # how long a result counts for the other network of a group
     "full_range": True,     # fast pass: one address from every /24 of every range (IPv4)
     "candidates": 500,      # without full_range: this many addresses
-    "workers": 32,
+    "workers": 64,
     "timeout": 2.0,
+    "reach_attempts": 4,    # fast pass: requests per address, as cfst's -t 4
+    "reach_max_loss_pct": 25,  # fast pass: at most this loss (cfst -tlr 0.25)
+    "reach_max_ms": 1000,   # fast pass: at most this mean round trip (cfst -tl 1000)
     "stop_after": 25,       # without full_range: stop after this many answers (0 = all)
     "verify_top": 10,       # the fastest answers measured for real, with the config
-    "verify_attempts": 6,
+    "verify_attempts": 20,  # the strict check: requests per address (cfscan's 20)
     "max_loss_pct": 0,
-    "max_ping_ms": 1500,    # slowest config delay that still counts as healthy
-    "good_ping_ms": 700,    # slower than this (but healthy) still looks for faster; 0 = off
+    "max_ping_ms": 1000,    # slowest config delay (in use) that still counts as healthy
+    "good_ping_ms": 350,    # slower than this (but healthy) still looks for faster; 0 = off
     "min_gain_pct": 20,     # a forced scan replaces working addresses only when this much faster
     "colos": "",            # allowed datacentres, e.g. "FRA,AMS"; empty = any
     "ip_version": 4,
@@ -148,7 +151,8 @@ SETTING_LIMITS = {
     "port": (1, 65535), "ttl": (60, 86400), "ips_per_record": (1, 3),
     "fresh_hours": (1, 168), "candidates": (20, 5000), "workers": (1, 128),
     "timeout": (0.5, 10.0), "stop_after": (0, 1000), "verify_top": (1, 20),
-    "verify_attempts": (2, 30), "max_loss_pct": (0, 50), "max_ping_ms": (50, 5000),
+    "verify_attempts": (2, 60), "max_loss_pct": (0, 50), "max_ping_ms": (50, 5000),
+    "reach_attempts": (1, 20), "reach_max_loss_pct": (0, 100), "reach_max_ms": (50, 10000),
     "good_ping_ms": (0, 5000),
     "min_gain_pct": (0, 90), "ip_version": (4, 6), "bad_ttl_hours": (0, 168),
 }
@@ -327,6 +331,13 @@ def _cell(raw):
     return cell
 
 
+def _worked_only(raw):
+    """A cell without its numbers: whether the address worked, and when."""
+    cell = dict(_cell(raw), delay=None)
+    cell.pop("ping", None)
+    return cell
+
+
 def _as_dict(value):
     return value if isinstance(value, dict) else {}
 
@@ -343,7 +354,7 @@ BEST_CHECK_S = 12 * 3600
 SWEEP_REUSE_S = 20 * 60
 
 #: The data file layout; see :func:`normalise_data`.
-DATA_VERSION = 6
+DATA_VERSION = 7
 
 
 def normalise_data(raw):
@@ -355,7 +366,10 @@ def normalise_data(raw):
     * 2: servers with a record per carrier, per-carrier good/bad memory;
     * 3: one app-wide ``ip1``/``ip2`` record, one coverage table;
     * 4: ``record``/``record2`` per server, one coverage table;
-    * 5: like 6, with the old shortlist of 6 (now 10) addresses.
+    * 5: like 6, with the old shortlist of 6 (now 10) addresses;
+    * 6: delays were whole new connections (~4 round trips); from 7 they are
+      round trips on a kept-alive connection, so old numbers are dropped
+      (whether each address worked is kept) and the old defaults move on.
 
     Records become ``record_mobile``/``record_home``; the one coverage table
     is copied to every server without its numbers (they were not taken
@@ -378,6 +392,11 @@ def normalise_data(raw):
                 pass
     if version < 6 and settings["verify_top"] == 6:
         settings["verify_top"] = DEFAULT_SETTINGS["verify_top"]  # the old default
+    if version < 7:
+        for key, old in (("verify_attempts", 6), ("workers", 32), ("max_ping_ms", 1500),
+                         ("good_ping_ms", 700)):
+            if settings[key] == old:
+                settings[key] = DEFAULT_SETTINGS[key]
     if version < 4 and raw_settings.get("max_ping_ms") in (800, "800"):
         settings["max_ping_ms"] = DEFAULT_SETTINGS["max_ping_ms"]  # was a TCP ping limit
     if version == 2 and not settings["zone_id"]:
@@ -420,8 +439,8 @@ def normalise_data(raw):
     if version >= 5:
         for sid, table in _as_dict(raw.get("matrix")).items():
             if sid in ids and isinstance(table, dict):
-                matrix[sid] = {ip: {nid: _cell(c) for nid, c in cells.items()
-                                    if isinstance(c, dict)}
+                matrix[sid] = {ip: {nid: _cell(c) if version >= 7 else _worked_only(c)
+                                    for nid, c in cells.items() if isinstance(c, dict)}
                                for ip, cells in table.items() if isinstance(cells, dict)}
     else:
         flat = {}
@@ -1198,6 +1217,222 @@ def ws_probe(ip, target, ctx, timeout):
     return r
 
 
+# --------------------------------------------------- keep-alive round trips
+#
+# The original cfscan (through cfst's HTTPing) timed requests, not new
+# connections: a connection is opened once and requests are timed on it.
+# That is the delay a user feels (and what clients call "ping"); a new
+# connection per sample costs ~4 round trips more every time.
+
+
+class _Stream:
+    """Bytes arriving from ``recv()``, with what was read ahead kept."""
+
+    def __init__(self, recv, pending=b""):
+        self.recv = recv
+        self.buf = pending
+
+    def _more(self):
+        chunk = self.recv()
+        if not chunk:
+            raise ConnectionResetError("closed")
+        self.buf += chunk
+
+    def until(self, marker, limit=65536):
+        while marker not in self.buf:
+            if len(self.buf) > limit:
+                raise OSError("answer too large")
+            self._more()
+        head, _, self.buf = self.buf.partition(marker)
+        return head
+
+    def take(self, n):
+        while len(self.buf) < n:
+            self._more()
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+
+def read_response(stream):
+    """One HTTP/1.1 response from ``stream``: ``(status, body, reusable)``.
+
+    Content-Length and chunked bodies are read to their end so the next
+    request on the same connection reads its own answer.
+    """
+    head = stream.until(b"\r\n\r\n")
+    status = parse_status(head)
+    headers = {}
+    for line in head.split(b"\r\n")[1:]:
+        if b":" in line:
+            name, value = line.split(b":", 1)
+            headers[name.strip().lower()] = value.strip().lower()
+    reusable = b"close" not in headers.get(b"connection", b"")
+    body = b""
+    if b"chunked" in headers.get(b"transfer-encoding", b""):
+        while True:
+            size = int(stream.until(b"\r\n").split(b";", 1)[0].strip() or b"0", 16)
+            if size == 0:
+                while stream.until(b"\r\n"):
+                    pass  # trailers, up to the empty line
+                break
+            body += stream.take(size)
+            stream.take(2)
+    elif b"content-length" in headers:
+        body = stream.take(int(headers[b"content-length"].split(b",", 1)[0]))
+    elif not (status in (204, 304) or (status is not None and 100 <= status < 200)):
+        reusable = False  # the body runs until the connection closes
+    return status, body, reusable
+
+
+def _keepalive_request(path, host):
+    return ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\n"
+            "Connection: keep-alive\r\n\r\n" % (path, host, USER_AGENT)).encode("ascii")
+
+
+def _ping_result(ip, count):
+    r = _blank_result(ip)
+    r.update(samples=[], sent=int(count), received=0, setup=None)
+    return r
+
+
+def _finish_ping(r):
+    r["ok"] = r["received"] > 0
+    r["total"] = sum(r["samples"]) / len(r["samples"]) if r["samples"] else None
+    if r["ok"] and r["received"] < r["sent"] and not r["error"]:
+        r["error"] = "lost %d of %d" % (r["sent"] - r["received"], r["sent"])
+    return r
+
+
+def http_ping(ip, target, ctx, timeout, count=4):
+    """``count`` requests for ``/cdn-cgi/trace`` on one kept-alive connection.
+
+    Cloudflare answers these at the edge, so this is the phone-to-Cloudflare
+    part only (cfst's HTTPing); a connection that breaks is opened again
+    once. ``samples`` are the answered requests' times, ``total`` their mean.
+    """
+    r = _ping_result(ip, count)
+    request = _keepalive_request("/cdn-cgi/trace", target.host)
+    asked = 0
+    for _ in range(2):
+        if asked >= count:
+            break
+        sock = None
+        try:
+            sock, start, tcp = _connect(ip, target, ctx, timeout)
+            if r["tcp"] is None:
+                r["tcp"], r["tls"] = tcp, _since(start) - tcp
+            stream = _Stream(lambda: sock.recv(4096))
+            while asked < count:
+                asked += 1
+                sent_at = time.perf_counter()
+                sock.sendall(request)
+                status, body, reusable = read_response(stream)
+                took = _since(sent_at)
+                info = parse_trace(body) if status == 200 else {}
+                if info.get("colo"):
+                    r["received"] += 1
+                    r["samples"].append(took)
+                    r["colo"], r["loc"] = info["colo"], info.get("loc", "")
+                    r["client"] = info.get("ip", "")
+                    r["status"] = status
+                else:
+                    r["status"] = status
+                    r["error"] = "HTTP %s" % status if status else "empty answer"
+                if not reusable:
+                    break
+        except Exception as exc:
+            r["error"] = describe_error(exc)
+            if r["tcp"] is None:
+                break  # it did not even connect: no second try
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    return _finish_ping(r)
+
+
+def tunnel_ping(ip, target, ctx, timeout, count=5):
+    """One config connection, then ``count`` requests through its tunnel.
+
+    TCP, TLS, the WebSocket upgrade and the VLESS header are paid once (and
+    timed apart: ``tcp``, ``tls``, ``ws``, ``tunnel`` for the first request,
+    ``setup`` for all of it - a client's "real delay"). Every request after
+    that is phone -> Cloudflare -> server -> the test site and back: the
+    delay felt while using the config. Without a uuid the WebSocket upgrade
+    is the one sample.
+    """
+    r = _ping_result(ip, count)
+    sock = None
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    try:
+        sock, start, r["tcp"] = _connect(ip, target, ctx, timeout)
+        r["tls"] = _since(start) - r["tcp"]
+        sock.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
+                      "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                      "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                      % (target.path or "/", target.host, USER_AGENT, key)).encode("ascii"))
+        data = _read(sock, until_head=True)
+        upgraded = _since(start)
+        r["ws"] = upgraded - r["tcp"] - r["tls"]
+        r["status"] = parse_status(data)
+        if r["status"] != 101:
+            r["error"] = "HTTP %s" % r["status"] if r["status"] else "empty answer"
+            return _finish_ping(r)
+        if not target.uuid:
+            r.update(sent=1, received=1, samples=[upgraded], setup=upgraded)
+            return _finish_ping(r)
+        reader = _WSReader(sock, data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b"")
+        header = {"left": True, "buf": b""}
+
+        def recv():
+            while True:
+                opcode, payload = reader.frame()
+                if opcode == 0x8:
+                    raise ConnectionResetError("closed by server")
+                if opcode not in (0x0, 0x1, 0x2):
+                    continue
+                if header["left"]:  # the VLESS response header: version, addons
+                    header["buf"] += payload
+                    if len(header["buf"]) < 2 or len(header["buf"]) < 2 + header["buf"][1]:
+                        continue
+                    payload = header["buf"][2 + header["buf"][1]:]
+                    header["left"] = False
+                if payload:
+                    return payload
+
+        stream = _Stream(recv)
+        request = _keepalive_request(DELAY_TEST_PATH, DELAY_TEST_HOST)
+        for i in range(int(count)):
+            sent_at = time.perf_counter()
+            payload = vless_request(target.uuid, DELAY_TEST_HOST, 80, request) if i == 0 \
+                else request
+            sock.sendall(ws_frame(payload))
+            status, _, reusable = read_response(stream)
+            took = _since(sent_at)
+            if i == 0:
+                r["tunnel"], r["setup"] = took, _since(start)
+            if status is not None and 200 <= status < 400:
+                r["received"] += 1
+                r["samples"].append(took)
+                r["status"] = status
+            else:
+                r["error"] = "tunnel HTTP %s" % status if status else "tunnel: no answer"
+            if not reusable:
+                break
+    except Exception as exc:
+        text = describe_error(exc)
+        r["error"] = text if r["status"] != 101 or r["received"] else "tunnel: " + text
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return _finish_ping(r)
+
+
 def successive_jitter_ms(samples):
     """Mean absolute gap between consecutive samples (as in cfscan.measure)."""
     if not samples or len(samples) < 2:
@@ -1206,10 +1441,10 @@ def successive_jitter_ms(samples):
     return sum(gaps) / len(gaps)
 
 
-def _safe_probe(probe, ip, target, ctx, timeout):
+def _safe_probe(probe, ip, target, ctx, timeout, count=1):
     """A probe that cannot raise: a bug in one probe is one failed attempt."""
     try:
-        return probe(ip, target, ctx, timeout)
+        return probe(ip, target, ctx, timeout, count)
     except Exception as exc:
         log("probe %s raised %r" % (ip, exc))
         r = _blank_result(ip)
@@ -1218,59 +1453,70 @@ def _safe_probe(probe, ip, target, ctx, timeout):
 
 
 def measure(ip, target, ctx, attempts, timeout, use_ws, cancel=None, pause=0.15,
-            probe_trace=trace_probe, probe_ws=ws_probe, warmup=False, fail_fast=2):
-    """``attempts`` sequential probes of one address, summarised.
+            probe_trace=None, probe_ws=None, warmup=False, fail_fast=2, per_conn=5):
+    """``attempts`` requests to one address, summarised (cfscan's strict check).
 
-    ``ping`` (the median TCP connect, one round trip to Cloudflare) is what
-    clients such as Happ show as "ping"; ``tls_ms``/``ws_ms``/``tunnel_ms``
-    split the rest. ``delay`` is the median time of a whole probe - with a VLESS target the
-    client's "real delay"; ``ping`` the median TCP connect. ``warmup``
-    first makes one probe whose time is not counted: on a phone the first
-    packets wake the radio and would count 50-200 ms that no later request
-    pays (a failed warm-up does count, as a failure). ``fail_fast``: an
-    address whose first attempts all fail is not waited on any longer - a
-    dead address would otherwise cost every attempt's full timeout.
+    The requests go ``per_conn`` at a time over kept-alive connections, so
+    ``delay`` (their median) is the round trip felt in use - through the
+    config's tunnel with ``use_ws``, to Cloudflare's edge without. ``setup``
+    is the median time to open a connection and get its first answer (a
+    client's "real delay"), ``ping`` the median TCP connect, and
+    ``tls_ms``/``ws_ms``/``tunnel_ms`` split a new connection's time.
+    ``ok``/``attempts`` count answered/asked requests: "20/20" passes.
+    ``fail_fast``: connections that answered nothing at all end the check
+    early - a dead address would otherwise cost every attempt's timeout.
+    ``warmup`` is kept for callers; a kept-alive connection needs none.
     """
-    probe = probe_ws if use_ws else probe_trace
-    tcp, total, errors = [], [], []
+    probe = (probe_ws or tunnel_ping) if use_ws else (probe_trace or http_ping)
+    samples, tcp, setups, errors = [], [], [], []
     parts = {"tls": [], "ws": [], "tunnel": []}
     colo = ""
-    if warmup and not (cancel is not None and cancel.is_set()):
-        r = _safe_probe(probe, ip, target, ctx, timeout)
-        if not r["ok"]:
-            errors.append(r["error"])
-        else:
-            colo = r.get("colo") or colo
-    for i in range(int(attempts)):
+    sent = dead = 0
+    attempts = int(attempts)
+    while sent < attempts:
         if cancel is not None and cancel.is_set():
             break
-        if fail_fast and not tcp and len(errors) >= fail_fast:
+        if fail_fast and not samples and dead >= fail_fast:
             break
-        r = _safe_probe(probe, ip, target, ctx, timeout)
-        if r["ok"]:
-            tcp.append(r["tcp"])
-            total.append(r["total"])
+        want = max(1, min(int(per_conn), attempts - sent))
+        r = _safe_probe(probe, ip, target, ctx, timeout, want)
+        got = r.get("samples")
+        if got is None:  # a single-answer probe
+            got = [r["total"]] if r.get("ok") and r.get("total") is not None else []
+        # a probe that does not say how many it asked made a single request
+        asked = max(1, min(int(r.get("sent") or 1), attempts - sent), len(got))
+        sent += asked
+        samples.extend(got)
+        if got:
+            if r.get("tcp") is not None:
+                tcp.append(r["tcp"])
+            if r.get("setup") is not None:
+                setups.append(r["setup"])
             for key, values in parts.items():
                 if r.get(key) is not None:
                     values.append(r[key])
             colo = r.get("colo") or colo
         else:
-            errors.append(r["error"])
-        if pause and i < attempts - 1:
+            dead += 1
+        if len(got) < asked:
+            errors.extend([r.get("error") or "no answer"] * (asked - len(got)))
+        if pause and sent < attempts:
             time.sleep(pause)
-    done = len(tcp) + len(errors)
+
+    def median(values):
+        return statistics.median(values) if values else None
+
     return {
-        "ip": ip, "attempts": done, "ok": len(tcp),
-        "loss": 100.0 * len(errors) / done if done else 100.0,
-        "ping": statistics.median(tcp) if tcp else None,
-        "total": statistics.median(total) if total else None,
-        "delay": statistics.median(total) if total else None,
-        "jitter": successive_jitter_ms(total),
-        # where the time goes: the TLS handshake, the WebSocket upgrade
-        # (Cloudflare -> the server -> back) and one request in the tunnel
-        "tls_ms": statistics.median(parts["tls"]) if parts["tls"] else None,
-        "ws_ms": statistics.median(parts["ws"]) if parts["ws"] else None,
-        "tunnel_ms": statistics.median(parts["tunnel"]) if parts["tunnel"] else None,
+        "ip": ip, "attempts": sent, "ok": len(samples),
+        "loss": 100.0 * (sent - len(samples)) / sent if sent else 100.0,
+        "ping": median(tcp),
+        "total": median(samples),
+        "delay": median(samples),
+        "setup": median(setups),
+        "jitter": successive_jitter_ms(samples),
+        "tls_ms": median(parts["tls"]),
+        "ws_ms": median(parts["ws"]),
+        "tunnel_ms": median(parts["tunnel"]),
         "colo": colo, "errors": errors,
     }
 
@@ -1297,12 +1543,17 @@ def diagnose(m, port=443):
     rtt, tls, ws, tunnel = m.get("ping"), m.get("tls_ms"), m.get("ws_ms"), m.get("tunnel_ms")
     if rtt is None or m.get("delay") is None:
         return []
-    lines = ["پینگ (یک رفت‌وبرگشت تا کلادفلر، مثل پینگ Happ): %.0fms · تأخیر کامل: %.0fms"
-             % (rtt, m["delay"])]
+    lines = ["تأخیر در استفاده (درخواست روی اتصال باز، مثل cfscan): %.0fms" % m["delay"]]
+    if m.get("setup") is not None:
+        lines.append("اتصال جدید از صفر (real delay کلاینت‌ها): %.0fms · پینگ TCP: %.0fms"
+                     % (m["setup"], rtt))
+    else:
+        lines.append("پینگ TCP: %.0fms" % rtt)
     parts = [("TLS", tls), ("CF→سرور", ws), ("تونل", tunnel)]
     known = [(name, v) for name, v in parts if v is not None]
     if known:
-        lines.append("تقسیم: اتصال %.0f · %s" % (rtt, " · ".join("%s %.0f" % kv for kv in known)))
+        lines.append("اتصال جدید، تقسیم: TCP %.0f · %s"
+                     % (rtt, " · ".join("%s %.0f" % kv for kv in known)))
     causes = []
     if tls is not None and tls > max(2.5 * rtt, rtt + 150):
         causes.append("TLS کُند است (%.0fms)؛ فیلترینگ دست‌دادن TLS را کُند می‌کند. اگر روی همهٔ "
@@ -1327,7 +1578,7 @@ def diagnose(m, port=443):
 CF_HTTP_PORTS = (80, 8080, 8880, 2052, 2082, 2086, 2095)
 
 
-def port_test(ip, target, ctx_factory=make_context, probe=trace_probe, attempts=5, timeout=3.0,
+def port_test(ip, target, ctx_factory=make_context, probe=http_ping, attempts=5, timeout=3.0,
               cancel=None):
     """The same address on each of Cloudflare's ports (``/cdn-cgi/trace``).
 
@@ -1341,7 +1592,7 @@ def port_test(ip, target, ctx_factory=make_context, probe=trace_probe, attempts=
             break
         t = Target(target.sni, target.path, port, target.tls, target.host)
         m = measure(ip, t, ctx_factory(), attempts, timeout, False, probe_trace=probe,
-                    warmup=True, cancel=cancel)
+                    cancel=cancel, per_conn=attempts)
         out.append(dict(m, port=port))
     return out
 
@@ -1932,8 +2183,6 @@ def cell_text(cell, now, window_s):
         return "✕"
     if cell.get("delay") is None:
         return "✓"
-    if cell.get("ping") is not None:
-        return "%.0f/%.0f" % (cell["ping"], cell["delay"])  # ping / full delay
     return "%.0f" % cell["delay"]
 
 
@@ -2068,8 +2317,8 @@ def relevant_networks(store, group):
 
 # ---------------------------------------------------------------- scan engine
 
-STEP_TITLES = ("بررسی IPهای فعلی رکورد", "اسکن سریع", "اندازه‌گیری دقیق و انتخاب",
-               "به‌روزرسانی DNS")
+STEP_TITLES = ("بررسی IPهای فعلی رکورد", "پیدا کردن IPهای در دسترس",
+               "بررسی دقیق برترها و انتخاب", "به‌روزرسانی DNS")
 
 
 class Events:
@@ -2112,7 +2361,7 @@ class ScanJob:
 
     def __init__(self, store, sid, nid, events=None, mode="auto", context_factory=make_context,
                  api_factory=CloudflareAPI, candidates=None, rng=None,
-                 probe_trace=trace_probe, probe_ws=ws_probe, now=None):
+                 probe_trace=http_ping, probe_ws=tunnel_ping, now=None):
         self.store = store
         self.sid = sid
         self.nid = nid
@@ -2302,12 +2551,15 @@ class ScanJob:
             result["kind"] = "nothing"
             result["hint"] = self._hint(errors, version)
             return result
+        rule = "هر IP %d بار، افت تا %s٪، زیر %sms" % (
+            int(s["reach_attempts"]), s["reach_max_loss_pct"], s["reach_max_ms"])
         if not answered:
-            text = "هیچ‌کدام از %d IP جواب نداد؛ فقط IPهای فعلی بررسی می‌شوند" % scanned
+            text = ("هیچ‌کدام از %d IP در دسترس نبود (%s)؛ فقط IPهای فعلی بررسی می‌شوند"
+                    % (scanned, rule))
         elif scanned < len(cands):
-            text = "%d IP جواب داد (از %d تست‌شده) — کافی بود" % (len(answered), scanned)
+            text = "%d IP در دسترس (از %d تست‌شده) — کافی بود" % (len(answered), scanned)
         else:
-            text = "%d از %d IP جواب داد" % (len(answered), scanned)
+            text = "%d IP در دسترس از %d (%s)" % (len(answered), scanned, rule)
         self.events.step(1, "ok" if answered else "fail", text)
 
         # 3. careful measure of the shortlist, then the rules
@@ -2456,9 +2708,18 @@ class ScanJob:
 
     @staticmethod
     def _rank(r):
-        """Shortlist order: the whole answer (TCP, TLS through any filter, the
-        request), which says more than the TCP connect alone."""
-        return r.get("total") if r.get("total") is not None else (r.get("tcp") or 0) * 3
+        """Shortlist order, as cfst sorts: the loss first, then the mean round trip."""
+        mean = r.get("total") if r.get("total") is not None else float("inf")
+        sent = r.get("sent") or 1
+        return ((sent - r.get("received", sent)) / float(sent), mean)
+
+    def _reachable(self, r, s):
+        """cfst's filters: most of the attempts answered, fast enough."""
+        sent = r.get("sent") or 1
+        received = r.get("received", 1 if r.get("ok") else 0)
+        loss = 100.0 * (sent - received) / sent
+        return (r.get("ok") and loss <= float(s["reach_max_loss_pct"])
+                and r.get("total") is not None and r["total"] <= float(s["reach_max_ms"]))
 
     def _fast_pass(self, cands, target, ctx, s, stop_after=None):
         queue = collections.deque(cands)
@@ -2469,6 +2730,7 @@ class ScanJob:
         colos = parse_colos(s["colos"])
         stop_after = int(s["stop_after"]) if stop_after is None else stop_after
         shown = max(8, int(s["verify_top"]))
+        attempts = int(s["reach_attempts"])
         timeout = float(s["timeout"])
 
         def worker():
@@ -2477,10 +2739,10 @@ class ScanJob:
                     if not queue or (stop_after and len(answered) >= stop_after):
                         return
                     ip = queue.popleft()
-                r = _safe_probe(self.probe_trace, ip, target, ctx, timeout)
+                r = _safe_probe(self.probe_trace, ip, target, ctx, timeout, attempts)
                 with lock:
                     counters["done"] += 1
-                    if r["ok"] and (not colos or r["colo"] in colos):
+                    if self._reachable(r, s) and (not colos or r["colo"] in colos):
                         answered.append(r)
                     else:
                         if not r["ok"]:
@@ -2537,7 +2799,7 @@ class ScanJob:
                 self.events.found(snapshot)
                 m = measure(ip, target, ctx, attempts, timeout, use_ws,
                             cancel=self.cancel_event, probe_trace=self.probe_trace,
-                            probe_ws=self.probe_ws, warmup=True)
+                            probe_ws=self.probe_ws)
             with lock:
                 out[i] = m
                 states[i] = "done"
@@ -2559,8 +2821,8 @@ class ScanJob:
     def _measure_text(m):
         if m.get("delay") is None:
             return "%s ✕ پاسخ نداد (%s)" % (m["ip"], error_summary(m.get("errors") or [], 1))
-        text = "%s ✓ %.0fms" % (m["ip"], m["delay"])
-        return text + (" · افت %.0f%%" % m["loss"] if m.get("loss") else "")
+        return "%s %s %.0fms · %d/%d" % (m["ip"], "✕" if m.get("loss") else "✓", m["delay"],
+                                          m["ok"], m["attempts"])
 
     def _explain(self, result, ips, port):
         """The diagnosis of the record's (first) address, as a note."""
@@ -2609,8 +2871,7 @@ RESULT_TEXT = {
     "error": "خطا",
 }
 GOOD_KINDS = ("healthy", "applied", "unchanged", "pending", "found")
-TEST_LABEL = {"vless": "تأخیر کامل کانفیگ (real delay)", "ws": "تأخیر تا سرور",
-              "trace": "تأخیر تا کلادفلر"}
+TEST_LABEL = {"vless": "تأخیر کانفیگ", "ws": "تأخیر تا سرور", "trace": "تأخیر تا کلادفلر"}
 
 
 def result_line(result, store=None):
@@ -2623,13 +2884,10 @@ def result_line(result, store=None):
         text = "IP سریع‌تری (حداقل ۲۰٪ بهتر) پیدا نشد؛ همان IP فعلی ماند"
     ips = result.get("ips") if kind in GOOD_KINDS else result.get("conflict")
     delays = result.get("delays") or {}
-    pings = result.get("pings") or {}
 
     def timed(ip):
         if not isinstance(delays.get(ip), (int, float)):
             return ip
-        if isinstance(pings.get(ip), (int, float)):
-            return "%s (پینگ %.0f · کامل %.0fms)" % (ip, pings[ip], delays[ip])
         return "%s (%.0fms)" % (ip, delays[ip])
 
     if ips:
@@ -3107,9 +3365,9 @@ if ui is not None:
     SPINNER = ("◐", "◓", "◑", "◒")
 
     #: What each step does, shown under it while it runs.
-    STEP_HINTS = ("IPهای فعلی رکورد چند بار روی همین اینترنت تست می‌شوند",
-                  "کدام IPها روی این اینترنت جواب می‌دهند",
-                  "بهترین جواب‌ها چند بار با همین سرور اندازه‌گیری می‌شوند",
+    STEP_HINTS = ("IPهای فعلی رکورد، مثل بررسی دقیق",
+                  "کدام IPها روی این اینترنت جواب می‌دهند (مثل cfst)",
+                  "هر کدام چند بار از داخل تونل همین سرور؛ فقط بدون افت قبول است",
                   "ثبت IPها در کلادفلر")
 
     def text_height(text, width, size):
@@ -3132,7 +3390,7 @@ if ui is not None:
             return (row["title"], "✓" if row["good"] else "✕", GOOD if row["good"] else BAD,
                     row["text"])
         if row.get("pending") == "run":
-            return ip, "در حال تست…", ACCENT, "چند بار، با همین سرور"
+            return ip, "در حال تست…", ACCENT, "از داخل تونل همین سرور"
         if row.get("pending"):
             return ip, "در صف", MUTED, ""
         if "attempts" in row:
@@ -3141,19 +3399,24 @@ if ui is not None:
             healthy = is_healthy(row, settings["max_loss_pct"], settings["max_ping_ms"])
             colour = BAD if not healthy else (
                 WARN if good_ms and row["delay"] > good_ms else GOOD)
-            parts = [("TLS", row.get("tls_ms")), ("CF→سرور", row.get("ws_ms")),
-                     ("تونل", row.get("tunnel_ms"))]
-            detail = " · ".join(["%s %.0f" % (n, v) for n, v in parts if v is not None]
-                                + ["±%.0f" % (row.get("jitter") or 0)]
-                                + (["افت %.0f%%" % row["loss"]] if row.get("loss") else [])
-                                + ([row["colo"]] if row.get("colo") else []))
+            right = "%.0fms ±%.0f" % (row["delay"], row.get("jitter") or 0)
+            detail = ["%d/%d%s" % (row["ok"], row["attempts"],
+                                   " ✓" if not row.get("loss") else " افت %.0f%%" % row["loss"])]
+            if row.get("setup") is not None:
+                detail.append("اتصال جدید %.0f" % row["setup"])
             if row.get("ping") is not None:
-                return ip, "پینگ %.0f · کامل %.0f" % (row["ping"], row["delay"]), colour, detail
-            return ip, "%.0fms" % row["delay"], colour, detail
-        detail = "فقط دسترسی"
-        if row.get("total") is not None:
-            detail += " · پاسخ در %.0fms" % row["total"]
-        return ip, "✓ %s" % (row.get("colo") or ""), NEUTRAL, detail
+                detail.append("پینگ %.0f" % row["ping"])
+            if row.get("colo"):
+                detail.append(row["colo"])
+            return ip, right, colour, " · ".join(detail)
+        detail = []
+        if row.get("sent"):
+            detail.append("%d/%d" % (row.get("received", 0), row["sent"]))
+        if row.get("colo"):
+            detail.append(row["colo"])
+        detail.append("فقط تا کلادفلر")
+        right = "%.0fms" % row["total"] if row.get("total") is not None else "✓"
+        return ip, right, NEUTRAL, " · ".join(detail)
 
     class ResultRow(ui.View):
         """One line of the scan list; reused, only its texts change."""
@@ -3421,8 +3684,9 @@ if ui is not None:
                     self._show_rows([])
                 self.table_title.text = fa({
                     0: "IPهای فعلی رکورد · %s" % self._target_label(),
-                    1: "سریع‌ترین جواب‌ها تا الان (فقط دسترسی، هنوز تأخیر کانفیگ نه)",
-                    2: "تست اصلی: %s" % self._target_label(),
+                    1: "سریع‌ترین IPهای در دسترس تا الان (فقط تا کلادفلر)",
+                    2: "بررسی دقیق: %s، %d بار هر IP" % (
+                        self._target_label(), int(self.app.store.settings["verify_attempts"])),
                 }.get(index, self.table_title.text))
             else:
                 if index == self.phase:
@@ -3999,9 +4263,15 @@ if ui is not None:
                 {"type": "switch", "key": "full_range",
                  "title": "اسکن کل رنج کلادفلر (یکی از هر /24، حدود ۶۰۰۰ IP)",
                  "value": s["full_range"]},
-                text_field("verify_top", "تعداد برترها برای تست اصلی (تأخیر کانفیگ)",
-                           s["verify_top"], "number"),
-                text_field("verify_attempts", "دفعات تست اصلی برای هر IP", s["verify_attempts"], "number"),
+                text_field("reach_attempts", "در دسترس بودن: دفعات تست هر IP (cfst: ۴)",
+                           s["reach_attempts"], "number"),
+                text_field("reach_max_loss_pct", "در دسترس بودن: حداکثر افت (٪)",
+                           s["reach_max_loss_pct"], "number"),
+                text_field("reach_max_ms", "در دسترس بودن: حداکثر تأخیر (ms)",
+                           s["reach_max_ms"], "number"),
+                text_field("verify_top", "تعداد برترها برای بررسی دقیق", s["verify_top"], "number"),
+                text_field("verify_attempts", "بررسی دقیق: دفعات هر IP (cfscan: ۲۰)",
+                           s["verify_attempts"], "number"),
                 text_field("workers", "تست همزمان در اسکن سریع", s["workers"], "number"),
                 text_field("timeout", "مهلت هر اتصال (ثانیه)", s["timeout"], "number"),
                 text_field("candidates", "بدون اسکن کل رنج: تعداد IP", s["candidates"], "number"),
@@ -4326,8 +4596,8 @@ if ui is not None:
             console.show_activity()
             try:
                 trace = trace_probe(ip, target, make_context(), float(s["timeout"]) + 1)
-                m = measure(ip, target, make_context(), 10, float(s["timeout"]) + 2,
-                            target.kind != "trace", warmup=True)
+                m = measure(ip, target, make_context(), int(s["verify_attempts"]),
+                            float(s["timeout"]) + 2, target.kind != "trace")
             finally:
                 console.hide_activity()
             ok = is_healthy(m, s["max_loss_pct"], s["max_ping_ms"])
@@ -4336,12 +4606,13 @@ if ui is not None:
             store.save()
             self.main.refresh()
             lines = ["%s · %s" % (server["name"], network["name"]),
-                     "نتیجه: %s" % ("سالم" if ok else "ناسالم"),
+                     "نتیجه: %s (%d/%d پاسخ)" % ("PASS، سالم" if ok else "FAIL، ناسالم",
+                                                m["ok"], m["attempts"]),
                      "%s: %s" % (TEST_LABEL[target.kind],
                                  "%.0f ms" % m["delay"] if m["delay"] is not None else "—"),
-                     "پینگ TCP: %s" % ("%.0f ms" % m["ping"] if m["ping"] is not None else "—"),
                      "نوسان: %.0f · افت: %.0f%%" % (m["jitter"] or 0, m["loss"]),
                      "دیتاسنتر: %s" % (trace.get("colo") or "—")]
+            lines += [""] + diagnose(m, target.port)
             if m["errors"]:
                 lines.append("خطاها: %s" % error_summary(m["errors"]))
             alert(ip, "\n".join(lines))
